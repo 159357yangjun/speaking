@@ -68,3 +68,14 @@ agents/<handle>/joins/<handle>.md 发起方为新人填好的 join 提示词副�
 ```
 
 `msg-<seq>` 的 `<seq>` 为 5 位零填充（`msg-00007.json`），保证文件名字典序等于序号序。
+
+## 六、配置与依赖例外登记
+
+**本仓库不新增任何依赖、不装任何服务。** 唯一被批准的项目配置文件改动记于此，
+免得后人看到 `package.json` 被改就以为开了依赖例外。
+
+| 文件 | 改了什么 | 没改什么 | 批准人 / 日期 |
+|---|---|---|---|
+| `package.json` | 仅 `scripts`：`test` 扩为三个测试文件，新增 `sim` | `dependencies`、`devDependencies`、`version`（仍 `0.1.0`） | 人 / 2026-09-29 |
+
+**规则：动 `dependencies` / `version` / lock 文件需要单独批准，且不因"上次批过 scripts"而自动生效。**
