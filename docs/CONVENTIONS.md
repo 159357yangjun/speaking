@@ -11,11 +11,16 @@
 | `docs/evidence/` | 实测事实：什么被验证过 | 人 | 每条带日期、来源、核查方式 |
 | `proto/` | 机器可读格式 + 人写的提示词 | 人 | **不许出现任何产品名** |
 | `src/` | 与厂商无关的实现 | 人 / agent | 只依赖 `proto/`，不依赖 `adapters/` |
+| `test/` | 断言。每条都必须先证明"输入确实生效"才算通过 | 人 | 不含业务逻辑，只调 `src/` 与 `tools/` |
+| `tools/` | 可执行的验证器/推演器，被 `test/` 调用也被人直接跑 | 人 | 不依赖 `adapters/`；自带 README 说明怎么跑 |
 | `adapters/` | 每个目标客户端的脏活 | 人 / agent | 产品知识只能待在这里 |
 | `experiments/` | 一次性验证 | 任意 | 必须自带 README 说明结论，否则删掉 |
 
-**依赖方向单向：`adapters → src → proto`。反向 import 即违规。**
+**依赖方向单向：`adapters → src → proto`，`test → tools → src → proto`。反向 import 即违规。**
 这条决定项目会不会腐化成一堆 `if (client == "xxx")`。
+
+**`tools/` 与 `experiments/` 的分界：** 结论需要能被任何人重跑验证的进 `tools/`，
+只回答一次性问题的进 `experiments/`。判据是"别人改完协议还能不能再跑"，不是"当时有没有用"。
 
 ## 二、specs 用序号前缀，序号即依赖层
 
