@@ -202,3 +202,75 @@ mv "C:\Users\yyyy\.agent-relay\keys\qoder\superseded-2026-09-29\qoder.pem" \
 - 同 UID 下任意进程读取：`.agent-relay` 也挡不住，它挡的是"另一个 agent 的授权目录"
 - 私有目录里现在有**两份**同一把私钥（现役 + 备份），这本身是额外的暴露面，
   确认不需要回滚后应删掉备份那份。删除是破坏性动作，等本人拍。
+
+---
+
+# 第三轮：迁移做成了一半，正在弄坏对端（执行人指出）
+
+## 一、问题
+
+上一轮删了 `<频道>/keys` 第三档回退（方向对），**但 `workbuddy.pem` 还在频道原位**。
+结果：对端按老形状跑（不给 `--keys-dir`、不设环境变量）直接 `exit 1` 拿不到自己的私钥。
+**它从"能签"变成"不能签"，而这不是它改的，是我们改的代码。**
+
+## 二、复现证据（动手前）
+
+```
+$ node src/cli.js seal --me=workbuddy --to=qoder --type=offer --body="对端形状复现"
+  退出码 = 1
+  错误：必须给 --keys-dir=<目录> 或设 AGENT_RELAY_KEYS_DIR。代码不再回退到 <频道>/keys……
+  agents/workbuddy/ 下 msg-*.json 数量 = 0      ← 没写出任何东西
+
+$ git show b3b4127:src/cli.js | grep '回退：<频道>/keys'
+  38:  return { dir: join(CH, "keys"), via: "回退：<频道>/keys（私钥仍在共享区）" };
+      ↑ 迁移前那一档存在，同一形状本可成功
+```
+
+## 三、迁出 WorkBuddy 那把（移动，不删）
+
+```
+频道 keys/ 终态：qoder.pub   workbuddy.pub                      ← 只剩两个公钥
+.agent-relay\keys\workbuddy\workbuddy.pem   sha256 7271e2c78f…  与迁出前逐字一致
+```
+
+迁出后同一形状：仍 `exit 1`（拒绝无来源，**不是静默失败**）；
+给上 `--keys-dir` → `退出码=0`，写出 `msg-00004.json`；
+qoder 侧 `drain` 读回：**新消息 1 条，被拒 0 条**；
+对端 `crypto-helper.js` 自验其新消息 → `VERIFY_OK`。
+
+## 四、这次迁出的直接代价（必须承认，不是"已完成"）
+
+对端自己的脚本把旧路径写死了，现已断：
+
+```
+$ node agents/workbuddy/make-deliverable.js
+  Error: ENOENT: no such file or directory, open
+  'C:\Users\yyyy\agent-relay\channels\dev\keys\workbuddy.pem'
+  （make-deliverable.js:8  const PEM = path.join(BASE, 'keys/workbuddy.pem');）
+```
+
+修法已写进 `adapters/workbuddy/renew-prompt.md`：改成读 `AGENT_RELAY_KEYS_DIR` 或走 argv
+（`crypto-helper.js` 不用改，它本来就是 argv 传路径）。
+
+**在对端改完那一行之前，它的 `make-deliverable.js` 是坏的。** 这是迁出的代价，
+不是可忽略的副作用——上一轮我正是因为怕这个才没动那把钥匙，
+但"怕弄断"不等于"可以停在半程"：半程状态同样弄断了它，而且断得更隐蔽
+（旧形状静默 `exit 1`，而不是响亮 `ENOENT`）。
+
+## 五、清掉的旧路径文字
+
+`grep -rn "keys/" README.md docs/ adapters/ proto/` 逐条处置：
+
+| 位置 | 原状 | 处理 |
+|---|---|---|
+| `README.md` 判据 5 | "仍躺着一把改名但未删的可用私钥 / ❌ 半程" | 改为 ✅，并写明备份位置与不删理由 |
+| `renew-prompt.md` | "本轮没有动那把钥匙" | **已是假话**，改为给出 `--keys-dir` 可照抄形状 + 那一行修法 |
+| `05-security-model.md` 信任假设 | "私钥只在其本机" | 加"且在共享频道目录之外"，并注明工具会拒读频道树内私钥 |
+| `proto/agent-prompt-template.md` | `private_key_location` 由人填 | 加硬约束：**必须指向频道目录之外** |
+| 两份 evidence | 撰写当时的状态 | 按不可变原则不改写，顶部加日期化后续说明指向本文 |
+
+## 六、本轮拍定
+
+`.agent-relay` 里 qoder 的那份备份**本轮不删**。理由：同一把密钥两份副本都在共享区外，
+新增面有限，而删除不可逆；它的价值恰好在本节这个坑上——**回滚不再是"把文件移回去"就够**
+（代码第三档已删，需同时 revert `keySource()`）。等频道两边都跑通至少一天再议。
