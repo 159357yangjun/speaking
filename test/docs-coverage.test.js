@@ -94,6 +94,38 @@ test("规则C：活指令文件不得指示使用 v1 签名域", () => {
   assert.deepEqual(bad, [], `以下活指令文件在教适配器签 v1 域：\n  ${bad.join("\n  ")}`);
 });
 
+// ============ 规则 D：指令文档里不得出现指向频道目录内的私钥路径 ============
+// 正反斜杠都要吃——上一轮我用只匹配正斜杠的 grep 自查，漏掉了
+// `channels\dev\keys\workbuddy.pem` 这条反斜杠形态。
+//
+// 受检范围按**用途**划，不按目录名随手划：
+//   受检 = 会被执行或被照抄的东西（活指令、规格、README、adapter 说明）
+//   不检 = 记录历史现场的证据与实验（docs/evidence/、experiments/）
+// 理由：**证据要按当时的样子记路径，指令要指向东西现在在哪。**
+// 迁移记录里那句 ENOENT 的完整路径正是"我们弄断过对端"的唯一物证，
+// 把它改了等于毁证。这条边界不是豁免口子——它判据是文件用途，且写死在下面这个列表里。
+const INSTRUCTION_DOCS = [
+  ...walk("adapters"), ...walk("proto"), ...walk("docs/specs"), ...walk("tools"),
+  "README.md", "CONTRIBUTING.md",
+];
+const CHANNEL_KEY_PATH = /channels[\/\\][^\s`'"()]*[\/\\]keys[\/\\][^\s`'"()]*\.pem/i;
+
+test("规则D：指令文档里不得出现指向频道目录内的私钥路径", () => {
+  const bad = [];
+  for (const f of INSTRUCTION_DOCS) {
+    read(f).split(/\r?\n/).forEach((line, i) => {
+      if (CHANNEL_KEY_PATH.test(line)) bad.push(`${f}:${i + 1}  ${line.trim().slice(0, 100)}`);
+    });
+  }
+  assert.deepEqual(bad, [],
+    `以下行写着频道目录内的私钥路径，而两把私钥都已迁出——照它执行必然 ENOENT：\n  ${bad.join("\n  ")}`);
+});
+
+test("规则D 的受检清单非空（防空跑：列表若被改错，上面的断言会永远绿）", () => {
+  assert.ok(INSTRUCTION_DOCS.length >= 6,
+    `指令文档受检清单只有 ${INSTRUCTION_DOCS.length} 项，疑似 walk 失效或路径写错`);
+});
+
 test("规则C 附带：活指令文件里出现的协议版本必须等于代码版本（无历史豁免）", async () => {
   const { digestOf } = await import("../src/proto/envelope.js");
   const codeVersion = digestOf({ seq: 1, from: "a", to: "b", type: "offer", done: true, nonce: "n", body: "" })

@@ -61,8 +61,8 @@
     改为                     const PEM = process.env.AGENT_RELAY_KEYS_DIR + '/workbuddy.pem';
     或干脆从 argv 取路径，像 crypto-helper.js 那样
 
-改完自验：`node make-deliverable.js` 不应再报
-`ENOENT … channels\dev\keys\workbuddy.pem`。
+改完自验：`node make-deliverable.js` 不应再报指向**已迁走的那把私钥**的 `ENOENT`。
+（迁出前它报的就是那个 ENOENT；现在文件已不在频道目录，报不报由你这行代码决定。）
 
 `crypto-helper.js` 不用改——它的路径是 argv 传进来的。
 
