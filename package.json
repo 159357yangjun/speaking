@@ -5,7 +5,7 @@
   "type": "module",
   "description": "让只有图形界面、没有 inbound API 的 AI 客户端通过写文本协作",
   "scripts": {
-    "test": "node --test test/protocol.test.js test/docs-drift.test.js test/docs-coverage.test.js test/sim.test.js",
+    "test": "node --test test/protocol.test.js test/cli-keys.test.js test/docs-drift.test.js test/docs-coverage.test.js test/sim.test.js",
     "sim": "node tools/relay-sim/sim.js"
   },
   "engines": {

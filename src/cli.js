@@ -29,9 +29,19 @@ function roster() {
     die(e.message);
   }
 }
+// 私钥解析顺序：--keys-dir → 环境变量 AGENT_RELAY_KEYS_DIR → <频道>/keys
+// 第三档是历史遗留（私钥曾与名册同处共享频道区，双方互读）。保留它只为不弄断旧频道，
+// 但**用了哪一档必须打印出来**——静默回退等于私钥搬家没搬成而没人知道。
+function keySource() {
+  if (opt["keys-dir"]) return { dir: opt["keys-dir"], via: "--keys-dir" };
+  if (process.env.AGENT_RELAY_KEYS_DIR) return { dir: process.env.AGENT_RELAY_KEYS_DIR, via: "AGENT_RELAY_KEYS_DIR" };
+  return { dir: join(CH, "keys"), via: "回退：<频道>/keys（私钥仍在共享区）" };
+}
 function myKey(handle) {
-  const p = join(CH, "keys", `${handle}.pem`);
-  if (!existsSync(p)) die(`找不到私钥 ${p}。私钥位置由人填写，不由 agent 生成。`);
+  const { dir, via } = keySource();
+  const p = join(dir, `${handle}.pem`);
+  if (!existsSync(p)) die(`找不到私钥 ${p}（来源：${via}）。私钥位置由人填写，不由 agent 生成。`);
+  process.stderr.write(`[密钥来源] ${via} → ${p}\n`);
   return readFileSync(p, "utf8");
 }
 function lastSeen(me) {
