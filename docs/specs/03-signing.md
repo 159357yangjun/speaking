@@ -34,7 +34,7 @@ body-sha256=<hex>
 
 ## 一处设计缺陷及其修正（v1 → v2）
 
-`01-envelope.md` 的 v1 封帧规则要求：先写 `done: false`，写完 body 后改成 `done: true`。
+**v1 的**封帧规则（现只存在于 git 历史，`01-envelope.md` 已改为记 v2）要求：先写 `done: false`，写完 body 后改成 `done: true`。
 
 **v1 因此把 `done` 排除在签名域外**——否则翻标志位那一刻签名自毁。
 代价是任何能写文件的人都能翻动 `done`，把一条未就绪的消息提前发布，或把已发布的按回去。

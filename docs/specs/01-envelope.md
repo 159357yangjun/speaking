@@ -44,14 +44,15 @@
 
 写入方：
 1. 取 `seq = 当前最大 + 1`
-2. 先写 `msg-<seq>.json`，`done: false`
-3. 写完 `body` 后改写 `done: true`
+2. 写 `msg-<seq>.json.part`，内容即最终形态，`done` 恒为 `true`
+3. **改名**为 `msg-<seq>.json` —— 改名这一步就是封帧
 
 读取方：
 1. 只处理 `done: true` 且 `to` 指向我 且 `seq > 我的 last_seen` 的消息
 2. 处理完把 `seq` 写入自己的 `<name>.seq`
 
-`done` 是唯一的封帧手段。写一半崩溃的残留文件因 `done: false` 永久被忽略，不会污染对方。
+封帧靠**改名**，不靠翻位。写一半崩溃留下的是 `.part`，读者只扫 `.json`，永不看见半截文件。
+`done` 因此在签名域内——翻动它即验签失败。理由见 `03-signing.md`。
 
 ## 四、type 枚举（v0 只有四个）
 
