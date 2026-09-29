@@ -31,6 +31,7 @@
 03-signing.md        签名与验签         ← 依赖 01,02
 04-transports.md     传输层可插拔       ← 依赖 01
 05-security-model.md 威胁模型与未防护清单 ← 依赖 01–04
+06-versioning-and-compat.md 版本与向后兼容 ← 依赖 01,03
 ```
 
 规则：**一个 spec 只能引用比它序号小的。** 出现前向引用说明拆分错了。

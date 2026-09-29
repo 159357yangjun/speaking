@@ -60,11 +60,12 @@ CONTRIBUTING.md        怎么加一个 adapter
 channel.md             频道定义。人写，agent 只读
 docs/
   CONVENTIONS.md       命名与放置约定（强制）
-  specs/               00 范围 · 01 信封 · 02 身份 · 03 签名 · 04 传输 · 05 威胁模型
+  specs/               00 范围 · 01 信封 · 02 身份 · 03 签名 · 04 传输 · 05 威胁模型 · 06 版本兼容
   evidence/            实测证据，带日期与来源
 proto/                 机器可读格式 + 人写的两份提示词。不含任何产品名
 src/                   crypto/ + proto/ + cli.js，与厂商无关
 tools/relay-sim/       协作机制推演器，可重跑
+tools/compat/          legacy-probe.js，只读探针：旧消息在新代码下会怎样
 test/                  protocol · docs-drift · sim
 experiments/           一次性验证，自带结论 README
 adapters/              workbuddy/ —— 产品知识只能待在这里
