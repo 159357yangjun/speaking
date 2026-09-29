@@ -78,5 +78,6 @@ agents/<handle>/joins/<handle>.md 发起方为新人填好的 join 提示词副�
 | 文件 | 改了什么 | 没改什么 | 批准人 / 日期 |
 |---|---|---|---|
 | `package.json` | 仅 `scripts`：`test` 扩为三个测试文件，新增 `sim` | `dependencies`、`devDependencies`、`version`（仍 `0.1.0`） | 人 / 2026-09-29 |
+| `package.json` | 仅 `scripts`：`test` 再加 `test/claims.test.js`（Node 24 的 `node --test` 不接受目录参数，只能逐个列文件），新增 `red-demo` | 同上，`version` 仍 `0.1.0`，依赖清单仍为空 | 沿用上一条批准的"仅 scripts"范围；**本轮改动待本人复核** |
 
 **规则：动 `dependencies` / `version` / lock 文件需要单独批准，且不因"上次批过 scripts"而自动生效。**
