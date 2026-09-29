@@ -27,26 +27,27 @@ A2A 承诺"两个 agent 各开一个端口，对等互调"。实测结论是**�
 
 | 能力 | 状态 |
 |---|---|
-| Ed25519 签名与验签 | **已实现，14 项单元测试全通过** |
-| CLI（seal / drain / show） | **已实现并实跑** |
+| Ed25519 签名与验签 | 已实现 |
+| CLI（seal / drain / wait / show） | 已实现并实跑 |
 | 伪造 `from` 被拒 | **已实测证伪**：用成员 B 的私钥签成员 A 的 handle → `drain` 拒收，原因"验签失败" |
 | 拒收时不泄漏正文 | **已实测**：伪造正文在全部输出中出现 **0 次** |
-| 篡改 `body` / `to` 被拒 | 已验证 |
-| 封帧翻 `done` 后签名仍有效 | 已验证 |
+| 篡改 `body` / `to` / `done` 被拒 | 已验证。`done` 自 v2 起在签名域内，v1 那个"翻位即自毁签名"的取舍已用改名封帧消掉 |
 | 名册格式校验、满员判定、nonce 去重 | 已实现 |
-| **防篡改 `roster.json` 本身** | **未防护，见下** |
-| 端到端 5 轮无人往返 | 未跑。卡在两个未验证前提，见 `adapters/workbuddy/README.md` |
-| adapter | 仅 `adapters/workbuddy/`，能力矩阵有 4 项未知 |
+| 文档与代码不漂移 | **`test/docs-drift.test.js` 钉住签名域的版本、字段名与顺序**。施加 v1 变异 → 3 条红、退出码 1；恢复 → 全绿 |
+| 协作机制的并发保证 | **`tools/relay-sim` 可重跑**。旧 markdown 机制 5/5 轮谎报成功；独占锁 + 强制 TTL 机制 0/5 轮，且每轮恰好 1 领取 + 1 明确受阻 |
+| **防篡改 `roster.json` 本身** | **未防护**，见下 |
+| 端到端 5 轮无人往返 | 未跑。定时间隔实测最小 1 小时，且 WorkBuddy 无人值守需本人签风险确认 |
+| adapter | 仅 `adapters/workbuddy/`，能力矩阵 4 项未知 |
+
+测试总数 **26**（protocol 15 · docs-drift 5 · sim 6）。
 
 ```
 npm test
 node src/cli.js seal  --channel=<目录> --me=<handle> --to=<handle|*> --type=offer --body="…"
 node src/cli.js drain --channel=<目录> --me=<handle>
-node src/cli.js show  --channel=<目录>
+node src/cli.js wait  --channel=<目录> --me=<handle> --timeout=300
+node tools/relay-sim/sim.js <空目录> --json
 ```
-
-**一处实现与规范的偏离**：`seal` 一次写完 `done:true`，没走"先 false 再翻 true"。
-本机单写者场景没有半截风险；跨 agent 的两次写只在 adapter 里需要，规范保留该要求。
 
 ## 目录
 
@@ -58,17 +59,18 @@ LICENSE                MIT
 CONTRIBUTING.md        怎么加一个 adapter
 channel.md             频道定义。人写，agent 只读
 docs/
-  CONVENTIONS.md       命名与放置约定
+  CONVENTIONS.md       命名与放置约定（强制）
   specs/               00 范围 · 01 信封 · 02 身份 · 03 签名 · 04 传输 · 05 威胁模型
   evidence/            实测证据，带日期与来源
 proto/                 机器可读格式 + 人写的两份提示词。不含任何产品名
 src/                   crypto/ + proto/ + cli.js，与厂商无关
-test/                  协议层测试
+tools/relay-sim/       协作机制推演器，可重跑
+test/                  protocol · docs-drift · sim
 experiments/           一次性验证，自带结论 README
-adapters/              workbuddy/ —— 每个目标客户端一个目录，产品知识只能待在这里
+adapters/              workbuddy/ —— 产品知识只能待在这里
 ```
 
-依赖方向单向：`adapters → src → proto`，反向 import 即违规。
+依赖方向单向：`adapters → src → proto`，`test → tools → src → proto`。反向 import 即违规。
 
 ## 已知的根问题
 
