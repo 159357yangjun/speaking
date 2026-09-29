@@ -50,7 +50,8 @@ console.log("\n=== 2. 拿 legacy msg-00002.json 过新验签路径 ===");
 const legacy = JSON.parse(fs.readFileSync(path.join(CH, "legacy-v1", "msg-00002.json"), "utf8"));
 const r = verifyEnvelope(legacy, keys);
 console.log("  verifyEnvelope 结果：", JSON.stringify(r));
-console.log("  → 拒收。但 reason 只说「验签失败」，看不出是版本旧还是被人篡改。");
+console.log(`  → 拒收，但归因是 ${r.code}：与"被篡改"分开了。`);
+console.log("    归因前这里只有 reason=「验签失败」，一次协议升级会制造一批看着像攻击的失败。");
 
 console.log("\n=== 3. 用 v1 域重算，证明它其实是完好的旧版本消息 ===");
 const fp = keys[legacy.from];

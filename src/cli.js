@@ -81,8 +81,10 @@ if (cmd === "drain") {
   const keys = keyringOf(r);
   const me = opt.me ?? die("缺 --me");
   const before = lastSeen(me);
-  report(me, scanNew(me, keys, before), before);
-  process.exit(0);
+  const found = scanNew(me, keys, before);
+  report(me, found, before);
+  // 退出码 7 = 本轮拒收里有"版本不支持"。让脚本能把它和真伪造分开数。
+  process.exit(found.bad.some((x) => x.code === "UNSUPPORTED_VERSION") ? 7 : 0);
 }
 
 if (cmd === "show") {
@@ -97,7 +99,7 @@ if (cmd === "show") {
     const v = verifyEnvelope(env, keys);
     console.log(
       `  ${v.ok ? "✓" : "✗"} seq=${env.seq} ${env.from}→${env.to} ${env.type} done=${env.done}` +
-        (v.ok ? ` ${JSON.stringify(env.body).slice(0, 40)}` : ` ${v.reason}`)
+        (v.ok ? ` ${JSON.stringify(env.body).slice(0, 40)}` : ` [${v.code}] ${v.reason}`)
     );
   }
   process.exit(0);
@@ -132,13 +134,13 @@ function scanNew(me, keys, since) {
   const ok = [];
   const bad = [];
   for (const { file, env, broken } of allMessages()) {
-    if (broken) { bad.push({ file, reason: "JSON 解析失败" }); continue; }
+    if (broken) { bad.push({ file, code: "BAD_ENVELOPE", reason: "JSON 解析失败" }); continue; }
     if (env.done !== true) continue;
     if (env.from === me) continue;
     if (env.to !== me && env.to !== "*") continue;
     if (env.seq <= since) continue;
     const v = verifyEnvelope(env, keys);
-    if (!v.ok) { bad.push({ file, reason: v.reason }); continue; }
+    if (!v.ok) { bad.push({ file, code: v.code, reason: v.reason }); continue; }
     const k = `${v.env.from}:${v.env.nonce}`;
     if (seen.has(k)) continue;
     seen.add(k);
@@ -158,7 +160,9 @@ function report(me, found, before) {
     console.log(`\n[seq ${e.seq}] ${e.from} → ${e.to}  type=${e.type}`);
     console.log(e.body);
   }
-  for (const x of found.bad) console.log(`\n✗ 拒收 ${x.file}\n  原因：${x.reason}   （body 未读取）`);
+  for (const x of found.bad) console.log(`\n✗ 拒收 ${x.file}\n  code=${x.code}  原因：${x.reason}   （body 未读取）`);
+  const stale = found.bad.filter((x) => x.code === "UNSUPPORTED_VERSION").length;
+  if (stale) console.log(`\n注意：其中 ${stale} 条是「版本不支持」而非伪造。它们同样被拒，但不应计入攻击信号——见 docs/specs/06。`);
 }
 
 console.log(`agent-relay CLI
