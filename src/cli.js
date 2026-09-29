@@ -1,8 +1,8 @@
 #!/usr/bin/env node
-import { readFileSync, writeFileSync, existsSync, readdirSync, mkdirSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, readdirSync, mkdirSync, renameSync } from "node:fs";
 import { join } from "node:path";
 import { loadRoster, keyringOf } from "./proto/roster.js";
-import { seal, flipDone, verifyEnvelope, msgFileName, newNonce } from "./proto/envelope.js";
+import { seal, verifyEnvelope, msgFileName, newNonce } from "./proto/envelope.js";
 
 const args = process.argv.slice(2);
 const cmd = args[0];
@@ -66,11 +66,13 @@ if (cmd === "seal") {
   const dir = join(CH, "agents", me);
   mkdirSync(dir, { recursive: true });
   const path = join(dir, msgFileName(seq));
+  const part = path + ".part";
   if (existsSync(path)) die(`${msgFileName(seq)} 已存在。seq 撞号，重跑一次。`);
   const env = seal({ seq, from: me, to: opt.to ?? "*", type: opt.type ?? "offer", body, nonce: newNonce() }, myKey(me));
-  writeFileSync(path, JSON.stringify(env, null, 2));
-  writeFileSync(path, JSON.stringify(flipDone(env), null, 2));
-  console.log(`已写入并封帧 ${path}`);
+  // 封帧靠改名，不靠翻位：读者只看 msg-N.json，永远看不到半截文件
+  writeFileSync(part, JSON.stringify(env, null, 2));
+  renameSync(part, path);
+  console.log(`已写入 ${path}（.part 改名封帧，done 在签名域内）`);
   process.exit(0);
 }
 
@@ -78,42 +80,8 @@ if (cmd === "drain") {
   const r = roster();
   const keys = keyringOf(r);
   const me = opt.me ?? die("缺 --me");
-  const ls = lastSeen(me);
-  const seen = seenNonces(me);
-  const fresh = [];
-  const rejected = [];
-  for (const { file, env, broken } of allMessages()) {
-    if (broken) {
-      rejected.push({ file, reason: "JSON 解析失败" });
-      continue;
-    }
-    if (env.done !== true) continue;
-    if (env.from === me) continue;
-    if (env.to !== me && env.to !== "*") continue;
-    if (env.seq <= ls) continue;
-    const v = verifyEnvelope(env, keys);
-    if (!v.ok) {
-      rejected.push({ file, reason: v.reason });
-      continue;
-    }
-    if (seen.has(`${v.env.from}:${v.env.nonce}`)) continue;
-    seen.add(`${v.env.from}:${v.env.nonce}`);
-    fresh.push(v.env);
-  }
-  fresh.sort((a, b) => a.seq - b.seq || a.from.localeCompare(b.from));
-  const maxSeq = Math.max(ls, ...fresh.map((e) => e.seq));
-  mkdirSync(join(CH, "agents", me), { recursive: true });
-  writeFileSync(join(CH, "agents", me, ".last_seen"), String(maxSeq));
-  writeFileSync(join(CH, "agents", me, ".seen-nonce"), [...seen].join("\n"));
-
-  console.log(`\n=== ${me}：新消息 ${fresh.length} 条，被拒 ${rejected.length} 条，last_seen → ${maxSeq} ===`);
-  for (const e of fresh) {
-    console.log(`\n[seq ${e.seq}] ${e.from} → ${e.to}  type=${e.type}`);
-    console.log(e.body);
-  }
-  for (const x of rejected) {
-    console.log(`\n✗ 拒收 ${x.file}\n  原因：${x.reason}   （body 未读取）`);
-  }
+  const before = lastSeen(me);
+  report(me, scanNew(me, keys, before), before);
   process.exit(0);
 }
 
@@ -135,10 +103,70 @@ if (cmd === "show") {
   process.exit(0);
 }
 
+if (cmd === "wait") {
+  const r = roster();
+  const keys = keyringOf(r);
+  const me = opt.me ?? die("缺 --me");
+  const timeoutMs = (parseInt(opt.timeout, 10) || 300) * 1000;
+  const everyMs = (parseInt(opt.every, 10) || 5) * 1000;
+  const start = lastSeen(me);
+  const deadline = Date.now() + timeoutMs;
+  process.stderr.write(`等待 ${me} 的新消息（last_seen>${start}），每 ${everyMs / 1000}s 轮询，超时 ${timeoutMs / 1000}s\n`);
+  for (;;) {
+    const before = lastSeen(me);
+    const found = scanNew(me, keys, before);
+    if (found.ok.length || found.bad.length) {
+      report(me, found, before);
+      process.exit(0);
+    }
+    if (Date.now() >= deadline) {
+      console.log(`超时：${timeoutMs / 1000}s 内没有新消息。对端可能没被唤醒——这本身就是结论。`);
+      process.exit(2);
+    }
+    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, everyMs);
+  }
+}
+
+function scanNew(me, keys, since) {
+  const seen = seenNonces(me);
+  const ok = [];
+  const bad = [];
+  for (const { file, env, broken } of allMessages()) {
+    if (broken) { bad.push({ file, reason: "JSON 解析失败" }); continue; }
+    if (env.done !== true) continue;
+    if (env.from === me) continue;
+    if (env.to !== me && env.to !== "*") continue;
+    if (env.seq <= since) continue;
+    const v = verifyEnvelope(env, keys);
+    if (!v.ok) { bad.push({ file, reason: v.reason }); continue; }
+    const k = `${v.env.from}:${v.env.nonce}`;
+    if (seen.has(k)) continue;
+    seen.add(k);
+    ok.push(v.env);
+  }
+  ok.sort((a, b) => a.seq - b.seq || a.from.localeCompare(b.from));
+  const maxSeq = Math.max(since, ...ok.map((e) => e.seq));
+  mkdirSync(join(CH, "agents", me), { recursive: true });
+  writeFileSync(join(CH, "agents", me, ".last_seen"), String(maxSeq));
+  writeFileSync(join(CH, "agents", me, ".seen-nonce"), [...seen].join("\n"));
+  return { ok, bad, maxSeq };
+}
+
+function report(me, found, before) {
+  console.log(`\n=== ${me}：新消息 ${found.ok.length} 条，被拒 ${found.bad.length} 条，last_seen ${before} → ${found.maxSeq} ===`);
+  for (const e of found.ok) {
+    console.log(`\n[seq ${e.seq}] ${e.from} → ${e.to}  type=${e.type}`);
+    console.log(e.body);
+  }
+  for (const x of found.bad) console.log(`\n✗ 拒收 ${x.file}\n  原因：${x.reason}   （body 未读取）`);
+}
+
 console.log(`agent-relay CLI
 
   seal   --channel=<目录> --me=<handle> --to=<handle|*> --type=<t> (--body=<文本> | --body-file=<路径>)
   drain  --channel=<目录> --me=<handle>
+  wait   --channel=<目录> --me=<handle> [--timeout=300] [--every=5]     阻塞到新消息出现，替代盲等 sleep
   show   --channel=<目录>
 
-seal 会一次写完 done:true，不留下半截文件——本机是单写者，封帧的两次写只在跨 agent 场景才需要。`)
+封帧：seal 先写 msg-N.json.part，再改名为 msg-N.json。读者只看 .json，永远读不到半截文件。
+done 在签名域内——翻动它即验签失败。`)

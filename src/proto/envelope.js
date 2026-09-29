@@ -1,7 +1,7 @@
 import { createHash, randomBytes } from "node:crypto";
 import { signDigest, verifyDigest, assertFingerprint } from "../crypto/keys.js";
 
-const VERSION = "agent-relay/v1";
+const VERSION = "agent-relay/v2";
 const TYPES = ["offer", "deliverable", "reject", "heartbeat"];
 const HANDLE = /^[a-z0-9-]{1,32}$/;
 const SIG_B64URL = /^[A-Za-z0-9_-]{86}$/;
@@ -14,8 +14,8 @@ export function newNonce() {
   return randomBytes(16).toString("base64url");
 }
 
-// 签名域刻意不含 done：封帧要把 done 从 false 翻成 true，
-// 若签名覆盖它，翻位那一刻签名自毁。见 docs/specs/03-signing.md
+// 签名域含 done。封帧不再靠翻位，而靠 .part → .json 改名（见 seal），
+// 所以 done 可以留在域内——翻动它即验签失败。
 export function digestOf(env) {
   const bodyHash = createHash("sha256").update(env.body ?? "", "utf8").digest("hex");
   return [
@@ -24,6 +24,7 @@ export function digestOf(env) {
     `from=${env.from}`,
     `to=${env.to}`,
     `type=${env.type}`,
+    `done=${env.done}`,
     `nonce=${env.nonce}`,
     `body-sha256=${bodyHash}`,
   ].join("\n");
@@ -39,17 +40,11 @@ function assertShape(env) {
   if (typeof env.body !== "string") throw new Error("body 必须是字符串");
 }
 
-export function seal({ seq, from, to, type, body, nonce = newNonce(), done = false }, privatePem) {
+export function seal({ seq, from, to, type, body, nonce = newNonce(), done = true }, privatePem) {
   const env = { seq, from, to, type, done, nonce, body };
   assertShape(env);
+  if (done !== true) throw new Error("done 必须为 true：封帧由 .part → .json 改名完成，不靠翻位");
   return { ...env, sig: signDigest(privatePem, digestOf(env)) };
-}
-
-// 封帧第二步：写完 body 后把 done 翻成 true。签名不含 done，故签名跨这次修改存活。
-export function flipDone(env) {
-  const next = { ...env, done: true };
-  assertShape(next);
-  return next;
 }
 
 // 返回 {ok:true, env} 或 {ok:false, reason}

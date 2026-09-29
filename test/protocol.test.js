@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { generateKeypair } from "../src/crypto/keys.js";
-import { seal, flipDone, verifyEnvelope, digestOf, msgFileName } from "../src/proto/envelope.js";
+import { seal, verifyEnvelope, digestOf, msgFileName } from "../src/proto/envelope.js";
 import { loadRoster, keyringOf, isClosed } from "../src/proto/roster.js";
 
 const alice = generateKeypair();
@@ -62,19 +62,21 @@ test("名册里没有的 handle → 拒，且拒因不回显 body", () => {
   assert.ok(!JSON.stringify(r).includes("忽略"), "拒因不得包含 body 内容");
 });
 
-test("03 的核心修正：翻 done 后签名仍有效", () => {
+test("T-6 已修：done 在签名域内，翻动即验不过", () => {
   const env = seal(base, alice.privatePem);
-  assert.equal(env.done, false, "seal 默认未封帧");
-  const sealed = flipDone(env);
-  assert.equal(sealed.done, true);
-  assert.equal(sealed.sig, env.sig, "签名不变");
-  assert.equal(verifyEnvelope(sealed, keys).ok, true, "翻位后必须仍可验");
+  assert.equal(env.done, true, "seal 直接产出已封帧消息");
+  const flipped = { ...env, done: false };
+  assert.equal(verifyEnvelope(flipped, keys).ok, false, "翻 done 必须自毁签名");
 });
 
-test("done 不在签名域：这是取舍不是漏洞，但内容仍在域内", () => {
+test("done 确实在签名域里", () => {
   const env = seal(base, alice.privatePem);
-  assert.ok(!digestOf(env).includes("done="), "done 不得出现在签名域");
+  assert.ok(digestOf(env).includes("done=true"), "done 必须出现在签名域");
   assert.ok(digestOf(env).includes("body-sha256="), "body 必须以摘要进入签名域");
+});
+
+test("seal 拒绝产出未封帧消息", () => {
+  assert.throws(() => seal({ ...base, done: false }, alice.privatePem), /done 必须为 true/);
 });
 
 test("A2 篡改名册换公钥 → 该成员所有消息立刻验不过", () => {

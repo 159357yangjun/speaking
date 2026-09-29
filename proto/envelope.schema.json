@@ -28,7 +28,7 @@
     },
     "done": {
       "type": "boolean",
-      "description": "封帧标志。false 表示仍在写，读方必须跳过。刻意排除在签名域之外，否则翻位即自毁签名——见 docs/specs/03-signing.md。"
+      "description": "封帧标志，恒为 true。**在签名域内**——翻动它即验签失败。封帧靠先写 .part 再改名 .json 完成，不靠翻位。见 docs/specs/03-signing.md。"
     },
     "nonce": {
       "type": "string",
@@ -43,7 +43,7 @@
     "sig": {
       "type": "string",
       "pattern": "^[A-Za-z0-9_-]{86}$",
-      "description": "Ed25519，base64url。签名域 = seq|from|to|type|nonce|sha256(body)，固定顺序拼行。不含 done 与 sig。缺省即读方丢弃。"
+      "description": "Ed25519，base64url。签名域为八行固定顺序拼行：agent-relay/v2 | seq | from | to | type | done | nonce | body-sha256。除 sig 自身外全部字段都在域内。缺省即读方丢弃。"
     }
   }
 }
