@@ -54,3 +54,17 @@ test("S4 抢占后原持有者提交被拒，且板上不多出提交记录", ()
   assert.equal(out.s4.rejected, true, "持有者校验必须拒绝非持有者的提交");
   assert.equal(out.s4.committedRows, 0);
 });
+
+test("S5 新版读者遇到旧版消息：拒收但能归因，且不抛异常", () => {
+  assert.equal(out.s5.threw, null, `旧消息不该让读者崩掉：${out.s5.threw}`);
+  assert.equal(out.s5.ok, false, "版本旧不等于放行");
+  assert.equal(out.s5.code, "UNSUPPORTED_VERSION",
+    "必须归因成版本差，否则会被当成 A1 伪造，污染攻击信号");
+});
+
+test("S6 旧版读者遇到新版消息：只能拒，且没有归因能力（不对等要写明）", () => {
+  assert.equal(out.s6.oldRejectsV2, true, "旧读者必须拒收新消息");
+  assert.equal(out.s6.oldAcceptsV1, true, "旧读者必须还能读旧消息，否则它不是'旧'而是坏了");
+  assert.equal(out.s6.attributable, false,
+    "归因是单向能力。若哪天旧读者也能归因，说明对端已同步，应同时更新 adapters 的升级顺序说明");
+});

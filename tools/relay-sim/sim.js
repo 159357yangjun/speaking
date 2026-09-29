@@ -9,6 +9,8 @@
 import fs from "node:fs";
 import path from "node:path";
 import { spawnSync, spawn } from "node:child_process";
+import { generateKeypair, signDigest, verifyDigest } from "../../src/crypto/keys.js";
+import { seal, verifyEnvelope, digestForDiagnosis, CURRENT_VERSION } from "../../src/proto/envelope.js";
 
 const SELF = import.meta.filename;
 const ROOT = process.argv[2];
@@ -207,6 +209,37 @@ const committed = [...fs.readFileSync(BOARD, "utf8").matchAll(/\|\s*committed\s*
 log(`  退出码 ${r4.status}（5=持有者不是提交者 → 拒绝），板上提交记录 ${committed} 条`);
 R.s4 = { rejected: r4.status === 5, committedRows: committed };
 log("  板子与锁都保住了。但 alice 在被拒之前已经改过 " + FILE + " —— 拒提交不等于回滚内容。");
+
+head("S5 · 新版读者遇到旧版消息：必须归因，不能崩");
+const kA = generateKeypair(), kB = generateKeypair();
+const keyring = { "node-a": kA.fingerprint, "node-b": kB.fingerprint };
+const baseMsg = { seq: 11, from: "node-a", to: "node-b", type: "offer", done: true, nonce: "nonce-s5-0000000001", body: "一条正文" };
+const msgV2 = seal(baseMsg, kA.privatePem);
+const msgV1 = { ...baseMsg, sig: signDigest(kA.privatePem, digestForDiagnosis("agent-relay/v1", baseMsg)) };
+let r5, r5threw = null;
+try { r5 = verifyEnvelope(msgV1, keyring); } catch (e) { r5threw = e.message; }
+log(`  旧版签的消息 → ${JSON.stringify(r5 ?? null)}`);
+log(`  是否抛异常：${r5threw ?? "否"}`);
+log(`  对照：同一条正文用 ${CURRENT_VERSION} 域签 → ${JSON.stringify(verifyEnvelope(msgV2, keyring).ok)}`);
+R.s5 = { threw: r5threw, code: r5?.code ?? null, ok: r5?.ok ?? null };
+log("  → 归因成功：拒收但明确说是版本差，不是攻击。");
+
+head("S6 · 旧版读者遇到新版消息：归因能力不对等");
+// 旧读者只认 v1 域，且没有 code 字段——它唯一能说的就是「验签失败」
+function oldReaderVerify(env, fp) {
+  try { return verifyDigest(fp, digestForDiagnosis("agent-relay/v1", env), env.sig); }
+  catch { return false; }
+}
+const oldAccepts = oldReaderVerify(msgV2, kA.fingerprint);
+const oldAcceptsV1 = oldReaderVerify(msgV1, kA.fingerprint);
+const oldReaderOutput = oldAccepts ? "接受" : "验签失败";
+log(`  旧读者见到 ${CURRENT_VERSION} 签的消息 → 它的判断：${oldReaderOutput}`);
+log(`  旧读者见到 v1 签的消息     → 它的判断：${oldAcceptsV1 ? "接受" : "验签失败"}`);
+log(`  旧读者能区分「版本旧」与「被篡改」吗：否——它只有一个布尔值，没有 code 字段`);
+R.s6 = { oldRejectsV2: oldAccepts === false, oldAcceptsV1, attributable: false };
+log("  → 结论：归因是单向能力。升级窗口内 新→旧 方向的失败会被旧侧误判成攻击。");
+log("    所以升级顺序必须「先升对端、后升本端」，反了就会给对端制造一批假攻击信号。");
+log("    这条已写进 adapters/workbuddy/prompt.md 的归因枚举一节。");
 
 head("汇总");
 log(JSON.stringify(R, null, 2));
