@@ -119,3 +119,86 @@ keys\qoder.pub  keys\workbuddy.pub     ← 公钥，留着是对的
 **`qoder.pem.superseded-2026-09-29` 本身仍然是一把可用的私钥，只是没人按这个名字去找它。**
 确认回滚不再需要之后，应当删除它——删除是破坏性动作，等本人拍。
 在它被删除之前，"qoder 私钥已移出共享区"这句只对**代码路径**成立，对**磁盘内容**不成立。
+
+---
+
+# 更正（同日第二轮，执行人指出）
+
+## 一、"原地改名不删"这一步是错的
+
+第三节的回滚命令已被本节取代。
+
+原地改名 `qoder.pem` → `qoder.pem.superseded-2026-09-29` **一点也没降低暴露**：
+私钥内容还在同一个共享目录、同 UID 照读不误，而且是**同一把钥匙**——
+拿这份残留签名，留在频道的 `qoder.pub` 照样验通。
+"迁出共享区"这个目标当时并未完成，只是换了个文件名。
+
+选"不删"的动机是可逆，但**在这个场景里可逆的代价就是把洞留着**。
+本文第五节当时已经写出这个风险（"只对代码路径成立，对磁盘内容不成立"），
+却仍然把它当成完成态交付——写清楚了问题却没解决问题，这不算修好。
+
+## 二、实际做的两件事
+
+**1) 残留移出频道目录（移动，不删）**
+
+```
+频道 keys/ 终态：qoder.pub  workbuddy.pem  workbuddy.pub      ← 无任何 qoder 私钥
+C:\Users\yyyy\.agent-relay\keys\qoder\qoder.pem                                  sha256 1a0cfc045f…
+C:\Users\yyyy\.agent-relay\keys\qoder\superseded-2026-09-29\qoder.pem            sha256 1a0cfc045f…
+```
+两份哈希相同且等于迁移记录里的原值 → 搬的就是那份，未删。
+
+**2) 删掉代码里的第三档回退（fail-closed）**
+
+`src/cli.js` 的私钥解析从三档变两档：`--keys-dir` → `AGENT_RELAY_KEYS_DIR`，**都没有就直接拒绝**。
+并加一道守卫：**路径落在频道目录树内的私钥，即使被显式指认也拒绝使用**。
+
+理由就是上面那条——只要还存在一条能命中频道内私钥的路径，"已移出共享区"就是假话。
+宁可拒签，也不静默用共享区里的钥匙。
+
+## 三、真实频道复验（不是 tmp 夹具）
+
+```
+2a seal --keys-dir=C:/Users/yyyy/.agent-relay/keys/qoder
+   [密钥来源] --keys-dir → …\.agent-relay\keys\qoder\qoder.pem
+   已写入 …\agents\qoder\msg-00003.json
+2b 对端 drain：新消息 1 条，被拒 0 条，last_seen 2 → 3
+   对端 crypto-helper 验我方消息：VERIFY_OK
+2c legacy msg-00002：{"ok":false,"code":"UNSUPPORTED_VERSION", …}   ← 归因，未崩
+2d 不给 --keys-dir：CLI 退出码 = 1，且 agents/qoder/ 下没有多出 msg-00004
+```
+
+`test/cli-keys.test.js` 用 `mkdtempSync` 造的临时频道验的是**解析逻辑**，
+上面这组验的是**真实频道还能跑**，两者不可互替。
+
+## 四、诱饵断言（挡"静默回退到旧位置"）
+
+频道目录里放一把**另一对密钥**的私钥作诱饵，真私钥放外面。
+若代码任何路径命中诱饵，签出的消息用 roster 公钥就验不过——所以"验通"本身就是"没命中"的证明。
+
+两道守卫各自演示过定向红：
+
+| 变异 | 结果 |
+|---|---|
+| 拆掉"拒绝频道树内私钥"守卫 | `fail 1`：显式把 `--keys-dir` 指进频道目录也要被拒 |
+| 把第三档回退加回来 | `fail 1`：两档都没给时必须拒绝 |
+
+两次还原均字节一致，收尾 43/43。
+
+## 五、修正后的回滚（一条命令）
+
+```
+mv "C:\Users\yyyy\.agent-relay\keys\qoder\superseded-2026-09-29\qoder.pem" \
+   "C:\Users\yyyy\agent-relay\channels\dev\keys\qoder.pem"
+```
+
+**但只把文件移回去已经不够了**——代码第三档已删，移回去也不会被读。
+真要回到迁移前状态，需同时 revert `src/cli.js` 的 `keySource()`（提交 `b3b4127` 的父提交即可）。
+校验哈希应为 `1a0cfc045faba38378527431f2e10dec92e3f5ec1a22879ef74ecfdd76501bd9`。
+
+## 六、仍然没解决的
+
+- `workbuddy.pem` **仍在频道目录内原位**（第四节四步流程未走完，前置是对端去掉硬编码）
+- 同 UID 下任意进程读取：`.agent-relay` 也挡不住，它挡的是"另一个 agent 的授权目录"
+- 私有目录里现在有**两份**同一把私钥（现役 + 备份），这本身是额外的暴露面，
+  确认不需要回滚后应删掉备份那份。删除是破坏性动作，等本人拍。

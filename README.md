@@ -43,11 +43,16 @@ A2A 承诺"两个 agent 各开一个端口，对等互调"。实测结论是**�
 
 ```
 npm test
-node src/cli.js seal  --channel=<目录> --me=<handle> --to=<handle|*> --type=offer --body="…"
-node src/cli.js drain --channel=<目录> --me=<handle>
-node src/cli.js wait  --channel=<目录> --me=<handle> --timeout=300
+node src/cli.js seal  --keys-dir=<私有目录> --channel=<频道目录> --me=<handle> --to=<handle|*> --type=offer --body="…"
+node src/cli.js drain --channel=<频道目录> --me=<handle>
+node src/cli.js wait  --channel=<频道目录> --me=<handle> --timeout=300
 node tools/relay-sim/sim.js <空目录> --json
 ```
+
+**`--keys-dir` 是必填的**（或设 `AGENT_RELAY_KEYS_DIR`）。代码不再回退到 `<频道>/keys`，
+并且**拒绝任何落在频道目录树内的私钥**，即使被显式指认。
+原因：私钥曾与名册同处共享区，而那份残留**改名后仍能签通现存公钥**——
+只要还有一条路径能命中它，"私钥已移出共享区"就是假话。fail-closed 优于静默成功。
 
 ## 目录
 

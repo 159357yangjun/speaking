@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 import { readFileSync, writeFileSync, existsSync, readdirSync, mkdirSync, renameSync } from "node:fs";
-import { join } from "node:path";
+import { join, resolve, sep } from "node:path";
 import { loadRoster, keyringOf } from "./proto/roster.js";
 import { seal, verifyEnvelope, msgFileName, newNonce } from "./proto/envelope.js";
 
@@ -29,18 +29,23 @@ function roster() {
     die(e.message);
   }
 }
-// 私钥解析顺序：--keys-dir → 环境变量 AGENT_RELAY_KEYS_DIR → <频道>/keys
-// 第三档是历史遗留（私钥曾与名册同处共享频道区，双方互读）。保留它只为不弄断旧频道，
-// 但**用了哪一档必须打印出来**——静默回退等于私钥搬家没搬成而没人知道。
+// 私钥解析：只有两档，且**永不回退进频道目录**。
+//
+// 曾有第三档 <频道>/keys。删掉它的理由不是洁癖：私钥曾与名册同处共享频道区，
+// 而该区里那份残留**改名后仍能签通现存的 qoder.pub**——只要还留一条能命中它的路径，
+// "已移出共享区"这句话就是假的。fail-closed：宁可拒绝签名，也不静默用共享区里的钥匙。
 function keySource() {
   if (opt["keys-dir"]) return { dir: opt["keys-dir"], via: "--keys-dir" };
   if (process.env.AGENT_RELAY_KEYS_DIR) return { dir: process.env.AGENT_RELAY_KEYS_DIR, via: "AGENT_RELAY_KEYS_DIR" };
-  return { dir: join(CH, "keys"), via: "回退：<频道>/keys（私钥仍在共享区）" };
+  die("必须给 --keys-dir=<目录> 或设 AGENT_RELAY_KEYS_DIR。代码不再回退到 <频道>/keys——" +
+      "那里可能留着能签通现存公钥的旧私钥。");
 }
 function myKey(handle) {
   const { dir, via } = keySource();
   const p = join(dir, `${handle}.pem`);
   if (!existsSync(p)) die(`找不到私钥 ${p}（来源：${via}）。私钥位置由人填写，不由 agent 生成。`);
+  if (resolve(p).startsWith(resolve(CH) + sep))
+    die(`拒绝使用频道目录内的私钥 ${p}。它来自共享区，即使被显式指认也不用。`);
   process.stderr.write(`[密钥来源] ${via} → ${p}\n`);
   return readFileSync(p, "utf8");
 }
