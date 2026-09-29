@@ -62,6 +62,63 @@ test("schema 的 done 描述不得声称刻意排除在签名域外", () => {
     `schema 的 done 描述与代码矛盾：${s.properties.done.description}`);
 });
 
+// ============ 锁的退码表：README 写的数字必须等于代码里的常量 ============
+// 这条是结构比对，不是 grep 关键词：把表抽成 {退码 → 行文本}，与 src/claims/lock.js
+// 导出的 EXIT 逐值对齐。改代码不改文档 → 红；改文档不改代码 → 红。
+const README = new URL("../README.md", import.meta.url);
+const { EXIT } = await import("../src/claims/lock.js");
+
+function exitTableFromDoc() {
+  const md = readFileSync(README, "utf8");
+  const sec = md.split(/^## /m).find((s) => s.startsWith("文件占用锁"));
+  if (!sec) throw new Error("README 里找不到「文件占用锁」这一节，退码表失去比对对象");
+  const rows = [...sec.matchAll(/^\|\s*(\d+)\s*\|(.*)$/gm)].map((m) => ({ code: Number(m[1]), rest: m[2] }));
+  if (rows.length === 0) throw new Error("「文件占用锁」一节里没有以退码开头的表格行");
+  return rows;
+}
+
+test("README 的锁退码表与代码 EXIT 常量逐值一致（不多、不少、不改号）", () => {
+  const doc = exitTableFromDoc();
+  const docCodes = doc.map((r) => r.code).sort((a, b) => a - b);
+  const codeCodes = [...new Set(Object.values(EXIT))].sort((a, b) => a - b);
+  assert.deepEqual(docCodes, codeCodes,
+    `\n退码表与代码不符。\n  代码 EXIT: ${JSON.stringify(codeCodes)}\n  README 表: ${JSON.stringify(docCodes)}\n`);
+});
+
+test("README 必须把三条关键语义钉在对应退码上，而不是只列个数字", () => {
+  const byCode = Object.fromEntries(exitTableFromDoc().map((r) => [r.code, r.rest]));
+  // 3 = 争用：必须写明不阻塞 + 留痕落在哪个文件
+  assert.match(byCode[3] ?? "", /waiters\.log/, "退码 3 那一行没写留痕文件，读者不知道该去哪看「它在等」");
+  assert.match(byCode[3] ?? "", /否/, "退码 3 必须显式回答阻塞与否");
+  // 5 = 被抢占后原方回来：必须写明"不是当前持有者"
+  assert.match(byCode[5] ?? "", /持有者/, "退码 5 那一行没写明是归属判定");
+  // 6 = TTL 非法：必须写明是拒建而不是取默认值
+  assert.match(byCode[6] ?? "", /拒建|TTL/, "退码 6 那一行没说明它拒绝的是什么");
+});
+
+test("代码里 EXIT 的每个值都能被 CLI 真跑到（防「表里有、代码里永远不会返回」）", async () => {
+  const { spawnSync } = await import("node:child_process");
+  const { mkdtempSync } = await import("node:fs");
+  const os = await import("node:os");
+  const path = await import("node:path");
+  const cli = new URL("../src/cli.js", import.meta.url).pathname.replace(/^\/(\w:)/, "$1");
+  const dir = mkdtempSync(path.join(os.tmpdir(), "relay-exit-"));
+  const run = (args) => spawnSync(process.execPath, [cli, ...args, `--channel=${dir}`], { encoding: "utf8" }).status;
+  const observed = new Set([
+    run(["claim", "--file=src/x.js", "--who=a", "--ttl=600"]),          // 0
+    run(["claim", "--file=src/x.js", "--who=b", "--ttl=600"]),          // 3
+    run(["claim", "--file=src/x.js", "--who=a"]),                        // 6：缺 --ttl
+    run(["claim", "--who=a", "--ttl=600"]),                              // 2：缺 --file
+    run(["release", "--file=src/x.js", "--who=b"]),                      // 5
+    run(["release", "--file=src/x.js", "--who=a"]),                      // 0
+    run(["release", "--file=src/x.js", "--who=a"]),                      // 4
+  ]);
+  const unreachable = [...new Set(Object.values(EXIT))].filter((c) => c !== 0 && !observed.has(c));
+  assert.deepEqual(unreachable, [],
+    `这些退码在 README/代码里存在，但本轮 CLI 实跑一次都没命中：${unreachable.join(", ")}。\n` +
+    `本轮实跑覆盖：${[...observed].sort().join(", ")}。`);
+});
+
 test("文档与 schema 的协议版本必须等于代码版本", () => {
   const codeVersion = domainShapeFromCode()[0];
   const doc = readFileSync(SIGNING_DOC, "utf8");

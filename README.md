@@ -28,26 +28,51 @@ A2A 承诺"两个 agent 各开一个端口，对等互调"。实测结论是**�
 | 能力 | 状态 |
 |---|---|
 | Ed25519 签名与验签 | 已实现 |
-| CLI（seal / drain / wait / show） | 已实现并实跑 |
+| CLI（seal / drain / wait / show / claim / release / locks） | 已实现；`claim` 一组已实跑并逐退码取证 |
 | 伪造 `from` 被拒 | **已实测证伪**：用成员 B 的私钥签成员 A 的 handle → `drain` 拒收，原因"验签失败" |
 | 拒收时不泄漏正文 | **已实测**：伪造正文在全部输出中出现 **0 次** |
 | 篡改 `body` / `to` / `done` 被拒 | 已验证。`done` 自 v2 起在签名域内，v1 那个"翻位即自毁签名"的取舍已用改名封帧消掉 |
 | 名册格式校验、满员判定、nonce 去重 | 已实现 |
 | 文档与代码不漂移 | **`test/docs-drift.test.js` 钉住签名域的版本、字段名与顺序**。施加 v1 变异 → 3 条红、退出码 1；恢复 → 全绿 |
-| 协作机制的并发保证 | **`tools/relay-sim` 可重跑**。旧 markdown 机制 5/5 轮谎报成功；独占锁 + 强制 TTL 机制 0/5 轮，且每轮恰好 1 领取 + 1 明确受阻 |
+| 协作机制的并发保证 | **`tools/relay-sim` 可重跑，且调的是出厂实现 `src/claims/lock.js`**。旧 markdown 机制 **20/20** 轮谎报成功；独占锁 + 强制 TTL **0/20** 轮，且 20/20 轮恰好"1 领取 + 1 明确受阻"。过期锁的 20 路真并发抢占：**1 家赢、19 家受阻**。数字见 `docs/evidence/2026-09-29-claim-mechanism-measurement.md` |
+| 抢锁失败的行为定义 | 见下节退码表。**非阻塞 + 固定退码 3 + 受阻方往 `claims/waiters.log` 追加一行**，`test/docs-drift.test.js` 把退码表钉在代码常量上 |
 | **防篡改 `roster.json` 本身** | **未防护**，见下 |
 | 端到端 5 轮无人往返 | 未跑。定时间隔实测最小 1 小时，且 WorkBuddy 无人值守需本人签风险确认 |
 | adapter | 仅 `adapters/workbuddy/`，能力矩阵 4 项未知 |
 
-测试总数 **26**（protocol 15 · docs-drift 5 · sim 6）。
+测试总数 **63**（protocol 20 · claims 14 · cli-keys 6 · docs-drift 8 · docs-coverage 6 · sim 9）。
 
 ```
 npm test
 node src/cli.js seal  --keys-dir=<私有目录> --channel=<频道目录> --me=<handle> --to=<handle|*> --type=offer --body="…"
 node src/cli.js drain --channel=<频道目录> --me=<handle>
 node src/cli.js wait  --channel=<频道目录> --me=<handle> --timeout=300
+node src/cli.js claim --channel=<频道目录> --file=<路径> --who=<handle> --ttl=<正整数秒>
 node tools/relay-sim/sim.js <空目录> --json
 ```
+
+## 文件占用锁：失败行为定义死了
+
+`claims/` 是频道目录下的一个子目录，一把锁 = 一个用 `O_EXCL` 独占创建出来的小 JSON。
+**这条机制解决的是"两个 agent 同时改同一个文件"**，不是并发写消息。
+
+| 退码 | 场景 | 阻塞吗 | 板上留痕 | 调用方该做什么 |
+|---|---|---|---|---|
+| 0 | 领取成功 / 同持有者续期 / 抢占过期锁 / 持有者释放 | 否，单次尝试 | 正常写 `PROGRESS.md` 自己那行 | 开工 |
+| 2 | 缺 `--file` 或 `--who` | 否 | 不写 | 是命令行写错，改命令重试 |
+| 3 | 锁被别人持有且未过期 | **否**（一次就返回） | **追加一行 `WAIT` 到 `claims/waiters.log`** | 换文件或隔一会儿再抢；放弃时也要让板子说得出"我在等" |
+| 4 | `release` 时压根没有这把锁 | 否 | 不写 | 通常意味着已被回收，回去检查自己那轮是否超时 |
+| 5 | `release`/提交方不是当前持有者——**被抢占后原方回来必须吃这一条** | 否 | 不写 | **不得提交**。自己的改动要重新领取后重做 |
+| 6 | `--ttl` 缺失、非整数、≤0，或 `--ttl` 不带值 | 否 | 不写 | 补一个正整数 TTL。这是拒建，不是默认值 |
+
+三条判定理由，都不是风格偏好：
+
+- **不阻塞。** 阻塞版要自己定轮询间隔和超时，超时后还得再造一个退码；调用方本来就要写重试循环，
+  把循环塞进 CLI 等于替 agent 决定了等待策略。非阻塞 + 固定退码 3，等多久归它自己管。
+- **受阻必须留一行 `WAIT`。** 不留痕，旁观者只看得到"这个目录没变化"，
+  分不清"它在等锁"和"它根本没干活"——后者会被当成对端失联，而失联是会被升级成人工介入的。
+- **TTL 必填，且 `ttl=0` 从入口拒建。** 实测过无过期时间的锁后来者无权回收，
+  一把脏锁能把整个频道永久卡死。存量违规锁（手改或旧版残留）另给一条回收路径：`locks` 标成"违规(无TTL)"，`claim` 可回收它。
 
 **`--keys-dir` 是必填的**（或设 `AGENT_RELAY_KEYS_DIR`）。代码不再回退到 `<频道>/keys`，
 并且**拒绝任何落在频道目录树内的私钥**，即使被显式指认。
@@ -68,10 +93,11 @@ docs/
   specs/               00 范围 · 01 信封 · 02 身份 · 03 签名 · 04 传输 · 05 威胁模型 · 06 版本兼容
   evidence/            实测证据，带日期与来源
 proto/                 机器可读格式 + 人写的两份提示词。不含任何产品名
-src/                   crypto/ + proto/ + cli.js，与厂商无关
-tools/relay-sim/       协作机制推演器，可重跑
+src/                   crypto/ + proto/ + claims/ + cli.js，与厂商无关
+tools/relay-sim/       协作机制推演器，可重跑；直接 import src/claims/lock.js
+tools/claims/          red-demo.mjs，变异演示：把实现逐处改坏，确认对应断言真的红
 tools/compat/          legacy-probe.js，只读探针：旧消息在新代码下会怎样
-test/                  protocol · docs-drift · sim
+test/                  protocol · claims · cli-keys · docs-drift · docs-coverage · sim
 experiments/           一次性验证，自带结论 README
 adapters/              workbuddy/ —— 产品知识只能待在这里
 ```
@@ -115,7 +141,7 @@ adapters/              workbuddy/ —— 产品知识只能待在这里
 
 | # | 判据 | 为什么是这条 | 当前 |
 |---|---|---|---|
-| 1 | `npm test` 全绿，**且每条守门断言都演示过红** | 没红过的断言不知道活没活。本项目已抓到过一条永远开不了火的死断言 | ✅ 45/45 |
+| 1 | `npm test` 全绿，**且每条守门断言都演示过红** | 没红过的断言不知道活没活。本项目已抓到过一条永远开不了火的死断言 | ✅ 63/63；锁这组 8 处变异逐条打红，记录见 `docs/evidence/2026-09-29-claim-mechanism-measurement.md` 第四节 |
 | 2 | 新增文档已登记进受检清单 | 文档会加，加了就静默逃检——已经发生过一次 | ✅ 规则A/C/D 守着 |
 | 3 | 仓库里不含"已防"式无条件结论 | 无条件结论会被下一轮当结论用。A3 已按此降级为条件防护 | ✅ |
 | 4 | **归因枚举已被对端实际跑过一轮** | 没跑过，`adapters/` 里那份就只是**未验证的接口约定**，推上去等于对外发布未验证的东西 | ❌ 待本人执行，文本已备好 |
