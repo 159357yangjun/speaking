@@ -2,7 +2,7 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "agent-relay/proto/envelope",
   "title": "envelope",
-  "description": "一条消息。信封字段由代码判断，body 由模型判断，两者权限不同。",
+  "description": "一条消息。信封字段由代码判断，body 由模型判断，两者权限不可互越。实现见 src/proto/envelope.js。",
   "type": "object",
   "required": ["seq", "from", "to", "type", "done", "nonce", "body"],
   "additionalProperties": false,
@@ -10,12 +10,12 @@
     "seq": {
       "type": "integer",
       "minimum": 1,
-      "description": "全局单调递增。写方读当前最大值 +1 自取。"
+      "description": "写方自取。文件名 5 位零填充：msg-00007.json。全局唯一不成立，读方按 (from,seq) 去重。"
     },
     "from": {
       "type": "string",
       "pattern": "^[a-z0-9-]{1,32}$",
-      "description": "handle。必须与 sig 对应的公钥一致，不接受正文自称。"
+      "description": "handle。必须与 sig 对应的 roster 公钥验签通过，不接受正文自称。"
     },
     "to": {
       "type": "string",
@@ -28,23 +28,22 @@
     },
     "done": {
       "type": "boolean",
-      "description": "封帧标志。false 表示仍在写，读方必须跳过。写一半崩溃的残留因 false 永久被忽略。"
+      "description": "封帧标志。false 表示仍在写，读方必须跳过。刻意排除在签名域之外，否则翻位即自毁签名——见 docs/specs/03-signing.md。"
     },
     "nonce": {
       "type": "string",
-      "minLength": 16,
-      "maxLength": 64,
-      "description": "防重放随机数。同一 handle 内不得重复。"
+      "pattern": "^[A-Za-z0-9_-]{16,64}$",
+      "description": "base64url。防重放。同一 handle 内不得重复。"
     },
     "body": {
       "type": "string",
       "maxLength": 200000,
-      "description": "自由文本。协议不解析、不因其内容改变行为。"
+      "description": "自由文本。以 SHA-256 摘要进入签名域，故被完整覆盖。协议不解析、不因其内容改变行为。"
     },
     "sig": {
       "type": "string",
-      "pattern": "^[A-Za-z0-9+/=]{86,100}$",
-      "description": "Ed25519，覆盖除 sig 自身外的全部字段，含 body。缺省时读方丢弃该消息。"
+      "pattern": "^[A-Za-z0-9_-]{86}$",
+      "description": "Ed25519，base64url。签名域 = seq|from|to|type|nonce|sha256(body)，固定顺序拼行。不含 done 与 sig。缺省即读方丢弃。"
     }
   }
 }

@@ -5,7 +5,7 @@
 发起方 agent 只允许填写 `{{...}}` 参数，产出一份填好的副本交给新成员。
 副本写进发起方自己的前缀目录 `agents/<发起方 handle>/joins/`，不得写回本文件。
 
-理由见 `docs/specs/2026-09-28-bootstrap-and-identity-design.md` 第二节：
+理由见 `docs/specs/02-identity.md` 第二节：
 如果发起方能自由撰写别人要照做的指令，它就拥有对整个频道的指令权。
 
 ---

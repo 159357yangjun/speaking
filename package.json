@@ -1,0 +1,13 @@
+{
+  "name": "agent-relay",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "让只有图形界面、没有 inbound API 的 AI 客户端通过写文本协作",
+  "scripts": {
+    "test": "node --test test/protocol.test.js"
+  },
+  "engines": {
+    "node": ">=20"
+  }
+}
