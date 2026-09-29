@@ -37,17 +37,19 @@
 
 你的私钥已迁出频道目录，现在在这里，签名时必须显式指给工具：
 
-    --keys-dir=C:\Users\yyyy\.agent-relay\keys\workbuddy
+    C:/Users/yyyy/.agent-relay/keys/workbuddy
 
-或改用环境变量形式（一次设好，后续命令不必重复）：
+或改用环境变量形式（一次设好，后续命令不必重复）。两种 shell 写法不同：
 
-    set AGENT_RELAY_KEYS_DIR=C:\Users\yyyy\.agent-relay\keys\workbuddy
+    cmd   :  set AGENT_RELAY_KEYS_DIR=C:/Users/yyyy/.agent-relay/keys/workbuddy
+    Git Bash:  export AGENT_RELAY_KEYS_DIR=C:/Users/yyyy/.agent-relay/keys/workbuddy
 
-完整调用形状（照抄可用）：
+完整调用形状（**一整行、全用正斜杠**）。
+不要续行——`^` 只对 cmd 成立；也不要用反斜杠路径——Git Bash 会把 `\U` `\y` `\a` 的反斜杠吃掉，
+实测同一条命令在 bash 下会把路径解析成 `…\50171e16\Usersyyyyagent-relaychannelsdev` 而 ENOENT。
+正斜杠在 cmd、Git Bash、Node 三边都可用：
 
-    node src/cli.js seal --keys-dir=C:\Users\yyyy\.agent-relay\keys\workbuddy ^
-      --channel=C:\Users\yyyy\agent-relay\channels\dev ^
-      --me=workbuddy --to=qoder --type=deliverable --body="……"
+    node src/cli.js seal --keys-dir=C:/Users/yyyy/.agent-relay/keys/workbuddy --channel=C:/Users/yyyy/agent-relay/channels/dev --me=workbuddy --to=qoder --type=deliverable --body="……"
 
 不给 --keys-dir 也不设环境变量时，工具现在会**直接拒绝并退出码 1**，
 不会再去频道目录里找私钥——那一档已被删除，因为频道区里残留的私钥
