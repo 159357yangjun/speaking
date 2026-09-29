@@ -3,6 +3,7 @@ import { readFileSync, writeFileSync, existsSync, readdirSync, mkdirSync, rename
 import { join, resolve, sep } from "node:path";
 import { loadRoster, keyringOf } from "./proto/roster.js";
 import { seal, verifyEnvelope, msgFileName, newNonce } from "./proto/envelope.js";
+import { acquire, release, list, noteWait, EXIT } from "./claims/lock.js";
 
 const args = process.argv.slice(2);
 const cmd = args[0];
@@ -144,6 +145,76 @@ if (cmd === "wait") {
   }
 }
 
+// 缺参数走 2，不走 die 的 1：README 的锁退码表里 2 就是"参数缺失"，
+// 让表格和代码不一致等于再造一次"文档教错规则"。
+function needArg(value, name) {
+  if (value === undefined) {
+    console.error(`✗ 参数缺失（exit ${EXIT.BAD_ARG}）：缺 --${name}`);
+    process.exit(EXIT.BAD_ARG);
+  }
+  return value;
+}
+
+// 文件占用锁：单次尝试，**默认不阻塞**。
+// 为什么不阻塞：阻塞版要自己决定轮询间隔与超时，超时后又得映射成一个新退码；
+// 而调用方本来就要重试循环——把循环放在 CLI 里等于替 agent 决定了等待策略。
+// 非阻塞 + 固定退码 3，让调用方自己决定等多久、放弃几次。
+if (cmd === "claim") {
+  const CLAIMS = join(CH, "claims");
+  const file = needArg(opt.file, "file=<要占用的文件>");
+  const who = needArg(opt.who, "who=<handle>");
+  const r = acquire({ claimsDir: CLAIMS, file, who, ttl: opt.ttl });
+  // 退码一律取 r.code，不在这里按 status 重新映射一遍：
+  // M7 变异演示暴露过——CLI 自己 re-map 的话，模块里的 code 字段不在可观测路径上，
+  // 改它测不出红，那条"每个退码都能实跑到"的断言就是死的。
+  if (r.status === "refused") {
+    console.error(`✗ 拒建（exit ${r.code}）：${r.reason}`);
+    process.exit(r.code);
+  }
+  if (r.status === "blocked") {
+    // 被挡住必须留下一行：否则旁观者看见目录没变化，分不清「它在等锁」和「它没干活」
+    const line = noteWait({ claimsDir: CLAIMS, file, who, holder: r.holder, ageS: r.ageS, ttl: r.ttl });
+    console.log(`✗ 受阻（exit ${r.code}）：${file} 被 ${r.holder} 占着，已 ${r.ageS?.toFixed?.(1) ?? "?"}s / TTL ${r.ttl ?? "?"}s`);
+    console.log(`  已登记：${line}`);
+    process.exit(r.code);
+  }
+  console.log(
+    r.status === "stolen"
+      ? `✓ 抢占 ${file} → ${who}：原持有者 ${r.prevHolder}，回收原因：${r.why}`
+      : r.status === "renewed"
+        ? `✓ 续期 ${file} → ${who}：本来就归你，TTL 重置为 ${r.ttl}s（此前已持有 ${r.ageS.toFixed(1)}s）`
+        : `✓ 领取 ${file} → ${who}（TTL ${r.ttl}s）`
+  );
+  console.log(`  锁文件：${r.path}`);
+  process.exit(EXIT.OK);
+}
+
+if (cmd === "release") {
+  const file = needArg(opt.file, "file");
+  const who = needArg(opt.who, "who");
+  const r = release({ claimsDir: join(CH, "claims"), file, who });
+  // 同 claim：退码只从 r.code 出处走，不在 CLI 里再抄一遍常量
+  if (r.status === "no-lock") { console.log(`✗ 无锁可放（exit ${r.code}）：${file}`); process.exit(r.code); }
+  if (r.status === "not-holder") {
+    console.log(`✗ 拒绝释放（exit ${r.code}）：${file} 现在属于 ${r.holder}，不是 ${who}`);
+    console.log("  这条就是「被抢占后原方回来 release 必须被拒」：锁的归属以文件内容为准，不以谁写的为准。");
+    process.exit(r.code);
+  }
+  console.log(`✓ 已释放 ${file}`);
+  process.exit(r.code);
+}
+
+if (cmd === "locks") {
+  const CLAIMS = join(CH, "claims");
+  const rows = list({ claimsDir: CLAIMS });
+  const wl = join(CLAIMS, "waiters.log");
+  const waits = existsSync(wl) ? readFileSync(wl, "utf8").trim().split("\n").filter(Boolean).length : 0;
+  console.log(`锁 ${rows.length} 把，等待登记 ${waits} 行：`);
+  for (const x of rows) console.log(`  ${x.lock}  持有者=${x.holder}  已占 ${x.ageS}s / TTL ${x.ttl}s  ${x.state}`);
+  if (!rows.length) console.log("  （当前无锁）");
+  process.exit(EXIT.OK);
+}
+
 function scanNew(me, keys, since) {
   const seen = seenNonces(me);
   const ok = [];
@@ -187,5 +258,14 @@ console.log(`agent-relay CLI
   wait   --channel=<目录> --me=<handle> [--timeout=300] [--every=5]     阻塞到新消息出现，替代盲等 sleep
   show   --channel=<目录>
 
+  claim    --channel=<目录> --file=<路径> --who=<handle> --ttl=<正整数秒>
+  release  --channel=<目录> --file=<路径> --who=<handle>
+  locks    --channel=<目录>
+
 封帧：seal 先写 msg-N.json.part，再改名为 msg-N.json。读者只看 .json，永远读不到半截文件。
-done 在签名域内——翻动它即验签失败。`)
+done 在签名域内——翻动它即验签失败。
+
+锁的退码：0 拿到/续期/释放成功，2 参数缺失，3 被别人占着（非阻塞，已写 waiters.log），
+4 没有这把锁，5 持有者不是你不是我，6 TTL 非法（缺失、非正整数）。
+--ttl 必填：允许 ttl=0 等于允许一把永远卡死频道的脏锁。
+同一持有者重复 claim = 续期（TTL 重置）；锁过期后被他人抢占，原方回来 release 得 exit 5。`)
