@@ -27,19 +27,26 @@ A2A 承诺"两个 agent 各开一个端口，对等互调"。实测结论是**�
 
 | 能力 | 状态 |
 |---|---|
-| Ed25519 签名与验签 | **已实现，14 项测试全通过** |
-| 伪造 `from` 被拒 | 已验证（用错误私钥签合法 handle） |
+| Ed25519 签名与验签 | **已实现，14 项单元测试全通过** |
+| CLI（seal / drain / show） | **已实现并实跑** |
+| 伪造 `from` 被拒 | **已实测证伪**：用成员 B 的私钥签成员 A 的 handle → `drain` 拒收，原因"验签失败" |
+| 拒收时不泄漏正文 | **已实测**：伪造正文在全部输出中出现 **0 次** |
 | 篡改 `body` / `to` 被拒 | 已验证 |
-| 名册里没有的 handle 被拒，且拒因不回显 body | 已验证 |
 | 封帧翻 `done` 后签名仍有效 | 已验证 |
-| 名册格式校验与满员判定 | 已实现 |
+| 名册格式校验、满员判定、nonce 去重 | 已实现 |
 | **防篡改 `roster.json` 本身** | **未防护，见下** |
-| 端到端跑通 5 轮无人往返 | 未做 |
-| 任何 adapter | 未写 |
+| 端到端 5 轮无人往返 | 未跑。卡在两个未验证前提，见 `adapters/workbuddy/README.md` |
+| adapter | 仅 `adapters/workbuddy/`，能力矩阵有 4 项未知 |
 
 ```
-npm test     # 或 node --test test/protocol.test.js
+npm test
+node src/cli.js seal  --channel=<目录> --me=<handle> --to=<handle|*> --type=offer --body="…"
+node src/cli.js drain --channel=<目录> --me=<handle>
+node src/cli.js show  --channel=<目录>
 ```
+
+**一处实现与规范的偏离**：`seal` 一次写完 `done:true`，没走"先 false 再翻 true"。
+本机单写者场景没有半截风险；跨 agent 的两次写只在 adapter 里需要，规范保留该要求。
 
 ## 目录
 
@@ -55,10 +62,10 @@ docs/
   specs/               00 范围 · 01 信封 · 02 身份 · 03 签名 · 04 传输 · 05 威胁模型
   evidence/            实测证据，带日期与来源
 proto/                 机器可读格式 + 人写的两份提示词。不含任何产品名
-src/                   crypto/ + proto/，与厂商无关
+src/                   crypto/ + proto/ + cli.js，与厂商无关
 test/                  协议层测试
 experiments/           一次性验证，自带结论 README
-adapters/              空。产品知识只能待在这里
+adapters/              workbuddy/ —— 每个目标客户端一个目录，产品知识只能待在这里
 ```
 
 依赖方向单向：`adapters → src → proto`，反向 import 即违规。
