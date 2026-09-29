@@ -11,6 +11,7 @@ import path from "node:path";
 import { spawnSync, spawn } from "node:child_process";
 import { generateKeypair, signDigest, verifyDigest } from "../../src/crypto/keys.js";
 import { seal, verifyEnvelope, digestForDiagnosis, CURRENT_VERSION } from "../../src/proto/envelope.js";
+import { acquire, release, lockFileName, EXIT } from "../../src/claims/lock.js";
 
 const SELF = import.meta.filename;
 const ROOT = process.argv[2];
@@ -53,7 +54,8 @@ function resetRun() {
   fs.rmSync(OUT, { recursive: true, force: true });
 }
 function lockPath(f) {
-  return path.join(CLAIMS, f.replace(/[^\w]/g, "_") + ".lock");
+  // 用出厂的文件名净化，不用这里自己写一遍——两套命名规则会让"实测的是哪套"失去意义
+  return path.join(CLAIMS, lockFileName(f));
 }
 
 // ============================ 子进程模式 ============================
@@ -80,74 +82,60 @@ if (mode === "--rmw") {
   process.exit(0);
 }
 
-// 新机制：独占创建锁 → 拿到锁才写板。TTL 必须为正整数。
+// 新机制：**直接调用出厂实现** src/claims/lock.js，不在这里另写一份。
+// 之前这里手写了一份"独占创建 + 过期就覆盖写"的复制品，量出 0/20。
+// 那个数字测的不是出厂机制：复制品没有 rename 仲裁，实测同场景会出 12/20 双主
+// （见 tools/claims/red-demo.mjs 的 M3）。推演器和实现分家，量出来的就是两个东西。
 if (mode === "--claimrmw") {
   const who = process.argv[4];
-  const ttl = parseInt(process.argv[5], 10);
-  if (!Number.isInteger(ttl) || ttl <= 0) {
-    log(`  CHILD ${who}: 拒绝领取 —— TTL 必须是正整数（收到 "${process.argv[5]}"）。无过期时间的锁不允许存在。`);
+  const r = acquire({ claimsDir: CLAIMS, file: FILE, who, ttl: process.argv[5] });
+  if (r.status === "refused") {
+    log(`  CHILD ${who}: 拒绝领取 —— ${r.reason}`);
     mark(who, "refused");
-    process.exit(6);
+    process.exit(EXIT.BAD_TTL);
   }
-  fs.mkdirSync(CLAIMS, { recursive: true });
-  const lock = lockPath(FILE);
-  const claim = () => {
-    fs.writeFileSync(lock, JSON.stringify({ who, at: Date.now(), ttl }));
-    const b = fs.readFileSync(BOARD, "utf8");
-    const rows = b.split("\n");
-    rows.splice(rows.findIndex((r) => r.startsWith("|---")) + 1, 0, `| ${FILE} | ${who} | now |`);
-    fs.writeFileSync(BOARD, rows.join("\n"));
-    mark(who, "claimed");
-  };
-  try {
-    fs.writeFileSync(lock, "", { flag: "wx" }); // 已存在即 EEXIST
-    claim();
-    log(`  CHILD ${who}: 领取 ${FILE} 成功（TTL=${ttl}s），已写板`);
-    process.exit(0);
-  } catch (e) {
-    if (e.code !== "EEXIST") throw e;
-    const cur = JSON.parse(fs.readFileSync(lock, "utf8") || "{}");
-    const ageS = (Date.now() - (cur.at || 0)) / 1000;
-    if (cur.ttl && ageS > cur.ttl) {
-      claim();
-      log(`  CHILD ${who}: 持有者 ${cur.who} 已超时 ${ageS.toFixed(1)}s > ${cur.ttl}s → 抢占并写板`);
-      process.exit(0);
-    }
-    log(`  CHILD ${who}: ${FILE} 被 ${cur.who} 持有（${ageS.toFixed(1)}s 前，TTL=${cur.ttl}s）→ 未写板`);
+  if (r.status === "blocked") {
+    log(`  CHILD ${who}: ${FILE} 被 ${r.holder} 持有（${r.ageS.toFixed(1)}s 前，TTL=${r.ttl}s）→ 未写板`);
     mark(who, "blocked");
-    process.exit(3);
+    process.exit(EXIT.BLOCKED);
   }
+  const b = fs.readFileSync(BOARD, "utf8");
+  const rows = b.split("\n");
+  rows.splice(rows.findIndex((x) => x.startsWith("|---")) + 1, 0, `| ${FILE} | ${who} | now |`);
+  fs.writeFileSync(BOARD, rows.join("\n"));
+  mark(who, "claimed");
+  log(`  CHILD ${who}: ${r.status === "stolen" ? `抢占成功（原持有者 ${r.prevHolder}，${r.why}）` : r.status === "renewed" ? "续期持有" : "领取成功"} ${FILE}（TTL=${r.ttl}s），已写板`);
+  process.exit(EXIT.OK);
 }
 
-// 提交：持有者必须等于提交者。
+// 提交：持有者必须等于提交者——归属判定直接复用 release()，不在推演器里重写一遍。
 if (mode === "--commit") {
   const who = process.argv[4];
-  const lock = lockPath(FILE);
-  if (!fs.existsSync(lock)) {
+  const r = release({ claimsDir: CLAIMS, file: FILE, who });
+  if (r.status === "no-lock") {
     log(`  CHILD ${who}: ${FILE} 无锁可提交`);
-    process.exit(4);
+    process.exit(EXIT.NO_LOCK);
   }
-  const cur = JSON.parse(fs.readFileSync(lock, "utf8"));
-  if (cur.who !== who) {
-    log(`  CHILD ${who}: 当前持有者是 ${cur.who}，不是提交者 → 拒绝`);
-    process.exit(5);
+  if (r.status === "not-holder") {
+    log(`  CHILD ${who}: 当前持有者是 ${r.holder}，不是提交者 → 拒绝`);
+    process.exit(EXIT.NOT_HOLDER);
   }
-  fs.unlinkSync(lock);
   fs.writeFileSync(BOARD, fs.readFileSync(BOARD, "utf8") + `| ${FILE} | ${who} | committed |\n`);
   log(`  CHILD ${who}: 提交 ${FILE}，锁已释放`);
-  process.exit(0);
+  process.exit(EXIT.OK);
 }
 
 // ============================ 父进程编排 ============================
 const child = (args) => spawnSync(process.execPath, [SELF, ROOT, ...args], { encoding: "utf8" });
 // 真并发：全部 spawn 出去，再用一个等待子进程同步轮询 pid。
 // 不能用 spawnSync —— 那是顺序执行，演示不出竞态。
+// 这里必须收回每个子进程的退出码：只数"板上有几行"看不出"几家自称拿到了锁"。
 function runConcurrent(specs) {
-  const pids = specs.map((s) => spawn(process.execPath, [SELF, ROOT, ...s], { stdio: "inherit" }).pid);
-  spawnSync(process.execPath, ["-e",
-    `const pids=${JSON.stringify(pids)};` +
-    `const alive=p=>{try{process.kill(p,0);return true}catch(e){return false}};` +
-    `const t=Date.now();while(pids.some(alive)&&Date.now()-t<60000){}`]);
+  const kids = specs.map((s) => {
+    const p = spawn(process.execPath, [SELF, ROOT, ...s], { stdio: "inherit" });
+    return new Promise((res) => p.on("close", (code) => res(code)));
+  });
+  return Promise.all(kids);
 }
 
 if (mode) process.exit(2); // 未知子模式
@@ -165,26 +153,59 @@ R.s1 = { rows: boardRows().length, ok: boardRows().length === 1 && boardRows()[0
 log(`  板上占用行：${boardRows().join(" , ")} → 串行场景两种机制都成立`);
 
 head("S2 · 并发抢同一文件：谎报成功数 = 自称领到人数 − 实际持有者数");
+// N=20 而不是 5：5 次排不掉"偶尔没撞上"，会让人误以为旧机制只是不稳而不是根本不安全。
+const ROUNDS = parseInt(process.env.RELAY_SIM_ROUNDS || "20", 10);
+log(`  两个进程同时抢 ${FILE}，各跑 ${ROUNDS} 轮。\n`);
+
 let lieOld = 0;
-for (let i = 1; i <= 5; i++) {
+const oldRows = [];
+for (let i = 1; i <= ROUNDS; i++) {
   resetRun();
-  runConcurrent([["--rmw", "alice"], ["--rmw", "bob"]]);
+  await runConcurrent([["--rmw", "alice"], ["--rmw", "bob"]]);
   const v = verdicts(), rows = boardRows().length, lie = v.claimed - rows;
   if (lie > 0) lieOld++;
-  log(`  旧机制 第${i}轮：自称领取 ${v.claimed}，板上 ${rows} 行 → 谎报 ${lie}${lie ? "  ← 有人以为锁是自己的" : ""}`);
+  oldRows.push(lie);
+  if (i <= 3 || lie > 0 === false) log(`  旧机制 第${String(i).padStart(2)}轮：自称领取 ${v.claimed}，板上 ${rows} 行 → 谎报 ${lie}`);
 }
 let lieNew = 0, cleanNew = 0;
+const newRows = [];
 log("");
-for (let i = 1; i <= 5; i++) {
+for (let i = 1; i <= ROUNDS; i++) {
   resetRun();
-  runConcurrent([["--claimrmw", "alice", "5"], ["--claimrmw", "bob", "5"]]);
+  await runConcurrent([["--claimrmw", "alice", "5"], ["--claimrmw", "bob", "5"]]);
   const v = verdicts(), locks = lockCount(), lie = v.claimed - locks;
   if (lie > 0) lieNew++;
   if (v.claimed === 1 && v.blocked === 1 && locks === 1) cleanNew++;
-  log(`  新机制 第${i}轮：领取成功 ${v.claimed}，明确受阻 ${v.blocked}，锁 ${locks} 把 → 谎报 ${lie}`);
+  newRows.push(lie);
 }
-R.s2 = { rounds: 5, lieOld, lieNew, cleanNew };
-log(`\n  旧机制 ${lieOld}/${5} 轮谎报；新机制 ${lieNew}/${5} 轮谎报，且 ${cleanNew}/5 轮恰好"1 领取 + 1 受阻"`);
+log(`  旧机制 ${ROUNDS} 轮逐轮谎报数：[${oldRows.join(", ")}]`);
+log(`  新机制 ${ROUNDS} 轮逐轮谎报数：[${newRows.join(", ")}]`);
+R.s2 = { rounds: ROUNDS, lieOld, lieNew, cleanNew, oldRows, newRows };
+log(`\n  并排结果：旧机制 ${lieOld}/${ROUNDS} 轮谎报；新机制 ${lieNew}/${ROUNDS} 轮谎报，` +
+    `且 ${cleanNew}/${ROUNDS} 轮恰好"1 领取 + 1 明确受阻"`);
+
+// S2b：上一轮只测了"未过期并发"。过期锁的抢占是另一条路径，也是上一版最容易出双主的路径
+// （读到过期 → 自己动手写，两个进程都这么干就两个都自称赢）。这里单独量。
+head(`S2b · ${ROUNDS} 个进程真并发抢同一把**已过期**锁`);
+resetRun();
+child(["--claimrmw", "stale-holder", "1"]);
+log(`  先由 stale-holder 建一把 TTL=1s 的锁，等它过期…`);
+sleepMs(1400);
+log("");
+const stealCodes = await runConcurrent(
+  Array.from({ length: ROUNDS }, (_, i) => ["--claimrmw", `racer-${i}`, "60"])
+);
+const stealWinners = stealCodes.filter((c) => c === EXIT.OK).length;
+const stealBlocked = stealCodes.filter((c) => c === EXIT.BLOCKED).length;
+// 只数 racer 写的行。板上此刻本来就有 stale-holder 那一行，
+// 拿"总行数==1"当判据会把 2 行误报成双主——上一版就是这么写错的，红得毫无道理。
+const racerRows = boardRows().filter((r) => /←racer-/.test(r)).length;
+const finalHolder = JSON.parse(fs.readFileSync(lockPath(FILE), "utf8")).who;
+R.s2b = { rounds: ROUNDS, winners: stealWinners, blocked: stealBlocked, racerRows, boardRows: boardRows().length, finalHolder, codes: stealCodes };
+log(`\n  退出码分布：0（拿到）×${stealWinners}，3（受阻）×${stealBlocked}`);
+log(`  racer 写入板上的行：${racerRows} 行（另有 stale-holder 的 1 行旧声明）；锁最终持有者：${finalHolder}`);
+log(`  → ${stealWinners === 1 && racerRows === 1 ? "单赢家成立：抢占走 rename 仲裁，只有搬走过期锁的那家能建新锁，写板的那家和持锁的那家同一家" : `异常：赢家 ${stealWinners} 家 / 写板 ${racerRows} 行`}`);
+log(`    对照：把仲裁换成「先删再建」，同场景 20 家里 12 家自称赢（tools/claims/red-demo.mjs 的 M3）`);
 
 head("S3 · 脏声明：领了锁就崩，不收尾");
 resetRun();

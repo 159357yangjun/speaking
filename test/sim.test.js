@@ -41,6 +41,18 @@ test("S2 新机制（独占锁 + 强制 TTL）零谎报", () => {
     "每轮必须恰好 1 人领取 + 1 人明确受阻；出现两个领取或两个受阻都是机制退化");
 });
 
+test("S2b 过期锁的 20 路真并发抢占：恰好 1 家赢，且只有赢家写板", () => {
+  // 这条盯的是**抢占路径**，和上面那条盯的"未过期并发"不是同一段代码。
+  // 上一版抢占用"先删再建"，20 家里会有多家自称赢（实测 6/7/12 家），
+  // 而在未过期场景里量不出来——只测后者就是一半覆盖冒充全覆盖。
+  assert.equal(out.s2b.winners, 1,
+    `${out.s2b.rounds} 家并发抢过期锁，自称赢 ${out.s2b.winners} 家。双主 = 锁失效`);
+  assert.equal(out.s2b.racerRows, 1,
+    `写板的 racer 应有 1 行，实际 ${out.s2b.racerRows} 行——持锁的和写板的不是同一家`);
+  assert.equal(out.s2b.blocked, out.s2b.rounds - 1, "其余必须全部明确受阻，不许静默消失");
+  assert.match(out.s2b.finalHolder, /^racer-/, "最终持有者必须是 20 家抢占者之一");
+});
+
 test("S3a 拒绝无过期时间的锁（ttl=0 与非数字）", () => {
   assert.equal(out.s3a.refusedZeroTtl, true, "ttl=0 必须被拒绝，否则脏声明会永久阻塞");
 });
