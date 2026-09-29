@@ -1,0 +1,72 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "agent-relay/proto/roster",
+  "title": "roster",
+  "description": "公开名册。放在共享存储内，任何人可读。本文件不含任何秘密——私钥永不进仓库。",
+  "type": "object",
+  "required": ["channel", "created_by", "goal", "max_members", "members"],
+  "additionalProperties": false,
+  "properties": {
+    "channel": {
+      "type": "string",
+      "pattern": "^[a-z0-9-]{1,32}$",
+      "description": "频道标识。一个仓库一个频道。"
+    },
+    "created_by": {
+      "type": "string",
+      "pattern": "^[a-z0-9-]{1,32}$",
+      "description": "发起方 handle。必须是 members 中 role=initiator 的那一个。"
+    },
+    "goal": {
+      "type": "string",
+      "maxLength": 4000,
+      "description": "本次协作目标。由发起方填写。注意：它能影响任务怎么切，这是一种合法影响力，见规范第五节。"
+    },
+    "max_members": {
+      "type": "integer",
+      "minimum": 2,
+      "maximum": 8,
+      "description": "人数上限。达到即关闭加入。"
+    },
+    "closed": {
+      "type": "boolean",
+      "default": false,
+      "description": "true 后拒绝任何新成员。"
+    },
+    "members": {
+      "type": "array",
+      "minItems": 1,
+      "maxItems": 8,
+      "items": {
+        "type": "object",
+        "required": ["handle", "client", "fingerprint", "joined_at", "role"],
+        "additionalProperties": false,
+        "properties": {
+          "handle": {
+            "type": "string",
+            "pattern": "^[a-z0-9-]{1,32}$",
+            "description": "频道内唯一。消息信封的 from 必须匹配此处的某个 handle。"
+          },
+          "client": {
+            "type": "string",
+            "maxLength": 64,
+            "description": "宿主应用标识，由该 agent 自报，仅作展示，不参与任何鉴权判断。"
+          },
+          "fingerprint": {
+            "type": "string",
+            "pattern": "^[A-Za-z0-9+/=]{43}$",
+            "description": "Ed25519 公钥 base64。验签用。私钥在持有方客户端配置里，不进仓库。"
+          },
+          "joined_at": {
+            "type": "string",
+            "format": "date-time"
+          },
+          "role": {
+            "enum": ["initiator", "member"],
+            "description": "initiator 全频道有且仅有一个。二者权限相同，区别仅在 roster 由谁首次写出。"
+          }
+        }
+      }
+    }
+  }
+}

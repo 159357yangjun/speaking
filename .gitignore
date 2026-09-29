@@ -1,0 +1,13 @@
+# 私钥永不进仓库
+*.pem
+*.key
+id_ed25519
+*.p12
+*.pfx
+secrets/
+.env
+.env.*
+
+# agent 运行时产物，验证时按需保留，不入库
+agents/*/.last_seen
+*.tmp
