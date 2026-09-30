@@ -98,6 +98,15 @@ function countRow(board, f, w) {
   return board.split(/\r?\n/).filter((l) => l.includes(`| ${f} |`) && l.includes(`| ${w} |`)).length;
 }
 
+// 第二把尺子：按**令牌**数，而不是按"文件名 + 人"这两个格子数。
+// 为什么必须换一把：`reported` 与现场重算的 `raw` 若是同一个函数算出来的，它们一致只证明
+// "没人手滑改数"，证明不了"数得对"——countRow 的锚点一变（本项目真踩过：行尾被盖上
+// `<at=…>` 之后逐字匹配静默失配），两把同源尺子会一起错、一起报"干净"。
+// 令牌这一把的值来自 claim 的 stdout（不是从板子上读出来的），所以来源是独立的。
+function countToken(board, token) {
+  return board.split(/\r?\n/).filter((l) => l.includes(`<at=${token}>`)).length;
+}
+
 function detectorSelfTest() {
   const cases = [
     { name: "两行都在（带令牌）",
@@ -145,8 +154,12 @@ for (let r = 1; r <= ROUNDS; r++) {
   const n1 = countRow(board, "src/one.js", "qoder");
   const n2 = countRow(board, "src/two.js", "workbuddy");
   const has1 = n1 === 1, has2 = n2 === 1;
-  rows.push({ round: r, c1: r1.code, c2: r2.code, has1, has2, both: has1 && has2, n1, n2 });
-  console.log(`  第${String(r).padStart(2)}轮：退码 qoder=${r1.code} workbuddy=${r2.code}  one行数=${n1} two行数=${n2}  ${has1 && has2 ? "两行都在" : "★ 有一行整块丢了"}`);
+  // 两把尺子必须同向；不同向就是测具在骗人，不是缺陷"没撞上"
+  if (ta === tb) { console.error(`第${r}轮：两家令牌相同（${ta}），第二把尺子失去独立性，停下`); process.exit(9); }
+  const t1 = countToken(board, ta), t2 = countToken(board, tb);
+  const agree = (t1 === 1 && t2 === 1) === (has1 && has2);
+  rows.push({ round: r, c1: r1.code, c2: r2.code, has1, has2, both: has1 && has2, n1, n2, agree });
+  console.log(`  第${String(r).padStart(2)}轮：退码 qoder=${r1.code} workbuddy=${r2.code}  one行数=${n1} two行数=${n2}  令牌尺=(${t1},${t2})  ${has1 && has2 ? "两行都在" : "★ 有一行整块丢了"}${agree ? "" : "  ✗两把尺子不同向"}`);
   fs.rmSync(dir, { recursive: true, force: true });
 }
 
@@ -165,16 +178,26 @@ console.log(`  **两家都自称写成功、板子上却只剩一行**的轮数�
 // 形状要求：退码由**现场重算的 raw** 推；对外报的数从**打印出去的那份对象**里读回来。
 // 于是"临时把计数打印错但不改退码"这种改动必定被 crossCheck 抓到，两个方向都是。
 const raw = rows.filter((x) => !x.both).length;
+// 第二把尺子不同向 ⇒ 这份数不可信（不管它偏向"丢了"还是"没丢"）
+const mismatch = rows.filter((x) => !x.agree).length;
 const code = raw > 0 ? EXIT_CODES.foundLoss : EXIT_CODES.clean;
 const summary = {
   kind: "board-race", rounds: ROUNDS, measured: rows.length,
   lost: lost.length,
   bothZero: bothZero.length,
   inject: Number.isInteger(INJECT) ? INJECT : 0, unlocked: UNLOCKED ? 1 : 0,
+  rulerMismatch: mismatch,
   code, codes: [...new Set(Object.values(EXIT_CODES))],
 };
 printSummary(summary);
 const why = crossCheck(code, { reported: summary.lost, raw, expect: ROUNDS, measured: summary.measured, badIsSuccess: true });
+if (mismatch > 0) {
+  // 这一条与 crossCheck 是两件事：crossCheck 只能发现"报出去的和现场重算的不一样"，
+  // 两边同源时它一定通过。第二把尺子不同向说明**两个同源数一起错**，那种数最难看穿。
+  console.error(`\n!! 两把尺子不同向：${mismatch}/${ROUNDS} 轮上"按格子数"与"按令牌数"结论不一致。`);
+  console.error("   停下不出表：检测器失去判别力时，\"两行都在 N/N\"与\"什么都没数到\"是同一句话。");
+  process.exit(EXIT_CODES.harness);
+}
 if (why) {
   console.error(`\n!! 测具不可信：${why}\n   这份表不进 README——它可能只是"没量到"，不是"没撞上"。`);
   process.exit(EXIT_CODES.harness);

@@ -29,6 +29,16 @@ export const EXIT = {
 // 没有上界它就等于一把"无限 TTL"的锁——而本文件第 8-9 行声称不允许那种锁存在。
 export const CORRUPT_GRACE_S = 120;
 
+// mtime 的可信前提是"**本地文件系统盖的**"。频道目录如果是同步盘（OneDrive/坚果云那类），
+// 客户端可能把 mtime 重写成同步时刻或对端时刻 ⇒ max 会取到一个比现实更晚的数 ⇒ "看着永不过期"。
+// 两道护栏，都不缩短到期时刻、只防止它被无限拉长：
+//   · deadlineOf 把 mtime 夹到本地此刻（未来的 mtime 一律不当真）；
+//   · 头部 at 与 mtime 相差超过 SKEW_UNTRUSTED_S ⇒ 判"算不出到期"，降级成脏锁，
+//     走**有上界**的回收（躺够 CORRUPT_GRACE_S 由 claim 收走），而不是让 max 默默取大。
+// SKEW_ALERT_S 之内的偏差是常见的时钟不同步：照样用 max 挡着，只在观测面上标"可疑"。
+export const SKEW_ALERT_S = 30;
+export const SKEW_UNTRUSTED_S = 900;
+
 // 文件名 → 锁文件名。必须吃掉路径分隔符与 ..，否则 claim("../../x") 能把锁写到别处
 export function lockFileName(file) {
   const flat = file.replace(/[\\/:*?"<>|]/g, "_").replace(/\.\./g, "-");
@@ -60,13 +70,29 @@ function readLock(p) {
   try {
     const obj = JSON.parse(raw);
     // JSON 解析成功 ≠ 读得懂。字段残缺的锁必须走同一条脏锁路径，理由见 lockShapeOk 的注释。
-    if (obj && typeof obj === "object" && lockShapeOk(obj)) return obj;
+    if (obj && typeof obj === "object" && lockShapeOk(obj)) {
+      const skew = clockSkewS(p, obj.at);
+      // 两个钟差得太远，就不是"挑一个晚的"能解决的了：这把锁的到期时刻**算不出来**。
+      // 归入脏锁=交给已有的、有上界的回收路径（躺够 CORRUPT_GRACE_S 由 claim 收走），
+      // 而不是让 max 默默取大变成"看着永不过期"。
+      if (skew !== null && skew > SKEW_UNTRUSTED_S) {
+        return corruptLock(p, `头部 at 与本地 mtime 相差 ${Math.round(skew)}s > 不可信阈值 ${SKEW_UNTRUSTED_S}s`);
+      }
+      return obj;
+    }
     return corruptLock(p, obj && typeof obj === "object"
       ? `字段残缺或非法（who=${typeof obj.who} at=${obj.at} ttl=${obj.ttl}）`
       : `不是对象（${typeof obj}）`);
   } catch {
     return corruptLock(p, "JSON 解析失败");
   }
+}
+
+// 头部 at 与本地 mtime 差多少秒（取绝对值）。stat 失败 ⇒ null（判不了就别拦）。
+function clockSkewS(p, at) {
+  const m = safeMtime(p);
+  if (!m || !Number.isFinite(Number(at))) return null;
+  return Math.abs(Number(at) - m) / 1000;
 }
 
 // 一把能参与归属判定的锁至少要能算出到期时刻。
@@ -211,13 +237,18 @@ function safeMtime(p) {
  * 同步盘还可能把 mtime 改成"同步落地时刻"（比 at 更晚），那会让等待变长——同样是只卡不丢。
  */
 function deadlineOf(p, c) {
-  let d = Math.max(Number(c.at) || 0, safeMtime(p)) + c.ttl * 1000;
+  // mtime 先夹到"本地此刻"：文件系统的钟不可能盖出一个未来的 mtime，
+  // 真出现了就说明它是被同步客户端/别的东西改写的 ⇒ 拿它算到期会变成"看着永不过期"。
+  // 夹到 now 的含义是：本地最多再等你 ttl 秒，而不是"等 mtime 里那个未来时刻 + ttl"。
+  const m = Math.min(safeMtime(p), Date.now());
+  let d = Math.max(Number(c.at) || 0, m) + c.ttl * 1000;
   for (const m of markersFor(p, c.at)) {
     // 读不懂的标记**不能当"没有标记"**：那会把到期时刻算少，等于抢走别人刚续过的活锁（丢数据方向）。
     // 也不能让它的 NaN 渗进 max——NaN 一旦进 deadline，`Date.now() > NaN` 恒 false 就又造出一把永不超期的锁。
     // 归到 CORRUPT_GRACE_S：保守延长，但躺够上界照样能回收，不给无限期留后门。
     if (m.corrupt) { d = Math.max(d, (m.mtimeMs || 0) + CORRUPT_GRACE_S * 1000); continue; }
-    d = Math.max(d, Math.max(m.at, m.mtimeMs || 0) + (m.ttl || c.ttl) * 1000);
+    const mm = Math.min(m.mtimeMs || 0, Date.now());   // 同法夹：标记的 mtime 也不许是未来的
+    d = Math.max(d, Math.max(m.at, mm) + (m.ttl || c.ttl) * 1000);
   }
   return d;
 }
@@ -622,7 +653,7 @@ export function auditBoard({ claimsDir, boardPath }) {
 }
 
 // 时钟差超过这个秒数才打"可疑"标注（秒级同步抖动不该刷屏）。
-export const SKEW_ALERT_S = 120;
+// （阈值定义集中在文件上方的 SKEW_* 处）
 
 const pidSuffix = (who) => {
   const m = /#(\d+)$/.exec(who || "");

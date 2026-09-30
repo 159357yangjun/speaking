@@ -767,7 +767,9 @@ function plantLock(d, file, obj, mtimeMs) {
 
 test("写方时钟偏早（at 很旧、本地 mtime 很新）不得被判过期——这是会丢数据的那一侧", async () => {
   const d = mkChannel();
-  const old = Date.now() - 30 * 60 * 1000;           // 头部说"我 30 分钟前就建了"
+  // 偏差要落在**可信带内**（<SKEW_UNTRUSTED_S）：这条测的是 max 挡得住"钟不太准"的锁；
+  // 差到 20 分钟那种已经属于"算不出到期"，另有一条用例管它（降级成脏锁）。
+  const old = Date.now() - 5 * 60 * 1000;             // 头部说"我 5 分钟前就建了"
   const p = plantLock(d, "src_early.js.lock", { who: "a", at: old, ttl: 60 });
   // mtime 不设置＝刚刚落地。只看 at 的话这把锁已经过期 29 分钟，谁都能抢。
   const r = await claim(d, ["--file=src/early.js", "--who=b", "--ttl=60"]);
@@ -780,14 +782,68 @@ test("写方时钟偏早（at 很旧、本地 mtime 很新）不得被判过期�
 
 test("写方时钟偏晚（at 在未来、本地 mtime 已老）也不得被抢——防的就是把 max 改成 min", async () => {
   const d = mkChannel();
-  const future = Date.now() + 30 * 60 * 1000;
+  const future = Date.now() + 5 * 60 * 1000;
   const p = plantLock(d, "src_late.js.lock", { who: "a", at: future, ttl: 60 },
-    Date.now() - 10 * 60 * 1000);                     // mtime 压到 10 分钟前
+    Date.now() - 5 * 60 * 1000);                     // mtime 压到 5 分钟前：只信 mtime 就会判过期
   const r = await claim(d, ["--file=src/late.js", "--who=b", "--ttl=60"]);
   assert.equal(r.code, 3, `mtime 单独说了算就会把这把锁判成过期（实退 ${r.code}）；偏晚那侧的代价只配是等待：\n${r.out}${r.err}`);
   assert.equal(JSON.parse(fs.readFileSync(p, "utf8")).who, "a", "偏晚方向的锁被抢走＝用等待换成了双写，方向反了");
   const l = await locks(d);
   assert.match(l.out, /时钟差 \+\d+(\.\d+)?s\(可疑\)/, `偏晚的锁必须被标成可疑，否则旁观者只能干等：\n${l.out}`);
+});
+
+test("两个钟相差超过不可信阈值 ⇒ 判\"算不出到期\"并降级成脏锁（有上界，不是永久）", async () => {
+  const d = mkChannel();
+  const longAgo = Date.now() - 20 * 60 * 1000;
+  const p = plantLock(d, "src_big.js.lock", { who: "a", at: longAgo, ttl: 600 });   // mtime 就是刚才
+  const r = await claim(d, ["--file=src/big.js", "--who=b", "--ttl=600"]);
+  assert.equal(r.code, 8, `相差 20 分钟的锁该被判"到期时刻算不出"（脏锁路径，退 8），实退 ${r.code}：
+${r.out}${r.err}`);
+  assert.match(r.out, /相差 \d+s > 不可信阈值 \d+s/, `理由必须写在现场，不能只给一个 8：
+${r.out}`);
+  // 上界仍然成立：mtime 躺够 CORRUPT_GRACE_S 后必须能被回收，否则"不可信"就变成了"永久"
+  const t = Date.now() - (120 + 25) * 1000;
+  fs.utimesSync(p, new Date(t), new Date(t));
+  const r2 = await claim(d, ["--file=src/big.js", "--who=b", "--ttl=600"]);
+  assert.equal(r2.code, 0, `脏锁躺了 145s 仍回收不了 = 又造出一把无限期锁（实退 ${r2.code}）：
+${r2.out}${r2.err}`);
+});
+
+test("mtime 在未来一整个小时 ⇒ 不是“租约变长”也不是“提前抢”，而是判“算不出到期”", async () => {
+  // 这是给"夹到本地此刻"那条 clamp 设的**反向**预言：
+  // 阈值内（<900s）clamp 生效 ⇒ 到期 = 本地此刻 + ttl，不随 mtime 变长；
+  // 超出阈值（这里 1 小时）就**不该**由 clamp 单独决定，因为 backward 时钟跳变会让
+  // "把 mtime 夹到 now"直接等于"提前 1 小时过期"——那是丢数据的方向。所以超阈降级成脏锁。
+  const d = mkChannel();
+  const now = Date.now();
+  const p = plantLock(d, "src_far.js.lock", { who: "a", at: now - 70 * 1000, ttl: 600 }, now + 60 * 60 * 1000);
+  const r = await claim(d, ["--file=src/far.js", "--who=b", "--ttl=600"]);
+  assert.equal(r.code, 8, `未来的 mtime 超阈却不判"算不出到期"（实退 ${r.code}）：clamp 会把它当成"已经到期"，等于提前 1 小时抢别人的锁`);
+  assert.match(r.out, /相差 \d+s > 不可信阈值/, `理由没带上现场数字：
+${r.out}`);
+  // 拉老 mtime 时要**留在不可信带里**：把 mtime 放到 at 之前 1000s（差 1000>900 仍算不出到期），
+  // 同时本地已躺 1070s > 上界 ⇒ 这条才真正在测"有界"，而不是悄悄退回可信带。
+  const t = (now - 70 * 1000) - 1000 * 1000;
+  fs.utimesSync(p, new Date(t), new Date(t));
+  const r2 = await claim(d, ["--file=src/far.js", "--who=b", "--ttl=600"]);
+  assert.equal(r2.code, 0, `不可信锁没有有界回收路径 = 又变成无限期锁（实退 ${r2.code}）：
+${r2.out}${r2.err}`);
+});
+
+test("未来的 mtime 不许把到期时刻推到未来：先夹到本地此刻再取 max", async () => {
+  const d = mkChannel();
+  const now = Date.now();
+  // 同步客户端可能把 mtime 写成对端/未来时刻。偏差留在可信带内（<900s），
+  // 否则先被上一条判据降级成脏锁，量的就不是这个夹住了。
+  // at 比此刻早 70s、ttl=60 ⇒ 本来早该到期；mtime 在未来 300s ⇒ 不夹就是 now+360s 才可回收。
+  plantLock(d, "src_sync.js.lock", { who: "a", at: now - 70 * 1000, ttl: 60 }, now + 300 * 1000);
+  const l = await locks(d);
+  const m = /剩 (-?[\d.]+)s/.exec(l.out);
+  assert.ok(m, `locks 没打出剩余秒数，量不到这条判据：
+${l.out}`);
+  const left = Number(m[1]);
+  assert.ok(left < 120, `mtime 被当成未来时刻直接用了：还剩 ${left}s（≈360s 就是没夹）——锁看起来比它的 TTL 活得久得多`);
+  assert.ok(left > 40, `夹完之后只剩 ${left}s？那说明 mtime 被完全忽略了（应当是 now+ttl≈60s 这一档）`);
 });
 
 test("两个钟都老才叫过期：max 不许把正常的过期回收路径挡掉", async () => {

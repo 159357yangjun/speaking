@@ -69,6 +69,7 @@ test("schema 的 done 描述不得声称刻意排除在签名域外", () => {
 // 这条是结构比对，不是 grep 关键词：把表抽成 {退码 → 行文本}，与 src/claims/lock.js
 // 导出的 EXIT 逐值对齐。改代码不改文档 → 红；改文档不改代码 → 红。
 const README = new URL("../README.md", import.meta.url);
+const CORRUPT_GRACE = 120;   // 与 lock.js 的 CORRUPT_GRACE_S 同值，下面有断言核它
 const rootDir = path.resolve(fileURLToPath(import.meta.url), "..", "..");
 const { EXIT } = await import("../src/claims/lock.js");
 
@@ -371,17 +372,28 @@ test("脏锁的定义包含\"解析得出来但字段算不出到期时刻\"，R
   assert.match(md, /字段残缺/, "README 退码 8 那行没把这道新入口写进去");
 });
 
-test("跨机时钟：判过期取 max(at, 本地 mtime)，README 必须连没关掉的那一侧一起写", () => {
+test("跨机时钟：max(at, mtime) 的两道护栏都在，README 连没关掉的那侧一起写", () => {
   const src = readFileSync(new URL("../src/claims/lock.js", import.meta.url), "utf8");
-  assert.match(src, /let d = Math\.max\(Number\(c\.at\) \|\| 0, safeMtime\(p\)\) \+ c\.ttl \* 1000;/,
+  assert.match(src, /const m = Math\.min\(safeMtime\(p\), Date\.now\(\)\);/,
+    "mtime 没夹到本地此刻：未来的 mtime（同步盘重写/时钟回跳）会把到期推到未来，锁看着永不过期");
+  assert.match(src, /let d = Math\.max\(Number\(c\.at\) \|\| 0, m\) \+ c\.ttl \* 1000;/,
     "到期判定不再是 max(头部 at, 本地 mtime)——写方钟偏早就会提前抢走活锁");
-  assert.match(src, /d = Math\.max\(d, Math\.max\(m\.at, m\.mtimeMs \|\| 0\)/,
-    "续期标记也要同法处理，否则标记的到期时刻还是只认写方那个钟");
+  assert.match(src, /const mm = Math\.min\(m\.mtimeMs \|\| 0, Date\.now\(\)\);/,
+    "续期标记的 mtime 也要同法夹，否则标记能把到期无限推到未来");
+  assert.match(src, /skew !== null && skew > SKEW_UNTRUSTED_S/,
+    "两个钟相差超过阈值必须降级成脏锁；只靠 clamp 单独决定，backward 时钟跳变就等于提前过期（丢数据方向）");
+  assert.match(src, /export const SKEW_UNTRUSTED_S = (\d+);/, "不可信阈值必须是具名常量，README 要引用同一个数");
+  const untrusted = Number(/export const SKEW_UNTRUSTED_S = (\d+);/.exec(src)[1]);
+  const alert = Number(/export const SKEW_ALERT_S = (\d+);/.exec(src)[1]);
+  assert.ok(alert < untrusted && untrusted > CORRUPT_GRACE,
+    `阈值顺序错了：报警线 ${alert}s 应低于不可信线 ${untrusted}s，且不可信线要大于脏锁上界 ${CORRUPT_GRACE}s，否则降级就等于永久`);
+
   const md = readFileSync(README, "utf8");
-  for (const k of ["偏早", "偏晚", "时钟差"]) {
-    assert.ok(md.includes(k), `README 少了"${k}"：只写关得住的那一侧，会被读成两侧都关住了`);
+  for (const k of ["偏早", "偏晚", "时钟差", "同步盘"]) {
+    assert.ok(md.includes(k), `README 少了"${k}"：这条前提只写在代码注释里，下一个人会直接在同步盘上拄走`);
   }
   assert.match(md, /只卡不丢|不丢数据/, "README 要写清偏晚那侧的代价是等待而不是丢数据");
+  assert.ok(md.includes(`SKEW_UNTRUSTED_S = ${untrusted}`), `README 写的不可信阈值与代码不是同一个数（代码 ${untrusted}）`);
 });
 
 test("audit 的现状段是只报不拒，README 与代码都说同一件事", () => {
@@ -511,4 +523,45 @@ test("red-demo 的 classify 对照表在 npm test 里真跑一次（子进程，
   const oks = (out.match(/^ {2}ok /gm) || []).length;
   assert.ok(oks >= 7, `对照表只打了 ${oks} 条 ok，预期至少 7 条——少一条就是某面没验`);
   assert.ok(!/✗✗/.test(out), `对照表里有判错：\n${out}`);
+});
+
+// 五面自证不能只在我手动跑的时候算数：npm test 里以子进程真跑一次。
+// 面 C/D（行数契约）与面 E（第二把尺子）都只有"真起一个被改坏的副本"才作数。
+test("五面自证：harness 的五个面在 npm test 里真跑一次（任一面没咬住就红）", () => {
+  const r = spawnSync(process.execPath, [
+    fileURLToPath(new URL("../tools/claims/selfcheck-harness.mjs", import.meta.url)), rootDir,
+  ], { encoding: "utf8", cwd: rootDir });
+  const out = (r.stdout || "") + (r.stderr || "");
+  const faces = (out.match(/咬住 [✓✗]/g) || []).length;
+  assert.equal(faces, 5, `只跑到 ${faces} 个面，预期 5 个：\n${out.split("\n").slice(-16).join("\n")}`);
+  assert.ok(!/没咬住 ✗/.test(out), `有面没被抓到（这才是这条断言真正防的事）：\n${out.split("\n").slice(-20).join("\n")}`);
+  assert.equal(r.status, 0, `harness 没退 0（实退 ${r.status}）：\n${out.split("\n").slice(-16).join("\n")}`);
+});
+
+// 分隔符本身可以出现在被解析的文本里（看板正文是 agent 写的，不是代码）。
+// 判读方若用" split 后取第 N 格"或"按行读汇总"，字面量里的分隔符就会把行切错位。
+test("被解析的文本里含分隔符：不许静默少读一行，也不许把两行读成一行", async () => {
+  const { parseSummary } = await import("../src/claims/summary.js");
+  // ① 汇总行：值里带换行与竖线，JSON 转义之后仍是**一行**
+  const line = [
+    "RELAY-SUMMARY",
+    JSON.stringify({ kind: "pipe", lost: 0, code: 0, note: "a|b\nc" }),
+  ].join(" ");
+  const s = parseSummary(`正在写板\n${line}\n下一行普通输出`, "pipe", ["lost", "code"]);
+  assert.equal(s.lost, 0, "值里含 | 与换行不影响汇总行的行数契约");
+  assert.equal(s.note, "a|b\nc");
+  // ② 两条同 kind ⇒ 抛（上一条测过；这里测"其中一条含竖线"时也别被数错）
+  assert.throws(() => parseSummary(`${line}\n${line}`, "pipe", ["lost"]), /2 条/);
+  // ③ 看板行：正文里含 | 的行必须仍被计数、仍被点名，不能因切分结果奇怪而整行丢掉
+  const fsv = await import("node:fs");
+  const osv = await import("node:os");
+  const dir = fsv.mkdtempSync(path.join(osv.tmpdir(), "relay-pipe-"));
+  const md = path.join(dir, "PROGRESS.md");
+  fsv.writeFileSync(md, "# 板\n| src/a.js | qoder | 修 A|B|C 三段 <at=123> |\n| src/b.js | qoder | ok <at=456> |\n");
+  const cli = fileURLToPath(new URL("../src/cli.js", import.meta.url));
+  const r = spawnSync(process.execPath, [cli, "audit", `--channel=${dir}`, `--board=${md}`], { encoding: "utf8" });
+  const sum = parseSummary((r.stdout || "") + (r.stderr || ""), "audit", ["rows", "stale", "untagged"]);
+  assert.equal(sum.rows, 2, `含竖线的那行被漏掉了（rows=${sum.rows}）：\n${r.stdout}`);
+  assert.equal(sum.stale, 2, "两行都对不上活锁，必须都点名");
+  assert.equal(r.status, 11, "有越写者就该退 11");
 });

@@ -25,20 +25,29 @@ export function printSummary(fields) {
 }
 
 /**
- * 从任意输出里取出指定 kind 的汇总行。
- * 读不到 / JSON 坏 / kind 不符 / 缺字段 ⇒ **抛**。抛出来的消息要把现场带上，
- * 否则调用方只看见"失败了"，看不见是格式变了还是真的没跑。
+ * 从任意输出里取出指定 kind 的汇总行。**契约是"恰好一条"**：
+ *  · 0 条 ⇒ 抛（读不到 ≠ 0）
+ *  · ≥2 条 ⇒ 抛。重试路径再打一行、finally 里补一行，都会让"两份数"同时存在；
+ *    这时随便取第一条还是最后一条都是**猜**，而猜出来的数长得像量出来的数。
+ *  · 行被 stdout 刷新拆开 ⇒ JSON 解析失败 ⇒ 抛（消息里带上原文，否则无从下手）
  */
 export function parseSummary(text, kind, requireFields) {
-  const lines = String(text).split(/\r?\n/).filter((l) => l.startsWith(`${SUMMARY_PREFIX} `));
-  if (!lines.length) {
+  const all = String(text).split(/\r?\n/).filter((l) => l.startsWith(`${SUMMARY_PREFIX} `));
+  if (!all.length) {
     throw new Error(`读不到 ${SUMMARY_PREFIX} 行（kind=${kind}）——打印方改了前缀、或这一步根本没跑到打印那句`);
   }
-  const hit = lines.map((l) => {
-    try { return JSON.parse(l.slice(SUMMARY_PREFIX.length + 1)); }
-    catch (e) { throw new Error(`${SUMMARY_PREFIX} 行不是合法 JSON：${e.message}｜原文：${l.slice(0, 120)}`); }
-  }).find((o) => o.kind === kind);
-  if (!hit) throw new Error(`汇总行里没有 kind=${kind} 的那一行（现有：${lines.join(" | ").slice(0, 200)}）`);
+  const hits = [];
+  for (const l of all) {
+    let o;
+    try { o = JSON.parse(l.slice(SUMMARY_PREFIX.length + 1)); }
+    catch (e) { throw new Error(`${SUMMARY_PREFIX} 行不是合法 JSON：${e.message}｜原文：${l.slice(0, 160)}`); }
+    if (o && o.kind === kind) hits.push({ line: l, obj: o });
+  }
+  if (!hits.length) throw new Error(`汇总行里没有 kind=${kind} 的那一行（现有：${all.map((x) => x.slice(0, 40)).join(" | ")}）`);
+  if (hits.length > 1) {
+    throw new Error(`kind=${kind} 的汇总行有 ${hits.length} 条，不能挑一条用：\n   ${hits.map((h) => h.line.slice(0, 160)).join("\n   ")}`);
+  }
+  const hit = hits[0].obj;
   for (const f of requireFields ?? []) {
     if (typeof hit[f] !== "number" || !Number.isFinite(hit[f])) {
       throw new Error(`字段 ${f} 读不到或不是数（拿到 ${JSON.stringify(hit[f])}）——字段被改名或被印成字符串，等于保护静默消失`);

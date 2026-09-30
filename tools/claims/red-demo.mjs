@@ -121,7 +121,7 @@ const MUT = [
     file: LOCK,
     // 锚点跟着 deadlineOf 改过形状：标记那一行从单行 for 变成了带 corrupt 分支的块，
     // 老锚点整段失配（red-demo 报"锚点没命中"而不是绿——这条守卫是对的）。
-    pairs: [["    d = Math.max(d, Math.max(m.at, m.mtimeMs || 0) + (m.ttl || c.ttl) * 1000);",
+    pairs: [["    d = Math.max(d, Math.max(m.at, mm) + (m.ttl || c.ttl) * 1000);",
              "    void m;   // 变异：标记不参与到期计算"]],
     test: "标记已在盘上时，外层判据就该直接收手",
   },
@@ -209,7 +209,7 @@ const MUT = [
     name: "M27 README 的测试总数与分项对不上代码",
     file: README,
     suite: "test/docs-drift.test.js",
-    pairs: [["测试总数 **116**（protocol 20 · claims 52", "测试总数 **106**（protocol 20 · claims 52"]],
+    pairs: [["测试总数 **121**（protocol 20 · claims 55", "测试总数 **116**（protocol 20 · claims 55"]],
     test: "测试计数",
   },
   {
@@ -230,7 +230,7 @@ const MUT = [
   {
     name: "M30 到期判定退回只看头部 at（写方钟偏早 ⇒ 抢走活锁 ⇒ 双写回来）",
     file: LOCK,
-    pairs: [["  let d = Math.max(Number(c.at) || 0, safeMtime(p)) + c.ttl * 1000;",
+    pairs: [["  let d = Math.max(Number(c.at) || 0, m) + c.ttl * 1000;",
              "  let d = Number(c.at) + c.ttl * 1000;   // 变异：丢掉本地 mtime"]],
     test: "偏早",
   },
@@ -239,15 +239,15 @@ const MUT = [
     file: LOCK,
     // 不用 min(at, mtime)：steal 的复查里路径已经指向搬走后的文件，min 的 0 会被 `|| at` 兜住，
     // 红就落在观测断言上而不是"不得被抢"那条——红的方向比红本身更要紧。
-    pairs: [["  let d = Math.max(Number(c.at) || 0, safeMtime(p)) + c.ttl * 1000;",
-             "  let d = safeMtime(p) + c.ttl * 1000;   // 变异：完全不看头部 at"]],
+    pairs: [["  let d = Math.max(Number(c.at) || 0, m) + c.ttl * 1000;",
+             "  let d = m + c.ttl * 1000;   // 变异：完全不看头部 at"]],
     test: "偏晚",
   },
   {
     name: "M32 不做字段校验（无 at/ttl 的锁重新变成永不超期）",
     file: LOCK,
-    pairs: [["    if (obj && typeof obj === \"object\" && lockShapeOk(obj)) return obj;",
-             "    if (obj && typeof obj === \"object\") return obj;   // 变异：残缺锁重新算合法"]],
+    pairs: [['    if (obj && typeof obj === "object" && lockShapeOk(obj)) {',
+             '    if (obj && typeof obj === "object") {   // 变异：残缺锁重新算合法']],
     test: "字段残缺",
   },
   {
@@ -266,8 +266,8 @@ const MUT = [
   {
     name: "M35 max 被当成'谁也别想回收'（两个钟都老也不许过期）",
     file: LOCK,
-    pairs: [["  let d = Math.max(Number(c.at) || 0, safeMtime(p)) + c.ttl * 1000;",
-             "  void p; let d = Number.MAX_SAFE_INTEGER;   // 变异：到期时刻永远到不了"]],
+    pairs: [["  let d = Math.max(Number(c.at) || 0, m) + c.ttl * 1000;",
+             "  void p; void m; let d = Number.MAX_SAFE_INTEGER;   // 变异：到期时刻永远到不了"]],
     test: "两个钟都老",
   },
   // ---- 通令那一族：读不到 ≠ 0、双向印证、少报形状 ----
@@ -311,7 +311,7 @@ const MUT = [
   {
     name: "M41 计数行读不到时静默兜底成 0（NOT REPORTED 就此变成 PASSED）",
     file: SUM,
-    pairs: [["  if (!lines.length) {", "  if (false) {"]],
+    pairs: [["  if (!all.length) {", "  if (false) {"]],
     test: "读不到就抛",
     suite: "test/docs-drift.test.js",
   },
@@ -326,6 +326,32 @@ const MUT = [
     file: BR,
     pairs: [["  code, codes: [...new Set(Object.values(EXIT_CODES))],", "  code,"]],
     test: "探针与夹具",
+    suite: "test/docs-drift.test.js",
+  },
+  {
+    name: "M44 摘掉『mtime 夹到本地此刻』（未来的 mtime 能把租约拉长）",
+    file: LOCK,
+    pairs: [["  const m = Math.min(safeMtime(p), Date.now());", "  const m = safeMtime(p);   // 变异：不夹"]],
+    test: "未来的 mtime",
+  },
+  {
+    name: "M45 摘掉『超阈就降级』（让 clamp 单独决定 = 时钟回跳等于提前过期）",
+    file: LOCK,
+    pairs: [["      if (skew !== null && skew > SKEW_UNTRUSTED_S) {", "      if (false) {"]],
+    test: "一整个小时",
+  },
+  {
+    name: "M46 第二把尺子被改成『永远同向』（同源两数一起错时没人发现）",
+    file: BR,
+    pairs: [["  const agree = (t1 === 1 && t2 === 1) === (has1 && has2);", "  const agree = true;   // 变异：尺子二变成常数"]],
+    test: "五面自证",
+    suite: "test/docs-drift.test.js",
+  },
+  {
+    name: "M47 parseSummary 允许同一 kind 出现两条（挑一条当结论）",
+    file: SUM,
+    pairs: [["  if (hits.length > 1) {", "  if (false) {"]],
+    test: "五面自证",
     suite: "test/docs-drift.test.js",
   },
 ];
