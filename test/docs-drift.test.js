@@ -85,7 +85,7 @@ test("README 的锁退码表与代码 EXIT 常量逐值一致（不多、不少�
     `\n退码表与代码不符。\n  代码 EXIT: ${JSON.stringify(codeCodes)}\n  README 表: ${JSON.stringify(docCodes)}\n`);
 });
 
-test("README 必须把四条关键语义钉在对应退码上，而不是只列个数字", () => {
+test("README 必须把关键语义钉在对应退码上，而不是只列个数字", () => {
   const byCode = Object.fromEntries(exitTableFromDoc().map((r) => [r.code, r.rest]));
   // 3 = 争用：必须写明不阻塞 + 留痕落在哪个文件
   assert.match(byCode[3] ?? "", /waiters\.log/, "退码 3 那一行没写留痕文件，读者不知道该去哪看「它在等」");
@@ -97,10 +97,14 @@ test("README 必须把四条关键语义钉在对应退码上，而不是只列�
   // 8 = 脏锁：必须写明回收上界与"release 也不给裸删"，否则读者会去手删锁文件
   assert.match(byCode[8] ?? "", /120/, "退码 8 那一行没写回收上界，读者不知道要等多久才收敛");
   assert.match(byCode[8] ?? "", /release/i, "退码 8 那一行没说明 release 的行为");
+  // 9 = 续期失败：必须写明动作是"停手"，不是"重试"
+  assert.match(byCode[9] ?? "", /停手|不许写/, "退码 9 那一行没给出动作，调用方会当成普通失败接着写板");
+  // 10 = 文件系统失败：必须与协议结论区分开，否则有人会把环境问题当判负去改锁
+  assert.match(byCode[10] ?? "", /不是锁判负|修目录|修环境/, "退码 10 那一行没和「锁判负」划清界限");
 });
 
 test("代码里 EXIT 的每个值都能被 CLI 真跑到（防「表里有、代码里永远不会返回」）", async () => {
-  const { spawnSync } = await import("node:child_process");
+  const { spawnSync, spawn } = await import("node:child_process");
   const fsv = await import("node:fs");
   const os = await import("node:os");
   const path = await import("node:path");
@@ -120,6 +124,27 @@ test("代码里 EXIT 的每个值都能被 CLI 真跑到（防「表里有、代
   fsv.mkdirSync(path.join(dir, "claims"), { recursive: true });
   fsv.writeFileSync(path.join(dir, "claims", "src_dirty.js.lock"), '{"who"');
   observed.add(run(["claim", "--file=src/dirty.js", "--who=a", "--ttl=600"]));
+  // 10 = 文件系统不可用：把 claims 做成一个**普通文件**，mkdir 立刻 ENOENT/EEXIST 类错误。
+  // 这条必须真跑：退码表里写 10 而代码从没返回过它，等于对外承诺了一个不存在的诊断信号。
+  const dir2 = fsv.mkdtempSync(path.join(os.tmpdir(), "relay-exit2-"));
+  fsv.writeFileSync(path.join(dir2, "claims"), "这不是目录");
+  observed.add(spawnSync(process.execPath, [cli, "claim", "--file=src/x.js", "--who=a", "--ttl=60", `--channel=${dir2}`], { encoding: "utf8" }).status);
+  // 9 = 续期失败：靠 .freeze 闸口把临界钉死，不靠运气撞。码必须从那次真跑里**收回来**，
+  // 不能写成 observed.add(9)——那等于把断言的结果当断言的证据。
+  const dir3 = fsv.mkdtempSync(path.join(os.tmpdir(), "relay-exit3-"));
+  const cli3 = (args) => new Promise((res) => {
+    const pr = spawn(process.execPath, [cli, ...args, `--channel=${dir3}`], { encoding: "utf8" });
+    pr.on("close", (code) => res(code));
+  });
+  fsv.mkdirSync(path.join(dir3, "claims"), { recursive: true });
+  const lk = path.join(dir3, "claims", "src_g.js.lock");
+  fsv.writeFileSync(lk, JSON.stringify({ who: "a", at: Date.now(), ttl: 600 }));
+  fsv.writeFileSync(lk + ".freeze", "hold");
+  const renewing = cli3(["claim", "--file=src/g.js", "--who=a", "--ttl=600"]);
+  await new Promise((r) => setTimeout(r, 200));                 // 让它停在闸口上
+  fsv.writeFileSync(lk, JSON.stringify({ who: "b", at: Date.now(), ttl: 600 }));   // 闸口期间换化身
+  fsv.rmSync(lk + ".freeze");
+  observed.add(await renewing);
   const unreachable = [...new Set(Object.values(EXIT))].filter((c) => c !== 0 && !observed.has(c));
   assert.deepEqual(unreachable, [],
     `这些退码在 README/代码里存在，但本轮 CLI 实跑一次都没命中：${unreachable.join(", ")}。\n` +

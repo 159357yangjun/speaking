@@ -155,6 +155,21 @@ function needArg(value, name) {
   return value;
 }
 
+// 文件系统异常不是协议结论。频道目录被删/只读/不可写时，给一个**文档里的退码 + 一句人话**，
+// 而不是把 stack trace 丢到进程外（实测旧行为：claim 连崩 10 次 exit=1，退出码 1 在退码表里
+// 只代表"die()"，谁也不知道那是环境坏了还是机制判负）。
+// 这不是把红抹掉：errno、syscall、路径全部原样带出来，且**非 fs 错误照抛**——
+// 伪装成环境问题比抛栈更难查。
+function lockOp(fn, args) {
+  try {
+    return fn(args);
+  } catch (e) {
+    if (!e || !e.code) throw e;
+    return { status: "io-error", code: EXIT.LOCK_IO, file: args.file, path: args.claimsDir,
+      reason: `文件系统拒绝 ${e.syscall || "操作"}（${e.code}${e.path ? "：" + e.path : ""}）` };
+  }
+}
+
 // 文件占用锁：单次尝试，**默认不阻塞**。
 // 为什么不阻塞：阻塞版要自己决定轮询间隔与超时，超时后又得映射成一个新退码；
 // 而调用方本来就要重试循环——把循环放在 CLI 里等于替 agent 决定了等待策略。
@@ -163,7 +178,12 @@ if (cmd === "claim") {
   const CLAIMS = join(CH, "claims");
   const file = needArg(opt.file, "file=<要占用的文件>");
   const who = needArg(opt.who, "who=<handle>");
-  const r = acquire({ claimsDir: CLAIMS, file, who, ttl: opt.ttl });
+  const r = lockOp(acquire, { claimsDir: CLAIMS, file, who, ttl: opt.ttl });
+  if (r.status === "io-error") {
+    console.error(`✗ 文件系统不可用（exit ${r.code}）：${r.reason}`);
+    console.error("  这不是锁判负，是频道目录本身读不了/写不了。修目录，别改协议。");
+    process.exit(r.code);
+  }
   // 退码一律取 r.code，不在这里按 status 重新映射一遍：
   // M7 变异演示暴露过——CLI 自己 re-map 的话，模块里的 code 字段不在可观测路径上，
   // 改它测不出红，那条"每个退码都能实跑到"的断言就是死的。
@@ -186,21 +206,39 @@ if (cmd === "claim") {
     console.log(`  已登记：${line}`);
     process.exit(r.code);
   }
+  if (r.status === "renew-failed") {
+    // 续期失败 = 停手。这一支只报错、不写板：调用方拿到非 0 就必须放弃那一行。
+    // 协议能给的最强保证就是"只有退码 0 才是通行证"——写 PROGRESS.md 这个动作本身在 CLI 之外，
+    // 所以这里绝不给出任何可以被误当成"可以继续"的输出。
+    console.log(`✗ 续期失败（exit ${r.code}）：${file} —— ${r.reason}`);
+    console.log(`  你现在**不持有**这把锁：PROGRESS.md 上你自己那一行不许写、已写的要撤，更不许提交。`);
+    console.log(`  下一步：重新 claim 拿一把新的，或把这次改动让给 ${r.holder}。`);
+    process.exit(r.code);
+  }
   console.log(
     r.status === "stolen"
       ? `✓ 抢占 ${file} → ${who}：原持有者 ${r.prevHolder}，回收原因：${r.why}`
       : r.status === "renewed"
-        ? `✓ 续期 ${file} → ${who}：本来就归你，TTL 重置为 ${r.ttl}s（此前已持有 ${r.ageS.toFixed(1)}s）`
+        ? `✓ 续期 ${file} → ${who}：TTL 重置为 ${r.ttl}s（${r.why ?? "标记已落"}）`
         : `✓ 领取 ${file} → ${who}（TTL ${r.ttl}s）`
   );
+  // 化身令牌必须打出来：它是调用方唯一能带回来的凭据。
+  // 不带回来，"被抢占后原方提交"就只能靠名字判断，而名字是原方也报得出的。
   console.log(`  锁文件：${r.path}`);
+  console.log(`  化身令牌：--at=${r.at ?? "?"}   释放/提交时带上它；对不上就是 5，别写板`);
   process.exit(EXIT.OK);
 }
 
 if (cmd === "release") {
   const file = needArg(opt.file, "file");
   const who = needArg(opt.who, "who");
-  const r = release({ claimsDir: join(CH, "claims"), file, who });
+  const r = lockOp(release, { claimsDir: join(CH, "claims"), file, who, at: opt.at });
+  if (r.status === "io-error") { console.error(`✗ 文件系统不可用（exit ${r.code}）：${r.reason}`); process.exit(r.code); }
+  if (r.status === "stale-token") {
+    console.log(`✗ 令牌过期（exit ${r.code}）：${file} —— ${r.reason}`);
+    console.log("  这条比 5 更硬：名字可以冒充，化身号冒充不了。你不持有这把锁，那一行不许写、不许提交。");
+    process.exit(r.code);
+  }
   // 同 claim：退码只从 r.code 出处走，不在 CLI 里再抄一遍常量
   if (r.status === "no-lock") { console.log(`✗ 无锁可放（exit ${r.code}）：${file}`); process.exit(r.code); }
   if (r.status === "dirty-blocked") { console.log(`✗ 无法释放（exit ${r.code}）：${file} —— ${r.reason}`); process.exit(r.code); }
@@ -215,12 +253,18 @@ if (cmd === "release") {
 
 if (cmd === "locks") {
   const CLAIMS = join(CH, "claims");
-  const rows = list({ claimsDir: CLAIMS });
+  const view = lockOp(list, { claimsDir: CLAIMS });
+  if (view && view.status === "io-error") {
+    console.error(`✗ 读不到锁目录（exit ${view.code}）：${view.reason}`);
+    process.exit(view.code);
+  }
+  const { locks, stray } = view;
   const wl = join(CLAIMS, "waiters.log");
   const waits = existsSync(wl) ? readFileSync(wl, "utf8").trim().split("\n").filter(Boolean).length : 0;
-  console.log(`锁 ${rows.length} 把，等待登记 ${waits} 行：`);
-  for (const x of rows) console.log(`  ${x.lock}  持有者=${x.holder}  已占 ${x.ageS}s / TTL ${x.ttl}s  ${x.state}`);
-  if (!rows.length) console.log("  （当前无锁）");
+  console.log(`锁 ${locks.length} 把，等待登记 ${waits} 行，仲裁残留 ${stray.length} 个：`);
+  for (const x of locks) console.log(`  ${x.lock}  持有者=${x.holder}  已占 ${x.ageS}s / TTL ${x.ttl ?? "-"}s  ${x.state}`);
+  if (!locks.length) console.log("  （当前无锁）");
+  for (const s of stray) console.log(`  ! 仲裁残留 ${s}（搬错人又放不回去的现场，不参与归属判定）`);
   process.exit(EXIT.OK);
 }
 
@@ -275,7 +319,9 @@ console.log(`agent-relay CLI
 done 在签名域内——翻动它即验签失败。
 
 锁的退码：0 拿到/续期/释放成功，2 参数缺失，3 被别人占着（非阻塞，已写 waiters.log），
-4 没有这把锁，5 持有者不是你不是我，6 TTL 非法（缺失、非正整数），
-8 锁文件内容读不懂（脏锁）；躺过 120s 上界后 claim 会回收它，release 一律不给裸删。
+4 没有这把锁，5 持有者不是你不是我（含令牌对不上），6 TTL 非法（缺失、非正整数），
+8 锁文件内容读不懂（脏锁）；躺过 120s 上界后 claim 会回收它，release 一律不给裸删，
+9 续期失败：复查时基锁已换化身 —— 那一行不许写、已写的要撤，
+10 文件系统本身不可用（目录被删/只读/是个普通文件）；这不是锁判负，修环境。
 --ttl 必填：允许 ttl=0 等于允许一把永远卡死频道的脏锁。
-同一持有者重复 claim = 续期（TTL 重置）；锁过期后被他人抢占，原方回来 release 得 exit 5。`)
+续期只追加标记文件、不覆盖基锁；claim 打出的「化身令牌」在 release/提交时要带回来。`)

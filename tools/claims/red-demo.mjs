@@ -25,13 +25,13 @@ const MUT = [
     test: "非持有者 release",
   },
   {
-    name: "M3 抢占改成「先删再建」，并强制拉开竞态窗口",
+    name: "M3 独占创建退化成普通写（单胜者判据整个失效）",
     file: LOCK,
-    // 只换 rm 不换出红：窗口是微秒级，20 个并发也撞不上，那条绿灯是假的。
-    // 注入 300ms 睡眠把「读到过期」和「动手抢占」隔开，让 20 家全部读到同一份过期锁。
+    // 旧版这条是「把 rename 换成 rm」；现在单胜者由 wx 独占创建保证，
+    // 所以等价的做法是把 flag:"wx" 摘掉——那才是"谁都能自称拿到"的形态。
     pairs: [
-      ["    fs.renameSync(p, tmp);", "    fs.rmSync(p, { force: true });"],
-      ["function stealExpired(p) {", "function stealExpired(p) {\n  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 300);"],
+      ['fs.writeFileSync(p, JSON.stringify({ who, at: incarnation, ttl: t.value }), { flag: "wx" });',
+       'fs.writeFileSync(p, JSON.stringify({ who, at: incarnation, ttl: t.value }));'],
     ],
     test: "恰好 1 家拿到",
   },
@@ -63,12 +63,12 @@ const MUT = [
     test: "每个值都能被 CLI 真跑到",
   },
   {
-    name: "M8 抢占仲裁失效，推演器 S2b 那条该红（证据文档引的是它的数字）",
+    name: "M8 独占创建退化，推演器 S2b 那条该红（证据文档引的是它的数字）",
     file: LOCK,
     suite: "test/sim.test.js",
     pairs: [
-      ["    fs.renameSync(p, tmp);", "    fs.rmSync(p, { force: true });"],
-      ["function stealExpired(p) {", "function stealExpired(p) {\n  Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 300);"],
+      ['fs.writeFileSync(p, JSON.stringify({ who, at: incarnation, ttl: t.value }), { flag: "wx" });',
+       'fs.writeFileSync(p, JSON.stringify({ who, at: incarnation, ttl: t.value }));'],
     ],
     test: "S2b",
   },
@@ -90,6 +90,45 @@ const MUT = [
     pairs: [["    if (cur.corrupt) {\n      const idleS = +(((Date.now() - cur.mtimeMs) / 1000).toFixed(1));", "    if (false) {\n      const idleS = +(((Date.now() - cur.mtimeMs) / 1000).toFixed(1));"]],
     test: "脏锁不再打崩 locks",
   },
+  {
+    name: "M12 续期换回裸覆盖写（洞 1 原样）",
+    file: LOCK,
+    pairs: [["    const m = markerOf(p, cur.at);",
+             "    fs.writeFileSync(p, JSON.stringify({ who, at: Date.now(), ttl: t.value }));\n    const m = markerOf(p, cur.at);"]],
+    test: "落笔前复查必须判它输",
+  },
+  {
+    name: "M13 抢占不做「搬走后复查」，判可拿就动手",
+    file: LOCK,
+    pairs: [["    const canTake = !got || (got.corrupt", "    const canTake = true || !got || (got.corrupt"]],
+    test: "抢占复查搬到的那一把时必须收手",
+  },
+  {
+    name: "M14 去掉化身令牌校验（名字对就放行）",
+    file: LOCK,
+    pairs: [["if (at !== undefined && at !== null && String(at) !== String(cur.at)) {", "if (false) {"]],
+    test: "化身令牌",
+  },
+  {
+    name: "M15 到期计算忽略续期标记（第一道防线：外层判据不算标记）",
+    file: LOCK,
+    pairs: [["  for (const m of markersFor(p, c.at)) d = Math.max(d, m.at + (m.ttl || c.ttl) * 1000);",
+             "  void p;   // 变异：标记不参与到期计算"]],
+    test: "标记已在盘上时，外层判据就该直接收手",
+  },
+  {
+    name: "M16 观测面与判定各算各的：locks 不报续期次数",
+    file: LOCK,
+    pairs: [["    const renewals = markersFor(path.join(claimsDir, f), cur.at).length;", "    const renewals = 0;"]],
+    test: "同持有者重复 claim",
+  },
+  {
+    name: "M17 fs 异常不收敛成退码 10，直接漏到进程顶",
+    file: CLI,
+    suite: "test/docs-drift.test.js",
+    pairs: [["    return { status: \"io-error\", code: EXIT.LOCK_IO, file: args.file, path: args.claimsDir,", "    throw e;\n    return { status: \"io-error\", code: EXIT.LOCK_IO, file: args.file, path: args.claimsDir,"]],
+    test: "每个值都能被 CLI 真跑到",
+  },
 ];
 
 function runTest(pattern, suite) {
@@ -104,7 +143,8 @@ function runTest(pattern, suite) {
     ran: /\nℹ tests (\d+)/.exec(out)?.[1],
     // 把断言消息原文抓出来：只报"红了"不够，要看得见红在哪条判据上
     msg: (out.match(/AssertionError[^\n]*/) || [])[0] || (out.match(/^\s*AssertionError[^\n]*/m) || [])[0] || "",
-    detail: (out.match(/(并发抢占出现[^\n]*|自称赢[^\n]*|TTL 必须是[^\n]*|被拒的 release[^\n]*|被挡住必须留痕[^\n]*|退码表与代码不符[^\n]*|这些退码在[^\n]*|那一行没[^\n]*|第\d+次：脏锁[^\n]*|躺了 \d+s 的脏锁[^\n]*|locks 自己崩了[^\n]*|应判脏锁[^\n]*|实退 \d+[^\n]*)/) || [])[1] || "",
+    raw: out,
+    detail: (out.match(/(并发抢占出现[^\n]*|自称赢[^\n]*|TTL 必须是[^\n]*|被拒的 release[^\n]*|被挡住必须留痕[^\n]*|退码表与代码不符[^\n]*|这些退码在[^\n]*|那一行没[^\n]*|第\d+次：脏锁[^\n]*|躺了 \d+s 的脏锁[^\n]*|locks 自己崩了[^\n]*|应判脏锁[^\n]*|实退 \d+[^\n]*|就该收手[^\n]*|一复查就该收手[^\n]*)/) || [])[1] || "",
   };
 }
 
@@ -119,8 +159,14 @@ function pairOf(src, from, to) {
   return null;
 }
 
+// RELAY_ONLY="M15,M16"：只跑其中几条。追因时"改一处要等 40 秒"会让人放弃验证，
+// 而放弃验证的代价正是这类假绿灯。
+const ONLY = (process.env.RELAY_ONLY || "").split(",").map((s) => s.trim()).filter(Boolean);
+const TODO = ONLY.length ? MUT.filter((m) => ONLY.some((o) => m.name.startsWith(o))) : MUT;
+if (ONLY.length && !TODO.length) { console.error(`!! RELAY_ONLY 没匹配到任何变异：${ONLY.join(",")}`); process.exit(9); }
+
 let allRed = true;
-for (const m of MUT) {
+for (const m of TODO) {
   const bak = m.file + ".bak-red";
   copyFileSync(m.file, bak);
   const src = readFileSync(m.file, "utf8");
@@ -138,6 +184,16 @@ for (const m of MUT) {
     continue;
   }
   writeFileSync(m.file, patched);
+  // 写完立刻回读：变异没落地时，"绿"是变异器的绿，不是代码的绿。
+  // M15 就撞上过这一次——现场手工打同一个变异行为明确变了，变异器却报绿，
+  // 差别只能出在"补丁到底有没有写进去"。
+  const back = readFileSync(m.file, "utf8");
+  if (back === src) {
+    console.log(`!! ${m.name}\n   写盘后回读与原文一致——变异根本没落地，这条不算测过\n`);
+    rmSync(m.file); copyFileSync(bak, m.file); rmSync(bak);
+    allRed = false;
+    continue;
+  }
   const res = runTest(m.test, m.suite);
   rmSync(m.file);
   copyFileSync(bak, m.file);
@@ -147,7 +203,10 @@ for (const m of MUT) {
   const empty = res.ran === "0" || res.ran === undefined;
   console.log(`${res.red && !empty ? "红 ✓" : "绿 ✗ 假绿灯！"}  ${m.name}`);
   console.log(`   套件 ${m.suite || "test/claims.test.js"} 匹配「${m.test}」：跑到 ${res.ran} 条，pass=${res.pass} fail=${res.fail}`);
-  console.log(`   断言原文：${(res.detail || res.msg || "（未匹配到）").slice(0, 200)}\n`);
+  console.log(`   断言原文：${(res.detail || res.msg || "（未匹配到）").slice(0, 200)}`);
+  // 变异器报绿、而现场证明行为变了——这种矛盾必须把原始输出摊开，否则下一步只能靠猜。
+  if (!res.red || empty) console.log(`   原始输出（末 22 行）：\n${res.raw.split("\n").slice(-22).map((l) => "     " + l).join("\n")}`);
+  console.log("");
   if (!res.red || empty) allRed = false;
   if (readFileSync(m.file, "utf8") !== src) { console.log("!! 还原失败，停下"); process.exit(9); }
 }
