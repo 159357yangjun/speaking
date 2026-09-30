@@ -163,6 +163,13 @@ for (const c of CASES) {
   console.log(`   判据 = ${verdict[1]}`);
   console.log(`   汇总行 = ${sum.slice(0, 200)}`);
   console.log(`   判读原文 = ${whyLine.slice(0, 200)}`);
+  if (!ok) {
+    // 偶发的"某面没咬住"只留上面那三行是分不出原因的：分不清是被检工具真没翻脸，
+    // 还是它压根没跑到那一步（ENOENT、锚点没落地、临时副本装不全都会长得一样）。
+    // 所以没咬住时把那一次运行的原文尾部摊出来；成功时不摊，免得把 5 面输出泡在水里。
+    console.log("   那一次运行的原文尾部：");
+    for (const l of out.split(/\r?\n/).slice(-10)) console.log("     " + l.slice(0, 170));
+  }
   if (tmp) fs.rmSync(tmp, { recursive: true, force: true });
   if (ok) caught++;
 }

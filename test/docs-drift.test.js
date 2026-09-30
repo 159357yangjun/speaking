@@ -698,10 +698,19 @@ test("red-demo 的 classify 对照表在 npm test 里真跑一次（子进程，
 test("五面自证：harness 的五个面在 npm test 里真跑一次（任一面没咬住就红）", () => {
   const r = runProbe("tools/claims/selfcheck-harness.mjs", [rootDir], { cwd: rootDir });
   const out = (r.stdout || "") + (r.stderr || "");
+  const lines = out.split(/\r?\n/);
+  // 面 A 排在最前面，而旧写法只摊最后 20 行：面 A 没咬住时，报出来的全是后面几个面的成功行，
+  // 红是红了，但把"哪一面、为什么"藏起来了（本轮就撞上一次偶发红，靠残尾行无法归因）。
+  // 现在按面块摊：每条 `没咬住 ✗` 连同它后面 4 行（判据 / 汇总行 / 判读原文）一起打出来。
+  const bad = [];
+  for (let i = 0; i < lines.length; i++) {
+    if (/没咬住 ✗/.test(lines[i])) bad.push(...lines.slice(i, i + 5), "   ---");
+  }
   const faces = (out.match(/咬住 [✓✗]/g) || []).length;
-  assert.equal(faces, 5, `只跑到 ${faces} 个面，预期 5 个：\n${out.split("\n").slice(-16).join("\n")}`);
-  assert.ok(!/没咬住 ✗/.test(out), `有面没被抓到（这才是这条断言真正防的事）：\n${out.split("\n").slice(-20).join("\n")}`);
-  assert.equal(r.status, 0, `harness 没退 0（实退 ${r.status}）：\n${out.split("\n").slice(-16).join("\n")}`);
+  assert.equal(faces, 5,
+    `只跑到 ${faces} 个面，预期 5 个（跑一半崩掉与某面没咬住是两件事，先看这份原文）：\n${out}\n[harness 真退码 ${r.status}]`);
+  assert.ok(bad.length === 0, `有面没被抓到（这才是这条断言真正防的事）：\n${bad.join("\n")}\n--- 全文尾部 ---\n${lines.slice(-12).join("\n")}`);
+  assert.equal(r.status, 0, `harness 没退 0（实退 ${r.status}）：\n${out}`);
 });
 
 // 分隔符本身可以出现在被解析的文本里（看板正文是 agent 写的，不是代码）。
