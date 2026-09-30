@@ -97,8 +97,9 @@ test("README 必须把关键语义钉在对应退码上，而不是只列个数�
   // 8 = 脏锁：必须写明回收上界与"release 也不给裸删"，否则读者会去手删锁文件
   assert.match(byCode[8] ?? "", /120/, "退码 8 那一行没写回收上界，读者不知道要等多久才收敛");
   assert.match(byCode[8] ?? "", /release/i, "退码 8 那一行没说明 release 的行为");
-  // 9 = 续期失败：必须写明动作是"停手"，不是"重试"
-  assert.match(byCode[9] ?? "", /停手|不许写/, "退码 9 那一行没给出动作，调用方会当成普通失败接着写板");
+  // 9 = 续期失败：必须写明动作是"停笔"，而且**不许当成可重试**
+  assert.match(byCode[9] ?? "", /停笔/, "退码 9 那一行没给出动作，调用方会把它当普通失败重试着继续写");
+  assert.match(byCode[9] ?? "", /不许重试|重新 claim/, "退码 9 必须区分'停笔'与'可重试'：重试要用新令牌，不是原地再写一次");
   // 10 = 文件系统失败：必须与协议结论区分开，否则有人会把环境问题当判负去改锁
   assert.match(byCode[10] ?? "", /不是锁判负|修目录|修环境/, "退码 10 那一行没和「锁判负」划清界限");
 });
@@ -131,9 +132,14 @@ test("代码里 EXIT 的每个值都能被 CLI 真跑到（防「表里有、代
   observed.add(spawnSync(process.execPath, [cli, "claim", "--file=src/x.js", "--who=a", "--ttl=60", `--channel=${dir2}`], { encoding: "utf8" }).status);
   // 9 = 续期失败：靠 .freeze 闸口把临界钉死，不靠运气撞。码必须从那次真跑里**收回来**，
   // 不能写成 observed.add(9)——那等于把断言的结果当断言的证据。
+  // 闸口只认 AGENT_RELAY_TEST_GATE（生产路径上这条代码不存在），所以这里要显式打开；
+  // 并且等子进程**自己报到**（.at-gate），不是 sleep 一个"大概够"的毫秒数——
+  // 上一版用 sleep 200ms，闸口一关就再也没收到过 9 而测试仍然"绿"，那种默默不成立比红更糟。
   const dir3 = fsv.mkdtempSync(path.join(os.tmpdir(), "relay-exit3-"));
   const cli3 = (args) => new Promise((res) => {
-    const pr = spawn(process.execPath, [cli, ...args, `--channel=${dir3}`], { encoding: "utf8" });
+    const pr = spawn(process.execPath, [cli, ...args, `--channel=${dir3}`], {
+      encoding: "utf8", env: { ...process.env, AGENT_RELAY_TEST_GATE: "1" },
+    });
     pr.on("close", (code) => res(code));
   });
   fsv.mkdirSync(path.join(dir3, "claims"), { recursive: true });
@@ -141,7 +147,10 @@ test("代码里 EXIT 的每个值都能被 CLI 真跑到（防「表里有、代
   fsv.writeFileSync(lk, JSON.stringify({ who: "a", at: Date.now(), ttl: 600 }));
   fsv.writeFileSync(lk + ".freeze", "hold");
   const renewing = cli3(["claim", "--file=src/g.js", "--who=a", "--ttl=600"]);
-  await new Promise((r) => setTimeout(r, 200));                 // 让它停在闸口上
+  const gateUntil = Date.now() + 8000;
+  while (!fsv.existsSync(lk + ".at-gate") && Date.now() < gateUntil) await new Promise((r) => setTimeout(r, 10));
+  assert.ok(fsv.existsSync(lk + ".at-gate"),
+    "子进程没到闸口报到：这条覆盖退码 9 的用例前提没成立，不许算通过");
   fsv.writeFileSync(lk, JSON.stringify({ who: "b", at: Date.now(), ttl: 600 }));   // 闸口期间换化身
   fsv.rmSync(lk + ".freeze");
   observed.add(await renewing);
@@ -159,4 +168,39 @@ test("文档与 schema 的协议版本必须等于代码版本", () => {
   for (const v of occurrences) {
     assert.equal(v, codeVersion, `docs/specs/03-signing.md 里有 ${v}，代码是 ${codeVersion}`);
   }
+});
+
+// ============ 写板 CAS 与测试闸口：文档/代码不许各说各话 ============
+test("README 必须写明 renewed 的承诺边界，并且 board 是那条边界的落地", () => {
+  const md = readFileSync(README, "utf8");
+  assert.match(md, /只承诺一件事/, "README 没界定 renewed 到底承诺多久——不界定就会被当成保险");
+  assert.match(md, /不承诺[\s\S]{0,40}到我下一次检查之前/, "必须明写'不承诺到下一次检查前'，否则读者以为拿到 0 就可以慢慢写");
+  assert.match(md, /cli\.js board/, "README 讲了边界却没给出落地手段：board 那条命令必须在表里");
+  // 窗口必须带数，不能只写"很小"
+  assert.match(md, /\*\*2\.12ms\*\*/, "复验到落盘的残余窗口要写实测数，不写形容词");
+});
+
+test("写板 CAS 在代码里真的是'先复验后落盘'，且复验不过时一个字节都不写", () => {
+  const src = readFileSync(new URL("../src/claims/lock.js", import.meta.url), "utf8");
+  const fn = /export function writeBoard\([\s\S]*?\n\}/.exec(src);
+  assert.ok(fn, "找不到 writeBoard：写板 CAS 被摘掉了，README 那节立刻是空话");
+  const body = fn[0];
+  const verifyAt = body.indexOf("verifyHold(");
+  const writeAt = body.indexOf("fs.writeFileSync(part");
+  assert.ok(verifyAt >= 0, "writeBoard 没做归属复验");
+  assert.ok(writeAt > verifyAt, "落盘发生在复验之前，或根本没复验");
+  assert.match(body, /if \(held\.status !== "held"\) return \{ \.\.\.held, wrote: false \};/,
+    "复验失败必须原样返回且不写盘——少了这句就是'拒了但还是写了'");
+  assert.match(body, /renameSync\(part, boardPath\)/, "写板必须走 .part → rename，和消息封帧同一个原子边界");
+});
+
+test("测试专用延时闸口只能由环境变量打开（生产路径上这条代码不存在）", () => {
+  const src = readFileSync(new URL("../src/claims/lock.js", import.meta.url), "utf8");
+  assert.match(src, /export const GATE_ENV = "AGENT_RELAY_TEST_GATE"/, "闸口开关必须是具名常量，便于两侧一起检索");
+  const fn = /function pauseForFreeze\([\s\S]*?\n\}/.exec(src);
+  assert.ok(fn, "找不到 pauseForFreeze");
+  assert.match(fn[0], /if \(!gateEnabled\(\)\) return false;/,
+    "函数第一句就必须按环境变量返回：只看磁盘等于给任何能写该目录的进程一条 25s 的拒绝服务通道");
+  const first = fn[0].split("\n").slice(0, 3).join("\n");
+  assert.doesNotMatch(first, /existsSync\(f\)/, "在 gateEnabled 判定之前不允许出现任何磁盘探测");
 });

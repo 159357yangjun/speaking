@@ -3,7 +3,7 @@ import { readFileSync, writeFileSync, existsSync, readdirSync, mkdirSync, rename
 import { join, resolve, sep } from "node:path";
 import { loadRoster, keyringOf } from "./proto/roster.js";
 import { seal, verifyEnvelope, msgFileName, newNonce } from "./proto/envelope.js";
-import { acquire, release, list, noteWait, EXIT } from "./claims/lock.js";
+import { acquire, release, list, noteWait, verifyHold, writeBoard, EXIT } from "./claims/lock.js";
 
 const args = process.argv.slice(2);
 const cmd = args[0];
@@ -268,6 +268,29 @@ if (cmd === "locks") {
   process.exit(EXIT.OK);
 }
 
+// 在锁的保护下写一行进度板：**归属复验和写板在同一个调用里**。
+// 为什么要有它：`claim` 返回 0 只承诺"复查那一瞬间我持着"。从那一刻到调用方自己伸手写
+// PROGRESS.md 之间隔的是"一次进程退出 + agent 想多久"，无界——而本系统最初的事故
+// 恰好就是"我以为我拿着，我写了"。把写板装进同一次调用，窗口就从无界压到零个动作。
+if (cmd === "board") {
+  const CLAIMS = join(CH, "claims");
+  const file = needArg(opt.file, "file=<你占用的文件>");
+  const who = needArg(opt.who, "who=<handle>");
+  // --at 必填：可省的话 board 就退化成"只认名字"，而名字是丢锁那方也报得出的东西。
+  const at = needArg(opt.at, "at=<claim 打出的化身令牌>");
+  const boardPath = needArg(opt.board, "board=<PROGRESS.md 路径>");
+  const row = needArg(opt.row, "row=<要写的那一行>");
+  const r = lockOp(writeBoard, { claimsDir: CLAIMS, boardPath, file, who, at, row });
+  if (r.wrote !== true) {
+    // 没过复验就一个字节都不写。这一支不产生任何可以被当成"可以继续"的输出。
+    console.log(`✗ 写板被拒（exit ${r.code}）：${file} —— ${r.reason ?? "归属复验未通过"}`);
+    console.log("  板子没动。你现在不持有这把锁：不要提交，重新 claim。");
+    process.exit(r.code);
+  }
+  console.log(`✓ 已写板 ${boardPath}：${file} → ${who}（写前复验通过，化身 ${r.at}）`);
+  process.exit(EXIT.OK);
+}
+
 function scanNew(me, keys, since) {
   const seen = seenNonces(me);
   const ok = [];
@@ -312,7 +335,8 @@ console.log(`agent-relay CLI
   show   --channel=<目录>
 
   claim    --channel=<目录> --file=<路径> --who=<handle> --ttl=<正整数秒>
-  release  --channel=<目录> --file=<路径> --who=<handle>
+  release  --channel=<目录> --file=<路径> --who=<handle> [--at=<化身令牌>]
+  board    --channel=<目录> --file=<路径> --who=<handle> --at=<化身令牌> --board=<PROGRESS.md> --row=<一行>
   locks    --channel=<目录>
 
 封帧：seal 先写 msg-N.json.part，再改名为 msg-N.json。读者只看 .json，永远读不到半截文件。

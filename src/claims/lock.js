@@ -167,13 +167,21 @@ function sweepMarkers(p, baseAt) {
   try { fs.unlinkSync(markerOf(p, baseAt)); } catch { /* 本来就没有，或已被别人清过 */ }
 }
 
-// —— 确定性闸口 ——
-// 存在 `<锁文件>.freeze` 时，在"读完基锁"与"动手改锁/落标记"之间停住，直到标记被删。
+// —— 确定性闸口（只在测试里存在）——
 // 为什么要有它：续期与抢占的临界只有几微秒，靠并发去撞，撞不上就是**假绿灯**
 // （本项目已经被这种绿灯骗过两次：一次注入延迟才红，一次发现改的字段根本不在观测路径上）。
-// 有了它，"A 读到还是自己的锁 → B 合法抢占 → A 才动手"这段时序可以被**逐字复现**，
-// 而不是"跑 20 轮希望撞上"。生产路径上不存在这个文件，代价只有一次 existsSync。
+//
+// **必须由环境变量打开，而且只由它打开。** 上一版只看磁盘上有没有 `<锁>.freeze`，
+// 那是我自己给靶场开的一条拒绝服务通道：本项目的威胁模型写着"任何能往该目录写文件的程序
+// 都能给两个 agent 下指令"，于是任何写入方建一个 `.freeze` 就能把对方卡到 25s 上限。
+// 现在生产路径上连 `existsSync` 都不做——不是省一次调用，是**这条路径不存在**。
+export const GATE_ENV = "AGENT_RELAY_TEST_GATE";
+function gateEnabled() {
+  return process.env[GATE_ENV] === "1";
+}
+
 function pauseForFreeze(p) {
+  if (!gateEnabled()) return false;              // 生产路径：一次 stat 都不做
   const f = `${p}.freeze`;
   if (!fs.existsSync(f)) return false;
   // 到闸了要**报到**，调用方等的是这个报到而不是"猜 200ms 够不够"。
@@ -379,6 +387,49 @@ export function list({ claimsDir }) {
   // 但它是"谁在临界点上被误伤"的唯一现场——必须看得见，不能变成暗垃圾。
   const stray = names.filter((f) => f.includes(".lock.arbiter-"));
   return { locks, stray };
+}
+
+/**
+ * 复验归属：调用方在**动笔写板之前**用它确认自己还持着这把锁。
+ * 为什么必须有它：`renewed` 只承诺"复查成功的那一瞬间我持着"，不承诺到下一次检查前。
+ * 从那一刻到真正写 `PROGRESS.md` 之间隔的是**一次进程退出 + agent 自己伸手的时间**，无界；
+ * 而本系统最初的事故恰好就是"我以为我拿着，我写了"（markdown 板 5/5 丢失更新）。
+ * 所以归属必须在使用点复验，而不是在领取点相信。
+ */
+export function verifyHold({ claimsDir, file, who, at }) {
+  const p = lockPath(claimsDir, file);
+  const cur = readLock(p);
+  if (!cur) return { status: "no-lock", code: EXIT.NO_LOCK, file, path: p, reason: "锁位上没有锁了" };
+  if (cur.corrupt) return { status: "dirty-blocked", code: EXIT.DIRTY_LOCK, file, path: p, holder: "(内容不可解析)" };
+  if (cur.who !== who) return { status: "not-holder", code: EXIT.NOT_HOLDER, file, path: p, holder: cur.who,
+    reason: `锁现在属于 ${cur.who}` };
+  if (at !== undefined && at !== null && String(cur.at) !== String(at)) {
+    return { status: "stale-token", code: EXIT.NOT_HOLDER, file, path: p, holder: who,
+      reason: `名字对但化身对不上（你带的是 ${at}，盘上是 ${cur.at}）——中途被抢走过` };
+  }
+  if (Date.now() > deadlineOf(p, cur)) {
+    return { status: "expired", code: EXIT.RENEW_FAILED, file, path: p, holder: who,
+      reason: "TTL 已到期且没有有效续期标记；此刻任何人都可以合法抢占" };
+  }
+  return { status: "held", code: EXIT.OK, file, path: p, holder: who, at: cur.at };
+}
+
+/**
+ * 在锁的保护下写板：先复验归属，**过不了就一个字节都不写**。
+ * 这把"拿到锁才写板"从一句约定变成一条能测的性质：写板与归属判定在同一个调用里，
+ * 中间不给调用方留伸手的时间。落盘用 .part → rename（与消息封帧同一个边界）。
+ */
+export function writeBoard({ claimsDir, boardPath, file, who, at, row }) {
+  const held = verifyHold({ claimsDir, file, who, at });
+  if (held.status !== "held") return { ...held, wrote: false };
+  const before = fs.existsSync(boardPath) ? fs.readFileSync(boardPath, "utf8") : "";
+  const body = before.includes(row.trimEnd() + "\n") || before.trimEnd().endsWith(row.trimEnd())
+    ? before                                   // 幂等：同一行重复写不产生第二行
+    : before + (before.endsWith("\n") || before === "" ? "" : "\n") + row + "\n";
+  const part = `${boardPath}.part-${process.pid}`;
+  fs.writeFileSync(part, body);
+  fs.renameSync(part, boardPath);             // rename 是原子边界，读者不会看到半截板
+  return { status: "written", code: EXIT.OK, file, path: lockPath(claimsDir, file), wrote: true, at: held.at };
 }
 
 /**

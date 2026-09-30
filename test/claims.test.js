@@ -15,24 +15,32 @@ const CLI = path.join(ROOT, "src", "cli.js");
 function mkChannel() {
   return fs.mkdtempSync(path.join(os.tmpdir(), "relay-claims-"));
 }
-function claim(dir, args) {
-  return run(CLI, ["claim", `--channel=${dir}`, ...args]);
+function claim(dir, args, env = {}) {
+  return run(CLI, ["claim", `--channel=${dir}`, ...args], env);
 }
-function release(dir, args) {
-  return run(CLI, ["release", `--channel=${dir}`, ...args]);
+function release(dir, args, env = {}) {
+  return run(CLI, ["release", `--channel=${dir}`, ...args], env);
 }
 function locks(dir) {
   return run(CLI, ["locks", `--channel=${dir}`]);
 }
-function run(bin, args) {
+function board(dir, args, env = {}) {
+  return run(CLI, ["board", `--channel=${dir}`, ...args], env);
+}
+function run(bin, args, env = {}) {
   return new Promise((res) => {
-    const p = spawn(process.execPath, [bin, ...args], { stdio: ["ignore", "pipe", "pipe"] });
+    const p = spawn(process.execPath, [bin, ...args], { stdio: ["ignore", "pipe", "pipe"], env: { ...process.env, ...env } });
     let out = "", err = "";
     p.stdout.on("data", (d) => (out += d));
     p.stderr.on("data", (d) => (err += d));
     p.on("close", (code) => res({ code, out, err }));
   });
 }
+
+// 闸口只在该环境变量为 "1" 时存在。测试要自己打开它——
+// 反过来讲：**任何没打开这个变量的调用都必须完全不理会 .freeze**，
+// 那正是下面那条生产路径用例要守的东西。
+const GATE = { AGENT_RELAY_TEST_GATE: "1" };
 
 // 等子进程**自己报到**它停在闸口上，而不是 sleep 一个"大概够"的毫秒数。
 // 差别是本质的：sleep 同步的用例里子进程可能还没读到锁，判据就发生在续期之后，
@@ -316,7 +324,7 @@ test("确定性临界：续期读到锁之后被抢占，落笔前复查必须�
   const token = /--at=(\d+)/.exec(a.out)[1];
 
   fs.writeFileSync(lockOf(d, "src/c.js") + ".freeze", "hold");
-  const renew = claim(d, ["--file=src/c.js", "--who=owner", "--ttl=600"]);   // 会停在闸口
+  const renew = claim(d, ["--file=src/c.js", "--who=owner", "--ttl=600"], GATE);   // 会停在闸口
   await waitAtGate(lockOf(d, "src/c.js"));   // 等它自己报到停在闸口
 
   // 闸口期间把基锁换成别人的化身——等价于"B 合法抢占成功"
@@ -357,7 +365,7 @@ test("确定性临界：判据成立之后才被续期，抢占复查搬到的�
   fs.writeFileSync(p, JSON.stringify({ who: "owner", at: baseAt, ttl: 1 }));   // 没有标记：真的过期了
 
   fs.writeFileSync(p + ".freeze", "hold");
-  const stealing = claim(d, ["--file=src/h.js", "--who=other", "--ttl=600"]);
+  const stealing = claim(d, ["--file=src/h.js", "--who=other", "--ttl=600"], GATE);
   await waitAtGate(p);                           // 等它自己报到：已判过期、还没动手
   fs.writeFileSync(markerOf(p, baseAt), JSON.stringify({ at: Date.now(), base: baseAt, ttl: 600 })); // 闸口里被续期
   fs.rmSync(p + ".freeze");
@@ -414,3 +422,83 @@ test("脏锁不许被 release 抹掉（那会把别人正在写的锁当垃圾�
   assert.ok(fs.existsSync(lockOf(d, "src/keep.js")), "脏锁被裸删了");
 });
 
+
+// ============ 闸口延时只在测试里存在（第 4 条） ============
+test("没打开 AGENT_RELAY_TEST_GATE 时，.freeze 完全不生效", async () => {
+  // 这条不是"顺手加的"：上一版 pauseForFreeze 只看磁盘上有没有 .freeze。
+  // 而本项目的威胁模型明写"任何能往该目录写文件的程序都能给两个 agent 下指令"——
+  // 于是任何写入方建一个 .freeze 就能把对方卡到 25s 上限。那是我自己开的 DoS 通道。
+  const d = mkChannel();
+  const first = await claim(d, ["--file=src/g.js", "--who=owner", "--ttl=600"]);
+  assert.equal(first.code, 0, first.out + first.err);
+  fs.writeFileSync(lockOf(d, "src/g.js") + ".freeze", "hold");
+  const t0 = Date.now();
+  const r = await claim(d, ["--file=src/g.js", "--who=owner", "--ttl=600"]);   // 无 env
+  const waited = Date.now() - t0;
+  assert.equal(r.code, 0, `${r.out}${r.err}`);
+  assert.ok(waited < 3000, `生产路径竟然等了 ${waited}ms——闸口没被环境变量关住`);
+  assert.ok(!fs.existsSync(lockOf(d, "src/g.js") + ".at-gate"), "报到文件都不该被创建：那条路径上不该有任何动作");
+});
+
+test("源码里闸口的唯一入口是环境变量（防「默认开着」回潮）", () => {
+  const src = fs.readFileSync(path.join(ROOT, "src", "claims", "lock.js"), "utf8");
+  assert.match(src, /process\.env\[GATE_ENV\] === "1"/, "闸口必须只由 AGENT_RELAY_TEST_GATE 打开");
+  assert.match(src, /if \(!gateEnabled\(\)\) return false;/, "pauseForFreeze 第一句就必须在生产路径上返回");
+});
+
+// ============ 写板装进 CAS：使用点复验（第 1、2 条） ============
+test("renewed 之后被合法抢占，board 必须拒写并且板子一个字节都不动", async () => {
+  const d = mkChannel();
+  const bd = path.join(d, "PROGRESS.md");
+  fs.writeFileSync(bd, "# 进度板\n");
+  const before = fs.readFileSync(bd, "utf8");
+
+  const a = await claim(d, ["--file=src/b.js", "--who=owner", "--ttl=1"]);
+  assert.equal(a.code, 0, a.out + a.err);
+  const token = /--at=(\d+)/.exec(a.out)[1];
+  await new Promise((r) => setTimeout(r, 1200));                 // TTL 到点
+  const steal = await claim(d, ["--file=src/b.js", "--who=other", "--ttl=600"]);
+  assert.equal(steal.code, 0, steal.out + steal.err);            // 抢占合法成立
+  const otherToken = /--at=(\d+)/.exec(steal.out)[1];
+
+  // 原方**不知道**自己被抢，照常来写板：使用点复验必须拦住它
+  const lost = await board(d, ["--file=src/b.js", "--who=owner", "--at=" + token,
+    `--board=${bd}`, "--row=| src/b.js | owner | now |"]);
+  assert.equal(lost.code, 5, `丢锁的一方写板竟然放行，退码 ${lost.code}：\n${lost.out}${lost.err}`);
+  assert.equal(fs.readFileSync(bd, "utf8"), before, "写板被拒却动了板子");
+
+  // 现持有者写板必须成
+  const ok = await board(d, ["--file=src/b.js", "--who=other", "--at=" + otherToken,
+    `--board=${bd}`, "--row=| src/b.js | other | now |"]);
+  assert.equal(ok.code, 0, ok.out + ok.err);
+  const after = fs.readFileSync(bd, "utf8");
+  assert.match(after, /\| src\/b\.js \| other \| now \|/);
+  assert.doesNotMatch(after, /\| src\/b\.js \| owner \|/, "丢锁一方的行留在了板上 = 双重声明");
+});
+
+test("board 幂等：同一行写两次只有一行（否则复跑一次就造出假的双重声明）", async () => {
+  const d = mkChannel();
+  const bd = path.join(d, "PROGRESS.md");
+  const a = await claim(d, ["--file=src/i.js", "--who=qoder", "--ttl=600"]);
+  const token = /--at=(\d+)/.exec(a.out)[1];
+  const args = ["--file=src/i.js", "--who=qoder", "--at=" + token, `--board=${bd}`, "--row=| src/i.js | qoder | now |"];
+  assert.equal((await board(d, args)).code, 0);
+  assert.equal((await board(d, args)).code, 0);
+  const txt = fs.readFileSync(bd, "utf8");
+  assert.equal((txt.match(/src\/i\.js \| qoder \| now/g) || []).length, 1, txt);
+});
+
+test("board 不许在没有令牌时放行（否则 CAS 写板退化成裸 append）", async () => {
+  const d = mkChannel();
+  const bd = path.join(d, "PROGRESS.md");
+  await claim(d, ["--file=src/n.js", "--who=qoder", "--ttl=600"]);
+  // (a) 整个 --at 不给：必须当参数缺失拒掉，而不是"跳过令牌校验"
+  const noArg = await board(d, ["--file=src/n.js", "--who=qoder", `--board=${bd}`, "--row=| src/n.js | qoder | now |"]);
+  assert.equal(noArg.code, 2, `缺 --at 应该退 2，实退 ${noArg.code}：\n${noArg.out}${noArg.err}`);
+  assert.ok(!fs.existsSync(bd), "被拒的写板创建了板文件");
+  // (b) 给了一个不相干的令牌：必须走归属判定退 5，而不是当成"没给"
+  const wrongArg = await board(d, ["--file=src/n.js", "--who=qoder", "--at=1",
+    `--board=${bd}`, "--row=| src/n.js | qoder | now |"]);
+  assert.equal(wrongArg.code, 5, `乱给令牌应该退 5，实退 ${wrongArg.code}：\n${wrongArg.out}${wrongArg.err}`);
+  assert.ok(!fs.existsSync(bd), "令牌被拒却还是落了盘");
+});

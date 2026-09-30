@@ -129,6 +129,24 @@ const MUT = [
     pairs: [["    return { status: \"io-error\", code: EXIT.LOCK_IO, file: args.file, path: args.claimsDir,", "    throw e;\n    return { status: \"io-error\", code: EXIT.LOCK_IO, file: args.file, path: args.claimsDir,"]],
     test: "每个值都能被 CLI 真跑到",
   },
+  {
+    name: "M18 board 跳过归属复验（写板退回裸 append）",
+    file: LOCK,
+    pairs: [['  if (held.status !== "held") return { ...held, wrote: false };', "  if (false) return { ...held, wrote: false };"]],
+    test: "board 必须拒写",
+  },
+  {
+    name: "M19 闸口无视环境变量、只看磁盘（等于给靶场开一条 DoS 通道）",
+    file: LOCK,
+    pairs: [["  if (!gateEnabled()) return false;", "  if (false) return false;"]],
+    test: "完全不生效",
+  },
+  {
+    name: "M20 复验不看化身令牌（名字对就让写）",
+    file: LOCK,
+    pairs: [["if (at !== undefined && at !== null && String(cur.at) !== String(at)) {", "if (false) {"]],
+    test: "没有令牌时放行",
+  },
 ];
 
 function runTest(pattern, suite) {
