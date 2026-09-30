@@ -566,12 +566,14 @@ test("脏锁的定义包含\"解析得出来但字段算不出到期时刻\"，R
 
 test("跨机时钟：max(at, mtime) 的两道护栏都在，README 连没关掉的那侧一起写", () => {
   const src = readFileSync(new URL("../src/claims/lock.js", import.meta.url), "utf8");
-  assert.match(src, /const m = Math\.min\(safeMtime\(p\), Date\.now\(\)\);/,
+  assert.match(src, /const m = Math\.min\(rawMtime, now\);/,
     "mtime 没夹到本地此刻：未来的 mtime（同步盘重写/时钟回跳）会把到期推到未来，锁看着永不过期");
   assert.match(src, /let d = Math\.max\(Number\(c\.at\) \|\| 0, m\) \+ c\.ttl \* 1000;/,
     "到期判定不再是 max(头部 at, 本地 mtime)——写方钟偏早就会提前抢走活锁");
-  assert.match(src, /const mm = Math\.min\(m\.mtimeMs \|\| 0, Date\.now\(\)\);/,
-    "续期标记的 mtime 也要同法夹，否则标记能把到期无限推到未来");
+  assert.match(src, /const mm = Math\.min\(rawMarker, Date\.now\(\)\);/,
+    "续期标记的 mtime 也要同法夹，否则标记能把到期无限推到未来。" +
+    "而且这里必须**现取 Date.now()**，不许复用 deadlineOf 入口那个 now：复用会让夹值偏早几微秒，" +
+    "方向是'到期更早 ⇒ 更容易被抢'——那种改变不该藏在一次只搬可见性的改动里");
   assert.match(src, /skew !== null && skew > SKEW_UNTRUSTED_S/,
     "两个钟相差超过阈值必须降级成脏锁；只靠 clamp 单独决定，backward 时钟跳变就等于提前过期（丢数据方向）");
   assert.match(src, /export const SKEW_UNTRUSTED_S = (\d+);/, "不可信阈值必须是具名常量，README 要引用同一个数");
@@ -759,24 +761,34 @@ test("S2b 的每条断言都必须自带普查（红一次只报数字差，等�
     `S2b 有 ${asserts} 条断言、只有 ${withCensus} 条带普查：剩下那些一旦红，报出来的还是光秃秃的数字差`);
 });
 
-test("clamp 的报告与判据必须同源同形：两处都得用 min(mtime, 本地此刻)", () => {
-  // 本轮边界是"不改 lock/配置"，所以 `[MTIME_CLAMPED]` 的报告只能长在读数侧（src/cli.js），
-  // 而 clamp 本身留在判据侧（src/claims/lock.js 的 deadlineOf）。
-  // **分居两处是有代价的**：lock.js 一旦改夹法（比如换成 `Math.min(mtime, at+ttl)` 或干脆去掉夹），
-  // 报告里那句"采用="说的就不是真话了 —— 而它看起来完全正常。所以这里把两处的形状一起钉住。
+// 上一轮这条断言钉的是"两处公式必须同形"（判据在 lock.js 夹、读数侧在 cli.js 再算一遍）。
+// 那种并存本身就是缺陷：读数侧算出来的"采用值"未必是判据真用过的数。本轮改成**返回值携带事实**
+// （`deadlineOf` 返 `{ms, clampedFrom, clampedTo}`），所以这里钉的方向反过来：
+// **不许出现第二处 clamp 计算** —— 谁再在 cli.js 里算 `Math.min(mtime…)`，就是又开了一个真相源。
+test("clamp 的可见性走返回值：判据算一次，读数侧不许再算第二遍", () => {
   const lock = readFileSync(new URL("../src/claims/lock.js", import.meta.url), "utf8");
   const cli = readFileSync(new URL("../src/cli.js", import.meta.url), "utf8");
-  assert.match(lock, /Math\.min\(safeMtime\(p\), Date\.now\(\)\)/,
-    "lock.js 的 clamp 不再是那句 `Math.min(safeMtime(p), Date.now())`：报告侧需要同步改，先红在这里");
-  assert.match(cli, /Math\.min\(rawM, Date\.now\(\)\)/,
-    "cli.js 的报告侧不再按同一形状算『采用值』：它会报一个判据其实没用过的数");
-  assert.match(cli, /\[MTIME_CLAMPED\] 原始=\$\{rawM\} 采用=\$\{usedM\}/,
+  assert.match(lock, /let clampedFrom = rawMtime > m \? rawMtime : null;/,
+    "『夹之前』那个数没被记下来了：clamp 又变回只在数字里留痕，读的人分不清实测与被抹值");
+  assert.match(lock, /return \{ ms: d, clampedFrom, clampedTo \};/,
+    "deadlineOf 不再返回结构：三个出口（list / verifyHold / auditBoard）就拿不到这件事，只有打印器看得见");
+  // 三个出口各自都要带——少一个就是"轨道存在但轨道里没东西"
+  for (const [needle, who] of [
+    ["clampedFrom: dl.clampedFrom, clampedTo: dl.clampedTo, state", "list().locks[]"],
+    ["clampedFrom: dl.clampedFrom, clampedTo: dl.clampedTo,", "auditBoard 的 holder"],
+    ["status: \"held\", code: EXIT.OK, file, path: p, holder: who, at: cur.at, clampedFrom: dl.clampedFrom", "verifyHold()"],
+  ]) assert.ok(lock.includes(needle), `${who} 没带 clampedFrom：走 API 的调用方拿到的还是一个普通数字`);
+  assert.doesNotMatch(cli, /Math\.min\([^)]*mtime/i,
+    "cli.js 又开始自己算 mtime 的夹法了：那就有第二处 clamp 公式，两处会各自飘而报告看着完全正常");
+  assert.match(cli, /if \(h\.clampedFrom != null\) \{/,
+    "打印器不再按返回值判『被夹过』：它与判据就用的是两个事实了");
+  assert.match(cli, /\[MTIME_CLAMPED\] 原始=\$\{h\.clampedFrom\} 采用=\$\{used\}/,
     "报告里两个量必须同时在场：只打一个数就等于没打（分清不了『被夹过』与『正常』）");
   // 来因必须是"未判定 + 候选"，不许写成结论：本仓从没在真同步盘上跑过（见 README 那句实测）
   assert.match(cli, /来因=未判定/,
     "来因被写成确定原因了：我们没有那个证据，写死就是替用户下结论");
   // `clockNote`（在 lock.js 里）会说"写方钟偏早"这种结论式措辞，而 `at − mtime < 0`
-  // 这一个观测同时由"钟早"与"mtime 被改到未来"产生。本轮不改 lock.js，所以在读数侧当场降级。
+  // 这一个观测同时由"钟早"与"mtime 被改到未来"产生 ⇒ 读数侧当场把它降回候选解释。
   assert.match(cli, /来因不是结论/,
     "clamp 与那句结论式时钟注释同时出现时，必须补一句『来因不是结论』——否则两句挨着，前一句看起来像已查明");
 });

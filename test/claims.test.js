@@ -1035,3 +1035,46 @@ test("少一个尾巴的手写行不许整行跳过：那是把越写者读成\"
   assert.equal(r.code, 11, `不规整的伪造行被静默跳过（实退 ${r.code}）：\n${r.out}`);
   assert.match(r.out, /越写者/);
 });
+
+// 下面两条**故意走进程内 API**，与本页开头那句"测真实 CLI 进程"相反 —— 因为要验的正是
+// "不走打印器的人拿到什么"。CLI 那层已经会打 [MTIME_CLAMPED]，而那恰恰证明不了别的调用方看得见。
+// 子进程测退出码的纪律仍由上面几十条守着，这两条补的是另一个面。
+test("被夹过要跟着返回值走：auditBoard / list / verifyHold 三个出口都带 clampedFrom（未来 mtime）", async () => {
+  const { auditBoard, list, verifyHold } = await import("../src/claims/lock.js");
+  const d = mkChannel();
+  const now = Date.now();
+  const raw = now + 300 * 1000;                       // 阈值内（<900s），否则先被降级成脏锁，量的就不是这条
+  plantLock(d, "src_api.js.lock", { who: "a", at: now, ttl: 600 }, raw);
+  const claimsDir = path.join(d, "claims");
+
+  const h = auditBoard({ claimsDir, boardPath: path.join(d, "PROGRESS.md") }).holders
+    .find((x) => x.file === "src_api.js.lock");
+  assert.ok(h, "auditBoard 没把这把锁列进 holders，后面无从谈起");
+  assert.equal(h.clampedFrom, raw,
+    `holder 拿不到"被夹之前的原始 mtime"（拿到 ${h.clampedFrom}，期望 ${raw}）：` +
+    "打印器会喊，但走 API 的人只看见一个普通 leftS");
+
+  const l = list({ claimsDir }).locks.find((x) => x.lock === "src_api.js.lock");
+  assert.ok(l, "list 没列出这把锁");
+  assert.equal(l.clampedFrom, raw, `list().locks[].clampedFrom 应当带出原始 mtime（拿到 ${l.clampedFrom}）`);
+
+  const v = verifyHold({ claimsDir, file: "src/api.js", who: "a", at: now });
+  assert.equal(v.status, "held", `前置条件：这把锁此刻应判 held，实际 ${v.status}`);
+  assert.equal(v.clampedFrom, raw,
+    `verifyHold 的返回也要带（拿到 ${v.clampedFrom}）：writeBoard 就是靠它决定能不能写板，` +
+    "而它用的到期时刻是被夹过的，它自己却不知道");
+});
+
+test("没夹过就不许带：正常 mtime 时三个出口的 clampedFrom 必须是 null", async () => {
+  // 反例面。缺了它，"永远返回一个数"或"永远返回 null"这类恒等实现都能蒙过去。
+  const { auditBoard, list, verifyHold } = await import("../src/claims/lock.js");
+  const d = mkChannel();
+  const t = Date.now() - 5000;
+  plantLock(d, "src_norm2.js.lock", { who: "a", at: t, ttl: 600 }, t);   // mtime 与 at 都在过去
+  const claimsDir = path.join(d, "claims");
+  assert.equal(auditBoard({ claimsDir, boardPath: path.join(d, "PROGRESS.md") })
+    .holders.find((x) => x.file === "src_norm2.js.lock").clampedFrom, null,
+    "正常锁也报 clampedFrom ⇒ 这个字段一旦恒真就回到 0 信息量");
+  assert.equal(list({ claimsDir }).locks.find((x) => x.lock === "src_norm2.js.lock").clampedFrom, null);
+  assert.equal(verifyHold({ claimsDir, file: "src/norm2.js", who: "a", at: t }).clampedFrom, null);
+});

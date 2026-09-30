@@ -240,17 +240,35 @@ function deadlineOf(p, c) {
   // mtime 先夹到"本地此刻"：文件系统的钟不可能盖出一个未来的 mtime，
   // 真出现了就说明它是被同步客户端/别的东西改写的 ⇒ 拿它算到期会变成"看着永不过期"。
   // 夹到 now 的含义是：本地最多再等你 ttl 秒，而不是"等 mtime 里那个未来时刻 + ttl"。
-  const m = Math.min(safeMtime(p), Date.now());
+  const now = Date.now();
+  const rawMtime = safeMtime(p);
+  const m = Math.min(rawMtime, now);
+  // **返回值携带"被夹过"这件事**：以前 clamp 只在数字里留下痕迹，读的人（含不走打印器的调用方）
+  // 拿到的是一个普通的毫秒数，看不出它是实测值还是被抹到此刻的值。见 23.x：这条是"读数只在
+  // 展示路径上、不在判定路径上"那个形状的修法。clampedFrom = 夹之前的原始 mtime，没夹则 null。
+  let clampedFrom = rawMtime > m ? rawMtime : null;
+  let clampedTo = clampedFrom === null ? null : m;
   let d = Math.max(Number(c.at) || 0, m) + c.ttl * 1000;
-  for (const m of markersFor(p, c.at)) {
+  for (const mk of markersFor(p, c.at)) {
     // 读不懂的标记**不能当"没有标记"**：那会把到期时刻算少，等于抢走别人刚续过的活锁（丢数据方向）。
     // 也不能让它的 NaN 渗进 max——NaN 一旦进 deadline，`Date.now() > NaN` 恒 false 就又造出一把永不超期的锁。
     // 归到 CORRUPT_GRACE_S：保守延长，但躺够上界照样能回收，不给无限期留后门。
-    if (m.corrupt) { d = Math.max(d, (m.mtimeMs || 0) + CORRUPT_GRACE_S * 1000); continue; }
-    const mm = Math.min(m.mtimeMs || 0, Date.now());   // 同法夹：标记的 mtime 也不许是未来的
-    d = Math.max(d, Math.max(m.at, mm) + (m.ttl || c.ttl) * 1000);
+    if (mk.corrupt) { d = Math.max(d, (mk.mtimeMs || 0) + CORRUPT_GRACE_S * 1000); continue; }
+    const rawMarker = mk.mtimeMs || 0;
+    // 这里刻意**重新取一次 Date.now()**，而不是复用函数入口那个 `now`：
+    // 本轮改的是可见性，判定路径必须逐位不变。复用入口时刻会让标记的夹值略微偏早
+    // （循环里每读一个标记都过几微秒），方向上是"到期更早 ⇒ 更容易被抢"，
+    // 那种改变不该藏在一次"只是把事实带回返回值"的改动里。
+    const mm = Math.min(rawMarker, Date.now());   // 同法夹：标记的 mtime 也不许是未来的
+    // 标记被夹过同样要带出去：原始值取最大的那次（=被抹掉最多），夹到的时刻跟着那一次
+    if (rawMarker > mm) {
+      if (clampedFrom === null || rawMarker > clampedFrom) { clampedFrom = rawMarker; clampedTo = mm; }
+    }
+    d = Math.max(d, Math.max(mk.at, mm) + (mk.ttl || c.ttl) * 1000);
   }
-  return d;
+  // clampedTo = 被抹到的那个时刻（基锁夹到入口 now；标记夹到各自取的那次 Date.now()）。
+  // 读数侧只要念这两个数，不许再算第三遍（docs-drift 有断言禁止 cli.js 出现第二处 clamp）。
+  return { ms: d, clampedFrom, clampedTo };
 }
 
 // 续期作废时把死化身的标记清掉。删的是"基锁已经不是这一把"之后谁都不再引用的文件，
@@ -345,7 +363,7 @@ export function acquire({ claimsDir, file, who, ttl }) {
     const got = readLock(tmp);
     const canTake = !got || (got.corrupt
       ? idleOf(got) > CORRUPT_GRACE_S
-      : Date.now() > deadlineOf(p, got));                   // 标记还在盘上，判过期要一起算
+      : Date.now() > deadlineOf(p, got).ms);                   // 标记还在盘上，判过期要一起算
     if (!canTake) {
       // 搬错人了。放回；空位若已被第三方合法占住，就不放（放会覆盖），
       // 残留文件由 locks 打出来——它不是垃圾，是"谁在临界点上被误伤"的现场。
@@ -385,7 +403,7 @@ export function acquire({ claimsDir, file, who, ttl }) {
   // 所以续期改成**只增不改的 compare-and-swap**：给"我这一个化身"独占创建一个续期标记，
   // 然后复查基锁是否还是我读到的那一把。是 → 续期成立；不是 → 作废（退码 9）。
   // 标记对过期判定是加分项，对别人的锁零破坏：不存在任何一次写会覆盖别人的字节。
-  const alive = deadlineOf(p, cur) >= Date.now();
+  const alive = deadlineOf(p, cur).ms >= Date.now();
   if (cur.who === who && alive) {
     pauseForFreeze(p);                                  // 确定性临界：见 pauseForFreeze 注释
     const m = markerOf(p, cur.at);
@@ -412,7 +430,7 @@ export function acquire({ claimsDir, file, who, ttl }) {
   // 否则"从入口消除"只挡住了增量，没挡住存量。
   // 过期判定必须把续期标记算进来：不算的话，一次正常续期之后锁照样能被抢，
   // 那"允许续期"就变成"允许被误伤"。
-  const expired = Date.now() > deadlineOf(p, cur);
+  const expired = Date.now() > deadlineOf(p, cur).ms;
   const invalid = !(cur.ttl > 0);
   if (expired || invalid) {
     pauseForFreeze(p);                                  // 同样给抢占留出可复现的临界窗口
@@ -469,7 +487,7 @@ export function list({ claimsDir }) {
     // 各算各的会出现：一把刚续过的锁在 `locks` 里被标成"已过期可回收"，
     // 而 claim 实际返回 3——旁观者照着板子做决定，决定是错的。
     const dl = deadlineOf(path.join(claimsDir, f), cur);
-    const left = ((dl - Date.now()) / 1000).toFixed(1);
+    const left = ((dl.ms - Date.now()) / 1000).toFixed(1);
     const renewals = markersFor(path.join(claimsDir, f), cur.at).length;
     // 跨机时钟偏移在观测面上必须可见：`at` 是写方钟，mtime 是本地钟，差得远就说明
     // 这把锁的"剩多少秒"不能被当成本机秒数读。判定用 max 兜住了提前抢，
@@ -477,9 +495,10 @@ export function list({ claimsDir }) {
     const skew = +(((cur.at - safeMtime(path.join(claimsDir, f))) / 1000).toFixed(1));
     const skewTag = Math.abs(skew) > SKEW_ALERT_S ? `  时钟差 ${skew > 0 ? "+" : ""}${skew}s(可疑)` : "";
     const state = !(cur.ttl > 0) ? "违规(无TTL)"
-      : Date.now() > dl ? "已过期可回收"
+      : Date.now() > dl.ms ? "已过期可回收"
       : `持有中(剩 ${left}s${renewals ? `，含 ${renewals} 次续期` : ""})${skewTag}`;
-    return { lock: f, holder: cur.who ?? "?", ageS, ttl: cur.ttl ?? null, state };
+    // clampedFrom 与 state 同源：走 API 的人（不是只看 locks 打印的人）也要能判断这个剩多少秒可信不可信
+    return { lock: f, holder: cur.who ?? "?", ageS, ttl: cur.ttl ?? null, clampedFrom: dl.clampedFrom, clampedTo: dl.clampedTo, state };
   });
   // 仲裁残留：搬错人又放不回去的那把锁留在这儿。它后缀不是 .lock、不参与归属判定，
   // 但它是"谁在临界点上被误伤"的唯一现场——必须看得见，不能变成暗垃圾。
@@ -505,11 +524,13 @@ export function verifyHold({ claimsDir, file, who, at }) {
     return { status: "stale-token", code: EXIT.NOT_HOLDER, file, path: p, holder: who,
       reason: `名字对但化身对不上（你带的是 ${at}，盘上是 ${cur.at}）——中途被抢走过` };
   }
-  if (Date.now() > deadlineOf(p, cur)) {
-    return { status: "expired", code: EXIT.RENEW_FAILED, file, path: p, holder: who,
+  // 判定与可见性同一处算：writeBoard 靠这次返回值决定要不要写板，它用的到期时刻可能就是被夹过的
+  const dl = deadlineOf(p, cur);
+  if (Date.now() > dl.ms) {
+    return { status: "expired", code: EXIT.RENEW_FAILED, file, path: p, holder: who, clampedFrom: dl.clampedFrom,
       reason: "TTL 已到期且没有有效续期标记；此刻任何人都可以合法抢占" };
   }
-  return { status: "held", code: EXIT.OK, file, path: p, holder: who, at: cur.at };
+  return { status: "held", code: EXIT.OK, file, path: p, holder: who, at: cur.at, clampedFrom: dl.clampedFrom };
 }
 
 // ---- 板级锁 ----
@@ -670,12 +691,13 @@ function pidAlive(pid) {
 
 function holderOf(p, f, logical, c) {
   const mtime = safeMtime(p);
-  const leftS = +((deadlineOf(p, c) - Date.now()) / 1000).toFixed(1);
+  const dl = deadlineOf(p, c);
+  const leftS = +((dl.ms - Date.now()) / 1000).toFixed(1);
   const skewS = +((c.at - mtime) / 1000).toFixed(1);
   const h = {
     lock: logical, file: f, who: c.who, at: c.at, ttl: c.ttl,
     ageS: +((Date.now() - c.at) / 1000).toFixed(1),
-    leftS, expired: leftS <= 0,
+    leftS, expired: leftS <= 0, clampedFrom: dl.clampedFrom, clampedTo: dl.clampedTo,
     holderPid: pidSuffix(c.who), samePid: pidSuffix(c.who) === process.pid,
     pidAlive: pidAlive(pidSuffix(c.who)), clockSkewS: skewS, clockNote: null,
   };

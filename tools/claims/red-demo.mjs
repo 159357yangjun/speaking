@@ -131,10 +131,12 @@ const MUT = [
   {
     name: "M15 到期计算忽略续期标记（第一道防线：外层判据不算标记）",
     file: LOCK,
-    // 锚点跟着 deadlineOf 改过形状：标记那一行从单行 for 变成了带 corrupt 分支的块，
-    // 老锚点整段失配（red-demo 报"锚点没命中"而不是绿——这条守卫是对的）。
-    pairs: [["    d = Math.max(d, Math.max(m.at, mm) + (m.ttl || c.ttl) * 1000);",
-             "    void m;   // 变异：标记不参与到期计算"]],
+    // 锚点跟着 deadlineOf 改过两次形状：标记那一行从单行 for 变成了带 corrupt 分支的块；
+    // 本轮 clamp 改成返回结构时循环变量 `m` 改名 `mk`（外层已有 `const m` 被它遮蔽，
+    // 那种同名本身就是读代码的坑），于是老锚点又整段失配。
+    // red-demo 每次都报"锚点没命中"而不是绿——这条守卫是对的，也是它该有的样子。
+    pairs: [["    d = Math.max(d, Math.max(mk.at, mm) + (mk.ttl || c.ttl) * 1000);",
+             "    void mk;   // 变异：标记不参与到期计算"]],
     test: "标记已在盘上时，外层判据就该直接收手",
   },
   {
@@ -343,7 +345,7 @@ const MUT = [
   {
     name: "M44 摘掉『mtime 夹到本地此刻』（未来的 mtime 能把租约拉长）",
     file: LOCK,
-    pairs: [["  const m = Math.min(safeMtime(p), Date.now());", "  const m = safeMtime(p);   // 变异：不夹"]],
+    pairs: [["  const m = Math.min(rawMtime, now);", "  const m = rawMtime;   // 变异：不夹"]],
     test: "未来的 mtime",
   },
   {
@@ -457,14 +459,14 @@ const MUT = [
     // "任何锁都打这行"这种写法照样能过整个套件。
     name: "M58 摘掉 clamp 的可见性报告（被夹过的锁与正常锁又长成一个样子）",
     file: CLI,
-    pairs: [["if (rawM !== usedM) {", "if (false) {   // 变异：夹还是照夹，只是不说了"]],
+    pairs: [["if (h.clampedFrom != null) {", "if (false) {   // 变异：夹还是照夹，只是不说了"]],
     test: "clamp 发生过就必须看得见",
     suite: "test/claims.test.js",
   },
   {
     name: "M59 让那条报告无条件打印（具名短码失去分辨力 ⇒ 反例面就是空的）",
     file: CLI,
-    pairs: [["if (rawM !== usedM) {", "if (true) {   // 变异：正常锁也打，『打过』不再有信息量"]],
+    pairs: [["if (h.clampedFrom != null) {", "if (true) {   // 变异：正常锁也打，『打过』不再有信息量"]],
     test: "clamp 没发生过就不许打",
     suite: "test/claims.test.js",
   },
@@ -474,6 +476,22 @@ const MUT = [
     pairs: [["      if (h.clockNote) {\n        console.log(`      ↑ 上一条时钟注释里的来因不是结论",
              "      if (false) {\n        console.log(`      ↑ 上一条时钟注释里的来因不是结论"]],
     test: "clamp 发生过就必须看得见",
+    suite: "test/claims.test.js",
+  },
+  {
+    // 上面三条打的是**打印器**。这两条打**返回值**本身：可见性只长在 stdout 上时，
+    // 走 API 的人（writeBoard 经 verifyHold 决定要不要写板）拿到的仍是一个被默默夹过的普通数字。
+    name: "M61 clampedFrom 恒为 null（夹过这件事又从返回值里消失了）",
+    file: LOCK,
+    pairs: [["  let clampedFrom = rawMtime > m ? rawMtime : null;", "  let clampedFrom = null;   // 变异：事实不再随返回值走"]],
+    test: "被夹过要跟着返回值走",
+    suite: "test/claims.test.js",
+  },
+  {
+    name: "M62 clampedFrom 恒等于原始 mtime（正常锁也报被夹 ⇒ 字段失去分辨力）",
+    file: LOCK,
+    pairs: [["  let clampedFrom = rawMtime > m ? rawMtime : null;", "  let clampedFrom = rawMtime;   // 变异：恒真"]],
+    test: "没夹过就不许带",
     suite: "test/claims.test.js",
   },
 ];
