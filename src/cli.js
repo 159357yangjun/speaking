@@ -6,6 +6,7 @@ import { seal, verifyEnvelope, msgFileName, newNonce } from "./proto/envelope.js
 // 故意不导入 verifyHold：归属复验只发生在 writeBoard 内部（锁序声明见 src/claims/lock.js）。
 // cli.js 自己拿一次复验，就多出一条"在板锁之外判断归属"的路径。
 import { acquire, release, list, noteWait, writeBoard, auditBoard, EXIT } from "./claims/lock.js";
+import { printSummary } from "./claims/summary.js";
 
 const args = process.argv.slice(2);
 const cmd = args[0];
@@ -313,6 +314,29 @@ if (cmd === "audit") {
   for (const s of a.stale) console.log(`  ✗ 越写者：${s.row}\n      声称 ${s.who} 持锁（化身 ${s.at}），盘上没有这把活锁`);
   for (const u of a.untagged) console.log(`  ? 无令牌行（不经 board 写上去的，锁管不到它）：${u}`);
   if (!a.stale.length && !a.untagged.length) console.log("  板上每一行都对得上活锁。");
+  // 第二段：盘上现在谁持着锁的现状。**这也是只报不拒**——它存在的理由很具体：
+  // 上一场崩溃留下的板锁还没到期时，下一个写者只看见退码 12，
+  // 而他分不清"真有人在并发重写这张板"和"前面死了一个人、还剩几秒自动好"。
+  // 不做拒绝：那会把一个进程的可交付性挂在另一个进程的命运上（同 seal 那条划分）。
+  console.log(`\n盘上现持锁 ${a.holders.length} 把（现状，不是判决）：`);
+  if (!a.holders.length) console.log("  （一把都没有：现在没人占着，也没有尸体）");
+  for (const h of a.holders) {
+    const pid = h.holderPid === null ? "无 pid 后缀"
+      : `pid=${h.holderPid} ${h.samePid ? "=本进程" : h.pidAlive === true ? "本机在跑" : h.pidAlive === false ? "本机查不到(尸体?)" : "跨机未知"}`;
+    console.log(`  ${h.lock}`.padEnd(28) + ` 持有者=${h.who}` +
+      `  已占 ${h.ageS}s  剩 ${h.leftS}s / TTL ${h.ttl}s  ${h.expired ? "已到期可回收" : "未到期"}  ${pid}`);
+    if (h.clockNote) console.log(`      时钟：${h.clockNote}`);
+  }
+  // 机读汇总行：退码只表达"有没有越写者(stale)"这一件事，
+  // 无令牌行(untagged)、现状条数这些**同样要能被机器判**，所以它们进这一行而不是挤进退码。
+  // 这是"少报"那一侧的处置：表头/人类注释行也是"无令牌"的形状，把它们并进 11
+  // 会把每张正常板子判成有问题（多报）；完全不给机读入口又会让靠退码自动化的脚本漏掉这一类。
+  printSummary({
+    kind: "audit", rows: a.total, stale: a.stale.length, untagged: a.untagged.length,
+    holders: a.holders.length,
+    code: a.stale.length ? EXIT.STALE_BOARD_ROW : EXIT.OK,
+    codes: [...new Set([EXIT.STALE_BOARD_ROW, EXIT.OK])],
+  });
   process.exit(a.stale.length ? EXIT.STALE_BOARD_ROW : EXIT.OK);
 }
 

@@ -4,12 +4,19 @@
 import { readFileSync, writeFileSync, copyFileSync, rmSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { join } from "node:path";
+import { printSummary, crossCheck, HARNESS_EXIT } from "../../src/claims/summary.js";
+
+// 退码声明表（见 board-race.mjs 同名表的注释）：7 专留给"测具自己在骗人"
+const EXIT_CODES = { allRed: 0, harness: 7, notAllRed: 8, badUsage: 9 };
 
 const ROOT = process.argv[2];
-if (!ROOT) { console.error("用法：node tools/claims/red-demo.mjs <仓库绝对路径>（参数只有一个，别再写反顺序）"); process.exit(9); }
+if (!ROOT) { console.error("用法：node tools/claims/red-demo.mjs <仓库绝对路径>（参数只有一个，别再写反顺序）"); process.exit(EXIT_CODES.badUsage); }
 const LOCK = join(ROOT, "src/claims/lock.js");
 const CLI = join(ROOT, "src/cli.js");
 const README = join(ROOT, "README.md");
+const SUM = join(ROOT, "src/claims/summary.js");
+const BR = join(ROOT, "tools/claims/board-race.mjs");
+const DEMO = join(ROOT, "tools/claims/red-demo.mjs");
 
 const MUT = [
   {
@@ -112,8 +119,10 @@ const MUT = [
   {
     name: "M15 到期计算忽略续期标记（第一道防线：外层判据不算标记）",
     file: LOCK,
-    pairs: [["  for (const m of markersFor(p, c.at)) d = Math.max(d, m.at + (m.ttl || c.ttl) * 1000);",
-             "  void p;   // 变异：标记不参与到期计算"]],
+    // 锚点跟着 deadlineOf 改过形状：标记那一行从单行 for 变成了带 corrupt 分支的块，
+    // 老锚点整段失配（red-demo 报"锚点没命中"而不是绿——这条守卫是对的）。
+    pairs: [["    d = Math.max(d, Math.max(m.at, m.mtimeMs || 0) + (m.ttl || c.ttl) * 1000);",
+             "    void m;   // 变异：标记不参与到期计算"]],
     test: "标记已在盘上时，外层判据就该直接收手",
   },
   {
@@ -200,7 +209,7 @@ const MUT = [
     name: "M27 README 的测试总数与分项对不上代码",
     file: README,
     suite: "test/docs-drift.test.js",
-    pairs: [["测试总数 **95**（protocol 20 · claims 40", "测试总数 **92**（protocol 20 · claims 40"]],
+    pairs: [["测试总数 **116**（protocol 20 · claims 52", "测试总数 **106**（protocol 20 · claims 52"]],
     test: "测试计数",
   },
   {
@@ -217,22 +226,169 @@ const MUT = [
     pairs: [["**4 = 前提不成立**", "**（原文已删）**"]],
     test: "探针与夹具",
   },
+  // ---- 跨机时钟与现状输出：四条新判据各配一处变异 ----
+  {
+    name: "M30 到期判定退回只看头部 at（写方钟偏早 ⇒ 抢走活锁 ⇒ 双写回来）",
+    file: LOCK,
+    pairs: [["  let d = Math.max(Number(c.at) || 0, safeMtime(p)) + c.ttl * 1000;",
+             "  let d = Number(c.at) + c.ttl * 1000;   // 变异：丢掉本地 mtime"]],
+    test: "偏早",
+  },
+  {
+    name: "M31 到期判定只信本地 mtime（写方钟偏晚那一侧被误当过期）",
+    file: LOCK,
+    // 不用 min(at, mtime)：steal 的复查里路径已经指向搬走后的文件，min 的 0 会被 `|| at` 兜住，
+    // 红就落在观测断言上而不是"不得被抢"那条——红的方向比红本身更要紧。
+    pairs: [["  let d = Math.max(Number(c.at) || 0, safeMtime(p)) + c.ttl * 1000;",
+             "  let d = safeMtime(p) + c.ttl * 1000;   // 变异：完全不看头部 at"]],
+    test: "偏晚",
+  },
+  {
+    name: "M32 不做字段校验（无 at/ttl 的锁重新变成永不超期）",
+    file: LOCK,
+    pairs: [["    if (obj && typeof obj === \"object\" && lockShapeOk(obj)) return obj;",
+             "    if (obj && typeof obj === \"object\") return obj;   // 变异：残缺锁重新算合法"]],
+    test: "字段残缺",
+  },
+  {
+    name: "M33 audit 看见盘上有锁就拒（把\"点名\"做成\"拦截\"）",
+    file: CLI,
+    pairs: [["  process.exit(a.stale.length ? EXIT.STALE_BOARD_ROW : EXIT.OK);",
+             "  process.exit(a.stale.length || a.holders.length ? EXIT.STALE_BOARD_ROW : EXIT.OK);"]],
+    test: "退码仍按越写者判",
+  },
+  {
+    name: "M34 现状段不再区分\"已到期可回收\"（尸体和拥堵混成一坨）",
+    file: LOCK,
+    pairs: [["    leftS, expired: leftS <= 0,", "    leftS, expired: false,"]],
+    test: "audit 的现状段要能同时说出",
+  },
+  {
+    name: "M35 max 被当成'谁也别想回收'（两个钟都老也不许过期）",
+    file: LOCK,
+    pairs: [["  let d = Math.max(Number(c.at) || 0, safeMtime(p)) + c.ttl * 1000;",
+             "  void p; let d = Number.MAX_SAFE_INTEGER;   // 变异：到期时刻永远到不了"]],
+    test: "两个钟都老",
+  },
+  // ---- 通令那一族：读不到 ≠ 0、双向印证、少报形状 ----
+  {
+    name: "M36 目录读失败整块吞成\"没有标记\"（少报：所有续期一笔勾销）",
+    file: LOCK,
+    pairs: [["    if (e.code === \"ENOENT\") return [];\n    throw e;", "    return [];"]],
+    test: "目录读失败",
+  },
+  {
+    name: "M37 半截续期标记被当成没有标记（把正在写的那一次续期读成不存在）",
+    file: LOCK,
+    // 打在 catch 那一支：用例喂的是 `{"at": 17`（半截 JSON），走的是 parse 抛错这条路。
+    // 上一版打的是"字段不完整"那一支，红不到——**变异要落在被测路径上，不是落在同名的相邻行上**。
+    pairs: [['      out.push({ corrupt: true, mtimeMs: safeMtime(full), why: e.code === "ENOENT" ? "刚被清掉" : `读不出（${e.code}）` });',
+             "      void e;   // 变异：读不懂就当没有这个标记"]],
+    test: "半截续期标记",
+  },
+  {
+    name: "M38 audit 把手写得不规整的行整行跳过（少一个尾巴的 | 就看不见越写者）",
+    file: LOCK,
+    pairs: [["    const cols = line.split(\"|\").map((s) => s.trim()).filter(Boolean);",
+             "    if (!/\\|\\s*$/.test(line.trimEnd())) continue;   // 变异：形状不合就整行不看\n    const cols = line.split(\"|\").map((s) => s.trim()).filter(Boolean);"]],
+    test: "少一个尾巴的手写行",
+  },
+  {
+    name: "M39 audit 把无令牌行也判成 11（表头与它形状一样，每张正常板子都会被拒）",
+    file: CLI,
+    pairs: [["    code: a.stale.length ? EXIT.STALE_BOARD_ROW : EXIT.OK,", "    code: a.stale.length || a.untagged.length ? EXIT.STALE_BOARD_ROW : EXIT.OK,"],
+            ["  process.exit(a.stale.length ? EXIT.STALE_BOARD_ROW : EXIT.OK);",
+             "  process.exit(a.stale.length || a.untagged.length ? EXIT.STALE_BOARD_ROW : EXIT.OK);"]],
+    test: "表头会被算进 untagged",
+  },
+  {
+    name: "M40 双向印证不看\"打印的数 vs 现场重算的数\"",
+    file: SUM,
+    pairs: [["  if (Number.isFinite(raw) && raw !== reported) {", "  if (false && raw !== reported) {"]],
+    test: "双向印证",
+    suite: "test/docs-drift.test.js",
+  },
+  {
+    name: "M41 计数行读不到时静默兜底成 0（NOT REPORTED 就此变成 PASSED）",
+    file: SUM,
+    pairs: [["  if (!lines.length) {", "  if (false) {"]],
+    test: "读不到就抛",
+    suite: "test/docs-drift.test.js",
+  },
+  // M42 已撤回，ID 不复用（留在这儿是为了"为什么少一条"有地方查）：
+  // 它想证"判读器必须先自证"，但目标文件是 red-demo 自己——pairs 的字面量也住在这个文件里，
+  // replace() 先命中 pairs 那一份，真调用点一个字节没动，而"写盘后回读与原文不同"这条守卫
+  // 照样通过（文件确实变了）。那是一条**伪装成测量结果的空操作**。
+  // 同一件事改用两条不自我指涉的判据：① docs-drift 断言源码里 runSelftest() 在变异循环之前；
+  // ② docs-drift 以子进程真跑一次 --selftest-only，要求 7 条 ok 且退 0。
+  {
+    name: "M43 退码表打进汇总行这件事被摘掉（读的人只能靠猜有哪些码）",
+    file: BR,
+    pairs: [["  code, codes: [...new Set(Object.values(EXIT_CODES))],", "  code,"]],
+    test: "探针与夹具",
+    suite: "test/docs-drift.test.js",
+  },
 ];
+
+// 计数行的正则与判读放在**同一处**定义：`node --test` 的报告格式一改，
+// "读不到 fail" 和 "fail 确实是 0" 就长得一模一样，而阶段状态如果只看退出码，
+// 汇总器会把它报成 PASSED。隔壁仓刚在这种形状上实出来一次，本仓同形的有四处。
+// 所以：**读不到计数 = harness error（非 0）**，绝不当 0。
+const COUNT_RE = { tests: /\nℹ tests (\d+)/, pass: /\nℹ pass (\d+)/, fail: /\nℹ fail (\d+)/ };
+
+function classify(status, out) {
+  const grab = (re) => { const m = re.exec(out); return m === null ? null : Number(m[1]); };
+  const ran = grab(COUNT_RE.tests), pass = grab(COUNT_RE.pass), fail = grab(COUNT_RE.fail);
+  const missing = [ran, pass, fail].filter((x) => x === null).length;
+  if (missing) {
+    return { verdict: "harness-error", ran, pass, fail,
+      why: `计数行读不到 ${missing} 项（node --test 的报告格式变了？读不到不等于 0）` };
+  }
+  // 双向印证：状态与计数必须互相印证，单方向不一致就是测具在骗人
+  if (status === 0 && fail > 0) return { verdict: "harness-error", ran, pass, fail, why: `退 0 却报 fail=${fail}` };
+  if (status !== 0 && fail === 0) {
+    return { verdict: "harness-error", ran, pass, fail,
+      why: "退非 0 但 fail=0：语法错或未捕获异常，测试根本没跑起来——这不是『变异被抓住了』" };
+  }
+  if (ran === 0) return { verdict: "empty", ran, pass, fail, why: "模式匹配到 0 条测试：空跑的绿灯" };
+  return { verdict: fail > 0 ? "red" : "green", ran, pass, fail, why: "" };
+}
+
+// 判读器自己先过一次对照表：它没资格在没被验证的情况下验证别人。
+// 每条都是"临时打印错的数，但**不改退出码**"——正是要看双向印证咬不咬得住。
+const SELFTEST = [
+  { status: 1, out: "\nℹ tests 1\nℹ pass 0\nℹ fail 1\n", want: "red", why: "真红" },
+  { status: 0, out: "\nℹ tests 1\nℹ pass 1\nℹ fail 0\n", want: "green", why: "真绿" },
+  { status: 0, out: "\nℹ tests 3\nℹ pass 1\nℹ fail 2\n", want: "harness-error", why: "退 0 但 bad>0" },
+  { status: 1, out: "\nℹ tests 3\nℹ pass 3\nℹ fail 0\n", want: "harness-error", why: "退非 0 但 bad=0" },
+  { status: 1, out: "SyntaxError: missing ) after argument list\n", want: "harness-error", why: "计数行整个没了" },
+  { status: 0, out: "\nℹ tests 1\nℹ pass 0\nℹ failing 1\n", want: "harness-error", why: "字段改名（fail→failing）" },
+  { status: 0, out: "\nℹ tests 0\nℹ pass 0\nℹ fail 0\n", want: "empty", why: "匹配到 0 条" },
+];
+
+function runSelftest() {
+  let bad = 0;
+  for (const t of SELFTEST) {
+    const got = classify(t.status, t.out);
+    const ok = got.verdict === t.want;
+    if (!ok) bad++;
+    console.log(`${ok ? "  ok " : "  ✗✗"} classify(退 ${t.status}, ${t.why}) = ${got.verdict}（应为 ${t.want}）${got.why ? "｜" + got.why : ""}`);
+  }
+  return bad;
+}
 
 function runTest(pattern, suite) {
   const r = spawnSync(process.execPath, ["--test", "--test-name-pattern", pattern, suite || "test/claims.test.js"], {
     cwd: ROOT, encoding: "utf8",
   });
   const out = (r.stdout || "") + (r.stderr || "");
+  const c = classify(r.status, out);
   return {
-    red: r.status !== 0,
-    pass: /\nℹ pass (\d+)/.exec(out)?.[1],
-    fail: /\nℹ fail (\d+)/.exec(out)?.[1],
-    ran: /\nℹ tests (\d+)/.exec(out)?.[1],
+    ...c,
     // 把断言消息原文抓出来：只报"红了"不够，要看得见红在哪条判据上
-    msg: (out.match(/AssertionError[^\n]*/) || [])[0] || (out.match(/^\s*AssertionError[^\n]*/m) || [])[0] || "",
+    msg: (out.match(/AssertionError[^\n]*/) || [])[0] || "",
     raw: out,
-    detail: (out.match(/(并发出现[^\n]*|自称赢[^\n]*|TTL 必须是[^\n]*|被拒的 release[^\n]*|被挡住必须留痕[^\n]*|退码表与代码不符[^\n]*|这些退码在[^\n]*|那一行没[^\n]*|第\d+次：脏锁[^\n]*|躺了 \d+s 的脏锁[^\n]*|locks 自己崩了[^\n]*|应判脏锁[^\n]*|实退 \d+[^\n]*|就该收手[^\n]*|一复查就该收手[^\n]*|持板锁期间又去取[^\n]*|不许绕过 writeBoard[^\n]*|板锁仍未被回收[^\n]*|回收写完还留着[^\n]*|seal 里出现了板级读取[^\n]*|那不是过期回收[^\n]*)/) || [])[1] || "",
+    detail: (out.match(/(并发出现[^\n]*|自称赢[^\n]*|TTL 必须是[^\n]*|被拒的 release[^\n]*|被挡住必须留痕[^\n]*|退码表与代码不符[^\n]*|这些退码在[^\n]*|那一行没[^\n]*|第\d+次：脏锁[^\n]*|躺了 \d+s 的脏锁[^\n]*|locks 自己崩了[^\n]*|应判脏锁[^\n]*|实退 \d+[^\n]*|就该收手[^\n]*|一复查就该收手[^\n]*|持板锁期间又去取[^\n]*|不许绕过 writeBoard[^\n]*|板锁仍未被回收[^\n]*|回收写完还留着[^\n]*|seal 里出现了板级读取[^\n]*|那不是过期回收[^\n]*|本地刚落地的锁[^\n]*|mtime 单独说了算[^\n]*|字段残缺的锁[^\n]*|板锁被一个死名字持着[^\n]*|已过期的锁必须在现状里写明[^\n]*)/) || [])[1] || "",
   };
 }
 
@@ -252,23 +408,43 @@ function pairOf(src, from, to) {
 // 而放弃验证的代价正是这类假绿灯。
 const ONLY = (process.env.RELAY_ONLY || "").split(",").map((s) => s.trim()).filter(Boolean);
 const TODO = ONLY.length ? MUT.filter((m) => ONLY.some((o) => m.name.startsWith(o))) : MUT;
-if (ONLY.length && !TODO.length) { console.error(`!! RELAY_ONLY 没匹配到任何变异：${ONLY.join(",")}`); process.exit(9); }
+if (ONLY.length && !TODO.length) { console.error(`!! RELAY_ONLY 没匹配到任何变异：${ONLY.join(",")}`); process.exit(EXIT_CODES.badUsage); }
+
+// 判读器先自证：它没资格在没被验证的情况下验证别人。
+// 这一步失败就**不去跑 35 处变异**——汇总器自己都不可信时，任何"全红"都不能引用。
+const selfBad = runSelftest();
+if (selfBad) {
+  console.error(`\n!! classify 对照表有 ${selfBad} 条判错，停下，不出变异结论。`);
+  process.exit(EXIT_CODES.harness);
+}
+if (process.argv.includes("--selftest-only")) { console.log("=== 判读器对照表全过（只跑了自测）==="); process.exit(0); }
+console.log("");
 
 let allRed = true;
+let harness = 0, empty = 0, green = 0, missed = 0;
+const verdicts = [];   // 每条变异最终判成什么，独立于上面的计数器
 for (const m of TODO) {
   const bak = m.file + ".bak-red";
   copyFileSync(m.file, bak);
   const src = readFileSync(m.file, "utf8");
   let patched = src;
-  let missed = null;
+  let missedAnchor = null;
+  if (m.file === DEMO) {
+    console.error(`!! ${m.name}：不许拿 red-demo 自己当变异对象（自指锚点会先命中自己的 pairs）`);
+    process.exit(EXIT_CODES.badUsage);
+  }
   for (const [from, to] of m.pairs) {
+    if (from === to) {
+      console.error(`!! ${m.name}：某处 pairs 的 from 与 to 完全相同——这是空变异，不算测过`);
+      process.exit(EXIT_CODES.badUsage);
+    }
     const pair = pairOf(patched, from, to);
-    if (!pair) { missed = from; break; }
+    if (!pair) { missedAnchor = from; break; }
     patched = patched.replace(pair[0], pair[1]);
   }
-  if (missed) {
-    console.log(`!! ${m.name}\n   变异锚点没命中：${missed}\n   跳过——锚点没命中的话，报绿不算证据\n`);
-    allRed = false;
+  if (missedAnchor) {
+    console.log(`!! ${m.name}\n   变异锚点没命中：${missedAnchor}\n   跳过——锚点没命中的话，报绿不算证据\n`);
+    allRed = false; missed++; verdicts.push("anchor-missed");
     rmSync(bak);
     continue;
   }
@@ -280,26 +456,46 @@ for (const m of TODO) {
   if (back === src) {
     console.log(`!! ${m.name}\n   写盘后回读与原文一致——变异根本没落地，这条不算测过\n`);
     rmSync(m.file); copyFileSync(bak, m.file); rmSync(bak);
-    allRed = false;
+    allRed = false; harness++; verdicts.push("not-landed");
     continue;
   }
   const res = runTest(m.test, m.suite);
   rmSync(m.file);
   copyFileSync(bak, m.file);
   rmSync(bak);
-  // 模式名匹配不到任何测试时，node --test 退出码是 0：那是一条**空跑的绿灯**。
-  // 上一轮就吃过这个亏，所以这里把"跑到几条"一起判掉。
-  const empty = res.ran === "0" || res.ran === undefined;
-  console.log(`${res.red && !empty ? "红 ✓" : "绿 ✗ 假绿灯！"}  ${m.name}`);
-  console.log(`   套件 ${m.suite || "test/claims.test.js"} 匹配「${m.test}」：跑到 ${res.ran} 条，pass=${res.pass} fail=${res.fail}`);
+  const icon = { red: "红 ✓", green: "绿 ✗ 假绿灯！", empty: "空跑 ✗ 一条都没匹配到", "harness-error": "测具 ✗ 状态与计数不互相印证" }[res.verdict];
+  console.log(`${icon}  ${m.name}`);
+  console.log(`   套件 ${m.suite || "test/claims.test.js"} 匹配「${m.test}」：跑到 ${res.ran} 条，pass=${res.pass} fail=${res.fail}${res.why ? `｜${res.why}` : ""}`);
   console.log(`   断言原文：${(res.detail || res.msg || "（未匹配到）").slice(0, 200)}`);
-  // 变异器报绿、而现场证明行为变了——这种矛盾必须把原始输出摊开，否则下一步只能靠猜。
-  if (!res.red || empty) console.log(`   原始输出（末 22 行）：\n${res.raw.split("\n").slice(-22).map((l) => "     " + l).join("\n")}`);
+  // 非红的一切情形都要把原始输出摊开：靠猜修不动"到底是断言没咬住还是我没跑起来"。
+  if (res.verdict !== "red") console.log(`   原始输出（末 22 行）：\n${res.raw.split("\n").slice(-22).map((l) => "     " + l).join("\n")}`);
   console.log("");
-  if (!res.red || empty) allRed = false;
-  if (readFileSync(m.file, "utf8") !== src) { console.log("!! 还原失败，停下"); process.exit(9); }
+  verdicts.push(res.verdict);
+  if (res.verdict === "green") { allRed = false; green++; }
+  if (res.verdict === "empty") { allRed = false; empty++; }
+  if (res.verdict === "harness-error") { allRed = false; harness++; }
+  if (readFileSync(m.file, "utf8") !== src) { console.log("!! 还原失败，停下"); process.exit(EXIT_CODES.badUsage); }
 }
-// RELAY_ONLY 时不能报"26 处全部红"——那是把 4 处的结果说成全部的结果。
+// RELAY_ONLY 时不能报"35 处全部红"——那是把跑过的条数说成全部。
 const scope = ONLY.length ? `按 RELAY_ONLY 只跑了 ${TODO.length}/${MUT.length} 处：` : "";
-console.log(allRed ? `=== ${scope}${TODO.length} 处变异全部把测试打红 ===` : "=== 有变异没打红、空跑或没命中，结论不成立 ===");
-process.exit(allRed ? 0 : 8);
+const notRed = green + empty + harness + missed;
+const tally = `（红 ${TODO.length - notRed}／绿 ${green}／空跑 ${empty}／测具不可信 ${harness}／锚点没命中 ${missed}）`;
+console.log(allRed ? `=== ${scope}${TODO.length} 处变异全部把测试打红 ${tally}===`
+  : `=== 结论不成立 ${tally}。绿=断言没咬住；空跑=模式没匹配；测具不可信=状态与计数不互相印证或计数行读不到 ===`);
+// 汇总器自己也要留一行机读结论：bad 是"这一批里没有一条断言咬住的次数"，
+// 读不到这行 = 这次跑不能引用（正是隔壁仓实出来的那个形状）。
+const raw = verdicts.filter((v) => v !== "red").length;   // 现场重算：与上面那组计数器互相印证
+const code = harness > 0 ? EXIT_CODES.harness : raw > 0 ? EXIT_CODES.notAllRed : EXIT_CODES.allRed;
+const summary = {
+  kind: "red-demo", rounds: TODO.length, measured: TODO.length, lost: notRed,
+  green, emptyCount: empty, harness, missedAnchor: missed,
+  code, codes: [...new Set(Object.values(EXIT_CODES))],
+};
+printSummary(summary);
+// crossCheck 只认"0 / 非 0"两种状态，所以把 7、8 折成非 0 的 1 再印证：
+// 报出去的统计与最终退码必须是同一个判断的两半。
+const why = crossCheck(code === 0 ? 0 : 1, { reported: summary.lost, raw, expect: TODO.length, measured: TODO.length });
+if (why) console.error(`!! 汇总器自身不自洽：${why}`);
+// 退出码分档：7 单独留给"测具自己在骗人"——它和"缺陷没被抓住"处置完全不同，
+// 前者要先修判读器，后者才轮到改代码或补断言。
+process.exit(why ? HARNESS_EXIT : code);

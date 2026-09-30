@@ -3,6 +3,9 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync, existsSync } from "node:fs";
+import { spawnSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import path from "node:path";
 import { digestOf } from "../src/proto/envelope.js";
 
 const SIGNING_DOC = new URL("../docs/specs/03-signing.md", import.meta.url);
@@ -66,6 +69,7 @@ test("schema 的 done 描述不得声称刻意排除在签名域外", () => {
 // 这条是结构比对，不是 grep 关键词：把表抽成 {退码 → 行文本}，与 src/claims/lock.js
 // 导出的 EXIT 逐值对齐。改代码不改文档 → 红；改文档不改代码 → 红。
 const README = new URL("../README.md", import.meta.url);
+const rootDir = path.resolve(fileURLToPath(import.meta.url), "..", "..");
 const { EXIT } = await import("../src/claims/lock.js");
 
 function exitTableFromDoc() {
@@ -246,24 +250,53 @@ test("测试专用延时闸口只能由环境变量打开（生产路径上这�
 // 这次一起清：README 按文件名引用，就得能按文件名跑到，且引用的参数/退码与脚本自己一致。
 test("README 引用的探针与夹具必须真实存在，且写明的参数、退码与脚本一致", () => {
   const md = readFileSync(README, "utf8");
+  // 具名退码从 summary.mjs 取数：判读方与打印方共用一处定义，改常量名/值都会被这里抓到。
+  const sumSrc = readFileSync(new URL("../src/claims/summary.js", import.meta.url), "utf8");
+  const SYMBOLS = {};
+  for (const m of sumSrc.matchAll(/export const ([A-Z0-9_]+) = (\d+);/g)) SYMBOLS[m[1]] = Number(m[2]);
+  assert.ok(Number.isInteger(SYMBOLS.HARNESS_EXIT),
+    "summary.js 里必须给『测具不可信』一个具名退码：它和『抓到缺陷』『没抓到』都要分得开");
   const PROBE_ROWS = [
     ["tools/claims/board-race.mjs", [0, 3, 9]],
     ["tools/claims/renew-race.mjs", [0, 3, 4, 9]],
     ["tools/claims/window-measure.mjs", [0, 8, 9]],
+    ["tools/claims/red-demo.mjs", [0, 7, 8, 9]],
+    ["tools/claims/selfcheck-harness.mjs", [0, 8, 9]],
   ];
   for (const [rel, codes] of PROBE_ROWS) {
     const url = new URL("../" + rel, import.meta.url);
     assert.ok(existsSync(url), `README 按文件名引用了 ${rel}，可它不在仓里——那等于不存在`);
     const src = readFileSync(url, "utf8");
-    // 退码要从 process.exit(<表达式>) 里取**所有数字**：探针的收尾是 `process.exit(lost.length > 0 ? 0 : 3)`，
-    // 只匹配 \d+ 的那种写法会把 0 和 3 整个漏掉，于是"实际退码集合"看起来比文档少两个——假红。
-    const found = new Set();
-    for (const m of src.matchAll(/process\.exit\(([^)]*)\)/g)) {
-      for (const d of m[1].matchAll(/\d+/g)) found.add(Number(d[0]));
-    }
-    const inCode = [...found].sort((a, b) => a - b);
+    // 判读"实际会退哪些码"不再正则扫 `process.exit(...)`——那已经骗过我一次
+    // （收尾写成 `process.exit(lost.length > 0 ? 0 : 3)`，0 和 3 整个漏读，"实际集合"被看成 [9]）。
+    // 现在读工具**自己声明的退码表** `const EXIT_CODES = { … }`：具名常量从 summary.mjs 取数，
+    // 且同一张表必须由汇总行打印出来（codes: Object.values(EXIT_CODES)）——
+    // 打印的、判读的、README 解释的，三份必须是同一个定义处。
+    const table = /\bconst EXIT_CODES = \{([^}]*)\}/.exec(src);
+    assert.ok(table, `${rel} 没有声明 EXIT_CODES 退码表——判读只能靠猜形状，改写法就静默失去保护`);
+    const entries = [...table[1].matchAll(/([A-Za-z0-9_]+)\s*:\s*(\d+|[A-Z][A-Z0-9_]*)/g)];
+    assert.ok(entries.length >= 2, `${rel} 的 EXIT_CODES 表读不出条目：${table[1].trim().slice(0, 80)}`);
+    // 用 m[1]/m[2] 明写，不用 `([, v])`：上面第一版就是这么错的——
+    // `[, v]` 取到的是**键名**而不是值，于是 foundLoss/clean/badUsage 被当成"解不出的常量"，
+    // 一个判读器自己读错字段序号，正是要防的那类"看起来是代码错了、其实是判据写歪了"。
+    const resolved = entries.map((m) => (SYMBOLS[m[2]] !== undefined ? SYMBOLS[m[2]] : Number(m[2])));
+    const unresolved = entries.filter((m) => !/^\d+$/.test(m[2]) && SYMBOLS[m[2]] === undefined).map((m) => m[2]);
+    assert.deepEqual(unresolved, [],
+      `${rel} 的退码表引用了 summary.mjs 里没有的常量：${unresolved.join(", ")}——解不出数就等于读不到计数`);
+    const inCode = [...new Set(resolved)].sort((a, b) => a - b);
     assert.deepEqual(inCode, codes,
-      `${rel} 实际会退的码是 ${inCode.join(", ")}，README 那行按 ${codes.join(", ")} 解释的——对不上就是文档过期`);
+      `${rel} 声明的退码是 ${inCode.join(", ")}，README 那行按 ${codes.join(", ")} 解释的——对不上就是文档过期`);
+    for (const m of entries) {
+      // m[0] 是整段匹配（"foundLoss: 0"），m[1] 才是成员名——上一版这里写的是 `const [name] of entries`，
+      // 于是"用到没用到"的检索拿整段匹配去拼字符串，永远拼不中。判读器自己下标读错，
+      // 报出来的是一条看起来很有道理的假红：正是这条通令针对的形状。
+      assert.ok(src.includes(`EXIT_CODES.${m[1]}`),
+        `${rel} 声明了退码 ${m[1]} 却没有哪条出口用到它——表在骗 README`);
+    }
+    assert.ok(src.includes("codes: [...new Set(Object.values(EXIT_CODES))]"),
+      `${rel} 没把退码表打进汇总行：读不到计数与计数为 0 就又长成一个样子了`);
+    assert.ok(src.includes("printSummary(") && src.includes("crossCheck("),
+      `${rel} 没走 summary.mjs 的打印/印证——共用一处定义这件事，写在注释里不算实现`);
     const row = md.split(/\r?\n/).find((l) => l.startsWith(`| \`${rel}\``));
     assert.ok(row, `README 必须有一行以 | \`${rel}\` 开头：探针不能只在提交信息里存在`);
     for (const c of codes) assert.ok(row.includes(`**${c} =`), `README 那行没解释退码 ${c} 的含义`);
@@ -323,4 +356,159 @@ test("README 的测试计数必须等于各套件 test( 的行数之和", () => 
   // 发布约束表里那一格抄的是同一个数，两处会各自飘——一起钉住。
   assert.ok(md.includes(`✅ ${total}/${total}`),
     `README 判据 1 那格写的通过数不是 ${total}/${total}，和上一行的总数自相矛盾`);
+});
+
+// ============ 跨机时钟与现状输出：文档与代码必须是同一句话 ============
+test("脏锁的定义包含\"解析得出来但字段算不出到期时刻\"，README 写的是同一个集合", () => {
+  const src = readFileSync(new URL("../src/claims/lock.js", import.meta.url), "utf8");
+  const fn = /function lockShapeOk\([\s\S]*?\n\}/.exec(src);
+  assert.ok(fn, "找不到 lockShapeOk：残缺锁又走回『永不超期』那条路了");
+  assert.match(fn[0], /Number\.isFinite\(Number\(o\.at\)\)/, "残缺校验必须管 at（NaN 的到期时刻永远判不出过期）");
+  assert.match(fn[0], /Number\.isFinite\(Number\(o\.ttl\)\)/, "…也要管 ttl");
+  assert.doesNotMatch(fn[0], /o\.ttl > 0/,
+    "ttl=0 是一条已经能走通的回收出口（locks 标违规、claim 立即可回收），在这里顺手拦成脏锁等于凭空多等 120s");
+  const md = readFileSync(README, "utf8");
+  assert.match(md, /字段残缺/, "README 退码 8 那行没把这道新入口写进去");
+});
+
+test("跨机时钟：判过期取 max(at, 本地 mtime)，README 必须连没关掉的那一侧一起写", () => {
+  const src = readFileSync(new URL("../src/claims/lock.js", import.meta.url), "utf8");
+  assert.match(src, /let d = Math\.max\(Number\(c\.at\) \|\| 0, safeMtime\(p\)\) \+ c\.ttl \* 1000;/,
+    "到期判定不再是 max(头部 at, 本地 mtime)——写方钟偏早就会提前抢走活锁");
+  assert.match(src, /d = Math\.max\(d, Math\.max\(m\.at, m\.mtimeMs \|\| 0\)/,
+    "续期标记也要同法处理，否则标记的到期时刻还是只认写方那个钟");
+  const md = readFileSync(README, "utf8");
+  for (const k of ["偏早", "偏晚", "时钟差"]) {
+    assert.ok(md.includes(k), `README 少了"${k}"：只写关得住的那一侧，会被读成两侧都关住了`);
+  }
+  assert.match(md, /只卡不丢|不丢数据/, "README 要写清偏晚那侧的代价是等待而不是丢数据");
+});
+
+test("audit 的现状段是只报不拒，README 与代码都说同一件事", () => {
+  const cli = readFileSync(new URL("../src/cli.js", import.meta.url), "utf8");
+  const branch = /\nif \(cmd === "audit"\) \{([\s\S]*?)\n\}\n/.exec(cli);
+  assert.ok(branch, "找不到 audit 分支");
+  // 退码只能由 stale 决定：有人持锁（哪怕是死掉的尸体）都不改判据
+  assert.match(branch[1], /process\.exit\(a\.stale\.length \? EXIT\.STALE_BOARD_ROW : EXIT\.OK\);/,
+    "audit 的退码不再只由越写者决定——现状段被做成了拦截");
+  assert.doesNotMatch(branch[1], /holders\.length \?/, "audit 里出现了『有活锁就非 0』的形状");
+  const md = readFileSync(README, "utf8");
+  assert.match(md, /现状，不是判决/, "README 没写 audit 现在会打出盘上持锁现状");
+});
+
+// ============ 对照数字的"可重跑性"与出处 ============
+test("README 的改前列必须能用一条命令重跑，每批数字都带出处", () => {
+  const md = readFileSync(README, "utf8");
+  const br = readFileSync(new URL("../tools/claims/board-race.mjs", import.meta.url), "utf8");
+  const rr = readFileSync(new URL("../tools/claims/renew-race.mjs", import.meta.url), "utf8");
+
+  // ① 两个探针都要有"改前列"的开关，而且 README 要教出来
+  assert.match(br, /--unlocked/, "board-race 没有 --unlocked：README 的改前列就只能靠手工改副本");
+  assert.match(rr, /--revertcas/, "renew-race 没有 --revertcas：双主的改前列不可重跑");
+  assert.match(rr, /--revertcas 锚点没命中/, "改前列的锚点失配必须停下——失配跑出来会被读成\"旧代也没双主\"");
+  for (const f of ["--unlocked", "--revertcas"]) {
+    assert.ok(md.includes(f), `README 没教 ${f}，那它就等于不存在`);
+  }
+  // ② 取整代旧代码要连入口一起取，否则是混合代（本轮实测退 4）
+  assert.match(rr, /gitShow\(REF, "src\/cli\.js"\)/, "只取旧 lock.js 不取旧 cli.js = 混合代，子进程全崩在 import");
+  assert.match(rr, /混合代/, "探针要能把混合代这件事说出来");
+
+  // ③ 数字要有出处：至少两批，且各带日期
+  const dated = [...md.matchAll(/2026-09-\d{2} (?:那轮|重跑)/g)].map((m) => m[0]);
+  assert.ok(dated.length >= 2, `README 的对照数字没标"取于哪一次"（找到 ${dated.length} 处）——旧数被新数覆盖就查不到当时量到哪一步`);
+  assert.ok(/取于 [^\n]*`?c?[0-9a-f]{7}`?/.test(md), "README 的测量表必须钉一个 commit（或工作树等于哪个 commit + 本批改动）");
+});
+
+// ============ 计数行的判读器：读不到 ≠ 0，状态与计数必须双向印证 ============
+// 通令来源：隔壁仓实出来的一次自骗——汇总器把阶段状态**只取退出码**、计数行当展示，
+// 打印方改了字段名后判读正则失配，于是报出 `PASSED count: NOT REPORTED` 自己被当成通过。
+// 本仓同形的四处（red-demo 的变异计数、npm test 的条数、三个探针的"几行都在"）
+// 都改成共用 tools/claims/summary.mjs 这一处定义；这里先把那处定义本身钉住。
+test("计数行：读不到就抛（绝不当成 0），打印与判读共用同一处定义", async () => {
+  const { printSummary, parseSummary } = await import("../src/claims/summary.js");
+  const line = printSummary({ kind: "demo", rounds: 3, measured: 3, lost: 0, code: 3 });
+  assert.ok(line.startsWith("RELAY-SUMMARY "), "汇总行必须有可寻址的前缀");
+  assert.equal(parseSummary(line, "demo", ["rounds", "measured", "lost", "code"]).lost, 0);
+
+  // ① 读不到计数 = 失败。三种"读不到"都要抛，不能返回 undefined 让调用方 `?? 0`：
+  assert.throws(() => parseSummary("PASSED count: NOT REPORTED\n", "demo", ["lost"]), /RELAY-SUMMARY/,
+    "整行没有时必须抛——这正是隔壁仓那个形状");
+  assert.throws(() => parseSummary('RELAY-SUMMARY {"kind":"other","lost":0}\n', "demo", ["lost"]), /kind/,
+    "kind 对不上等于没打到这一步");
+  assert.throws(() => parseSummary('RELAY-SUMMARY {"kind":"demo","rounds":3,"measured":3}\n', "demo", ["lost"]),
+    /字段 lost/, "字段被改名/删掉时必须抛，判 `?? 0` 通过就是把保护静默撤走");
+  assert.throws(() => parseSummary('RELAY-SUMMARY {"kind":"demo","lost":"0"}\n', "demo", ["lost"]),
+    /不是数/, "字符串 \"0\" 不是数：Number.isFinite 那一关必须拦住");
+});
+
+test("双向印证：退 0 但 bad>0 与 退非 0 但 bad=0 两面都判测具不可信", async () => {
+  const { crossCheck } = await import("../src/claims/summary.js");
+  // 汇总器约定（0=全绿）：两个方向都要咬
+  // 先判"有没有返回一句话"，再判那句话的内容：
+  // 直接 assert.match(返回值,…) 时，变异把判据删掉会返回 null，assert.match 抛的是 TypeError，
+  // 红是红了，但红在参数类型上——读的人看不出"是判据没了"。
+  const a1 = crossCheck(0, { reported: 2, raw: 2, expect: 3, measured: 3 });
+  assert.equal(typeof a1, "string", "退 0 而 bad>0 必须返回一句『为什么不可信』");
+  assert.match(a1, /退 0 却报 bad=2/);
+  const a2 = crossCheck(8, { reported: 0, raw: 0, expect: 3, measured: 3 });
+  assert.equal(typeof a2, "string", "退非 0 而 bad=0 必须返回一句『为什么不可信』");
+  assert.match(a2, /退 8 但报 bad=0/);
+  assert.equal(crossCheck(0, { reported: 0, raw: 0, expect: 3, measured: 3 }), null, "自洽时不该误伤");
+  // 探针约定（0=抓到缺陷）必须反过来判，否则探针每次成功复现缺陷都会被自己的测具打死
+  assert.equal(crossCheck(0, { reported: 2, raw: 2, expect: 3, measured: 3, badIsSuccess: true }), null);
+  assert.match(crossCheck(3, { reported: 2, raw: 2, expect: 3, measured: 3, badIsSuccess: true }), /退 3（=没抓到）却报 bad=2/);
+  // ③报出去的数 ≠ 现场重算的数 / 样本不齐：两种"计数在骗人"都要咬
+  assert.match(crossCheck(8, { reported: 1, raw: 3, expect: 3, measured: 3 }), /bad=1 与现场重算的 bad=3/);
+  assert.match(crossCheck(0, { reported: 0, raw: 0, expect: 12, measured: 11 }), /样本数不齐：安排 12，实测到 11/);
+});
+
+// ============ 计数定义的"单一出处"：谁都不许再自己写一份判读正则 ============
+test("机读汇总行的格式只有一处定义，五个出口都从那里取", () => {
+  const sum = readFileSync(new URL("../src/claims/summary.js", import.meta.url), "utf8");
+  for (const needle of ["export const SUMMARY_PREFIX", "export function printSummary",
+    "export function parseSummary", "export function crossCheck", "export const HARNESS_EXIT = 9"]) {
+    assert.ok(sum.includes(needle), `summary.js 少了 ${needle}——判读与打印必须同源`);
+  }
+  const consumers = ["src/cli.js", "tools/claims/board-race.mjs", "tools/claims/renew-race.mjs",
+    "tools/claims/window-measure.mjs", "tools/claims/red-demo.mjs", "tools/claims/selfcheck-harness.mjs"];
+  for (const f of consumers) {
+    const src = readFileSync(new URL(`../${f}`, import.meta.url), "utf8");
+    assert.match(src, /claims\/summary\.js"|\.\/summary\.js"/,
+      `${f} 没从 summary.js 取计数格式——它自己写一份，就是下一场"读不到当成 0"`);
+    assert.ok(src.includes("printSummary("), `${f} 没有机读汇总行`);
+  }
+  // red-demo 的判读器必须先自证：顺序错了（先跑变异再自测）等于自测永远不影响结论
+  const rd = readFileSync(new URL("../tools/claims/red-demo.mjs", import.meta.url), "utf8");
+  const selfAt = rd.indexOf("runSelftest()");
+  const loopAt = rd.indexOf("for (const m of TODO)");
+  assert.ok(selfAt > 0 && loopAt > 0 && selfAt < loopAt,
+    "red-demo 必须在跑任何变异之前先过 classify 对照表");
+  assert.ok(/harness:\s*7/.test(rd), "对照表判错必须有专属退码 7，不能混进『有变异没红』");
+  assert.ok(rd.includes("process.exit(EXIT_CODES.harness)"), "对照表判错必须真从表里取那个码");
+});
+
+test("README 说清了两件事：退码 11 只管越写者，无令牌行走机读出口", () => {
+  const md = readFileSync(README, "utf8");
+  const row11 = md.split(/\r?\n/).find((l) => l.startsWith("| 11 |"));
+  assert.ok(row11, "找不到退码 11 那行");
+  assert.ok(row11.includes("无令牌") && row11.includes("不进退码"),
+    "11 那行必须写明：无令牌行只点名、不进退码，并给出机读出口（untagged）——旧文案承诺过『或该行根本没令牌』，代码从来没这么退过");
+  assert.ok(row11.includes("RELAY-SUMMARY"), "出口必须是那个可被机器读的字段名，不是一句形容词");
+  assert.ok(md.includes("测具不可信"), "README 要写清退码里『测具不可信』是哪一档");
+});
+
+// 判读器的对照表不能只在"我手动跑了 red-demo"时才生效：npm test 里就子进程跑一次。
+// 上一版我只在测试里断言"源码里有 runSelftest() 且顺序在前"——那证明的是形状，不是行为。
+test("red-demo 的 classify 对照表在 npm test 里真跑一次（子进程，不退 7 才算过）", () => {
+  const r = spawnSync(process.execPath, [
+    // 必须走 fileURLToPath：Windows 上 `new URL(...).pathname` 得到 "/C:/Users/…"，
+    // 那个前导斜杠会让 node 按 CJS 解析模块直接失败（实退 1，红在测具自己身上）。
+    fileURLToPath(new URL("../tools/claims/red-demo.mjs", import.meta.url)),
+    rootDir, "--selftest-only",
+  ], { encoding: "utf8" });
+  const out = (r.stdout || "") + (r.stderr || "");
+  assert.equal(r.status, 0, `判读器自测没退 0（实退 ${r.status}）：\n${out.split("\n").slice(-14).join("\n")}`);
+  const oks = (out.match(/^ {2}ok /gm) || []).length;
+  assert.ok(oks >= 7, `对照表只打了 ${oks} 条 ok，预期至少 7 条——少一条就是某面没验`);
+  assert.ok(!/✗✗/.test(out), `对照表里有判错：\n${out}`);
 });

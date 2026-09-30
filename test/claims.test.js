@@ -184,6 +184,11 @@ test("claim 里的路径穿越关不进 claims/ 以外", async () => {
   assert.match(out.out, /escape\.js\.lock/, "锁应能在 claims/ 里被列出");
 });
 
+function waiterText(d) {
+  const p = path.join(d, "claims", "waiters.log");
+  return fs.existsSync(p) ? fs.readFileSync(p, "utf8") : "（文件不存在）";
+}
+
 test("20 个进程真并发抢同一把过期锁：恰好 1 家拿到", async () => {
   const d = mkChannel();
   const N = 20;
@@ -197,12 +202,18 @@ test("20 个进程真并发抢同一把过期锁：恰好 1 家拿到", async ()
   );
   const winners = results.filter((x) => x.code === 0);
   const losers = results.filter((x) => x.code === 3);
-
-  assert.equal(winners.length, 1, `并发抢占出现 ${winners.length} 个赢家（应为 1）：双主 = 锁失效`);
-  assert.equal(losers.length, N - 1, `其余应全部 exit 3，实得 ${losers.length}：${results.map((x) => x.code).join(",")}`);
+  // 这条用例在 6 个文件并发跑时红过两次（都没复现出成因），所以先把**现场**摊全：
+  // 只报"赢家数=2"没法分辨是仲裁坏了，还是某个子进程根本没起来（EMFILE/spawn 失败）。
+  const odd = results.filter((x) => x.code !== 0 && x.code !== 3);
+  const dump = () => `20 个退码分布 [${results.map((x) => x.code).join(",")}]｜异常码 ${odd.length} 个：` +
+    odd.map((x) => `\n    ${String(x.out).slice(0, 200)}`).join("") +
+    `\n  赢家的话：${winners.map((x) => String(x.out).split("\n")[0]).join(" / ")}`;
+  assert.equal(winners.length, 1, `并发抢占出现 ${winners.length} 个赢家（应为 1）：双主 = 锁失效\n${dump()}`);
+  assert.equal(losers.length, N - 1, `其余应全部 exit 3，实得 ${losers.length}：\n${dump()}`);
   const winner = winners[0].out.match(/抢占 \S+ → (\S+)：/)[1];
   assert.equal(readLockRaw(d, "src/race.js").who, winner, "锁的内容和报赢的不是同一家");
-  assert.equal(waiters(d).length, N - 1, "每个受阻方都该在板子上留一行");
+  assert.equal(waiters(d).length, N - 1,
+    `每个受阻方都该在板子上留一行，实得 ${waiters(d).length} 行\n  waiters.log=${JSON.stringify(waiterText(d))}`);
 });
 
 test("20 个进程真并发抢同一把**未过期**锁：0 家拿到", async () => {
@@ -348,6 +359,9 @@ test("续期标记要算进过期判定：标记已在盘上时，外层判据�
   const p = lockOf(d, "src/d.js");
   const baseAt = Date.now() - 5000;
   fs.writeFileSync(p, JSON.stringify({ who: "owner", at: baseAt, ttl: 1 }));
+  // mtime 也要一起改老：判过期取的是 max(at, 本地 mtime)，只写 at 的话这把锁在本地钟上
+  // 其实还没到期——那"标记把它救活了"这句就没被检验过，用例只是碰巧绿。
+  fs.utimesSync(p, new Date(baseAt), new Date(baseAt));
   fs.writeFileSync(markerOf(p, baseAt), JSON.stringify({ at: Date.now(), base: baseAt, ttl: 600 }));
   const r = await claim(d, ["--file=src/d.js", "--who=other", "--ttl=600"]);
   assert.equal(r.code, 3, `标记已经把有效期推到 600s，抢占还是动手了：${r.code}\n${r.out}${r.err}`);
@@ -363,6 +377,9 @@ test("确定性临界：判据成立之后才被续期，抢占复查搬到的�
   const p = lockOf(d, "src/h.js");
   const baseAt = Date.now() - 5000;
   fs.writeFileSync(p, JSON.stringify({ who: "owner", at: baseAt, ttl: 1 }));   // 没有标记：真的过期了
+  // 过期必须两个钟都成立：判据取 max(at, 本地 mtime)，mtime 不改老的话外层就判"没过期"，
+  // 子进程根本走不到闸口——上一轮这条正是这么红的（"子进程没到闸口报到，前提不成立"）。
+  fs.utimesSync(p, new Date(baseAt), new Date(baseAt));
 
   fs.writeFileSync(p + ".freeze", "hold");
   const stealing = claim(d, ["--file=src/h.js", "--who=other", "--ttl=600"], GATE);
@@ -731,4 +748,189 @@ test("seal 不看令牌是决定，不是遗漏：seal 的代码路径里不得�
     "seal 里出现了板级读取/令牌校验——越写者一旦能拦住签名，可交付性就挂在别人的守规矩上了");
   // 反向护栏：seal 只该依赖 roster + 私钥 + 信封
   assert.match(seal[1], /myKey\(/, "seal 分支被改写了？不变式的前提取不到");
+});
+
+// ============ 跨机时钟：判过期取 max(头部 at, 本地 mtime) ============
+// `at` 是**写方**的钟盖的，`mtime` 是**这台机器的文件系统**在文件落地时盖的。
+// 频道目录经云盘同步时两者可以差很远，而两个偏差方向的危害不对称：
+//   偏早 ⇒ 提前到期 ⇒ 把活锁抢走 ⇒ 回到双写（丢数据）
+//   偏晚 ⇒ 到期被推到未来 ⇒ 白等（只卡不丢）
+// 这三条用例钉的就是这个不对称：① 必须拦住丢数据那一侧，② 不许顺手改成 min（会把①请回来），
+// ③ 不许把正常过期回收也一起挡掉。
+function plantLock(d, file, obj, mtimeMs) {
+  fs.mkdirSync(path.join(d, "claims"), { recursive: true });
+  const p = path.join(d, "claims", file);
+  fs.writeFileSync(p, JSON.stringify(obj));
+  if (mtimeMs) fs.utimesSync(p, new Date(mtimeMs), new Date(mtimeMs));
+  return p;
+}
+
+test("写方时钟偏早（at 很旧、本地 mtime 很新）不得被判过期——这是会丢数据的那一侧", async () => {
+  const d = mkChannel();
+  const old = Date.now() - 30 * 60 * 1000;           // 头部说"我 30 分钟前就建了"
+  const p = plantLock(d, "src_early.js.lock", { who: "a", at: old, ttl: 60 });
+  // mtime 不设置＝刚刚落地。只看 at 的话这把锁已经过期 29 分钟，谁都能抢。
+  const r = await claim(d, ["--file=src/early.js", "--who=b", "--ttl=60"]);
+  assert.equal(r.code, 3, `本地刚落地的锁被按 at 判成过期并抢走了（实退 ${r.code}）⇒ 双写回来了：\n${r.out}${r.err}`);
+  const now = JSON.parse(fs.readFileSync(p, "utf8"));
+  assert.equal(now.who, "a", "抢走之后锁位上的名字都变了——a 还以为自己持着");
+  const l = await locks(d);
+  assert.match(l.out, /时钟差 -\d+(\.\d+)?s\(可疑\)/, `locks 没把"头部时刻比本地文件系统早半小时"打出来：\n${l.out}`);
+});
+
+test("写方时钟偏晚（at 在未来、本地 mtime 已老）也不得被抢——防的就是把 max 改成 min", async () => {
+  const d = mkChannel();
+  const future = Date.now() + 30 * 60 * 1000;
+  const p = plantLock(d, "src_late.js.lock", { who: "a", at: future, ttl: 60 },
+    Date.now() - 10 * 60 * 1000);                     // mtime 压到 10 分钟前
+  const r = await claim(d, ["--file=src/late.js", "--who=b", "--ttl=60"]);
+  assert.equal(r.code, 3, `mtime 单独说了算就会把这把锁判成过期（实退 ${r.code}）；偏晚那侧的代价只配是等待：\n${r.out}${r.err}`);
+  assert.equal(JSON.parse(fs.readFileSync(p, "utf8")).who, "a", "偏晚方向的锁被抢走＝用等待换成了双写，方向反了");
+  const l = await locks(d);
+  assert.match(l.out, /时钟差 \+\d+(\.\d+)?s\(可疑\)/, `偏晚的锁必须被标成可疑，否则旁观者只能干等：\n${l.out}`);
+});
+
+test("两个钟都老才叫过期：max 不许把正常的过期回收路径挡掉", async () => {
+  const d = mkChannel();
+  const t = Date.now() - 10 * 60 * 1000;
+  plantLock(d, "src_real.js.lock", { who: "a", at: t, ttl: 60 }, t);   // at 与 mtime 都在 10 分钟前
+  const r = await claim(d, ["--file=src/real.js", "--who=b", "--ttl=60"]);
+  assert.equal(r.code, 0, `真过期的锁必须能被回收（实退 ${r.code}）：\n${r.out}${r.err}`);
+  assert.match(r.out, /抢占/, "回收了却没说抢占——旁观者会以为是新建");
+});
+
+// ---- 脏锁的第二道入口：JSON 能解析，但字段算不出到期时刻 ----
+test("锁文件解析得出来但字段残缺（无 at/ttl）归入脏锁，不再成为永不超期的锁", async () => {
+  const d = mkChannel();
+  const p = plantLock(d, "src_part.js.lock", { who: "a" });
+  // 旧行为：deadline = NaN，`Date.now() > NaN` 恒 false ⇒ 谁也抢不走，且 locks 上只写着 TTL ?s。
+  const r = await claim(d, ["--file=src/part.js", "--who=b", "--ttl=60"]);
+  assert.equal(r.code, 8, `字段残缺的锁该走脏锁路径（退 8、躺够上界可回收），实退 ${r.code}：\n${r.out}${r.err}`);
+  const l = await locks(d);
+  assert.match(l.out, /脏锁/, `locks 得把它当脏锁打出来，不是"被 a 占着 / TTL ?s"：\n${l.out}`);
+  const rel = await release(d, ["--file=src/part.js", "--who=a"]);
+  assert.equal(rel.code, 8, "残缺锁同样不给裸删——它可能是别人写了一半的锁");
+});
+
+test("ttl=0 的存量违规锁不在字段校验里被拦：那是已经能走通的回收出口", async () => {
+  const d = mkChannel();
+  plantLock(d, "src_zero.js.lock", { who: "a", at: Date.now() - 5000, ttl: 0 });
+  const r = await claim(d, ["--file=src/zero.js", "--who=b", "--ttl=60"]);
+  assert.equal(r.code, 0, `ttl=0 语义是"立刻可回收"，把它变成脏锁等于凭空多等 ${120}s：\n${r.out}${r.err}`);
+  assert.match(r.out, /回收原因/, "回收必须写出原因，否则旁观者以为是一次普通抢占");
+});
+
+// ---- 现状输出：尸体要看得见，但仍然一个字节都不拦 ----
+test("audit 的现状段打出盘上谁持着锁（含板锁尸体），退码仍按越写者判，不因为有人持锁就拒", async () => {
+  const d = mkChannel();
+  const bd = path.join(d, "PROGRESS.md");
+  fs.writeFileSync(bd, "# 进度板\n");
+  const ghost = Date.now() - 3000;
+  plantLock(d, "__board__.lock", { who: "ghost#99999", at: ghost, ttl: 60 });
+
+  const r = await audit(d, [`--board=${bd}`]);
+  assert.equal(r.code, 0, `板锁被一个死名字持着不是越写者，audit 必须退 0（实退 ${r.code}）：\n${r.out}${r.err}`);
+  assert.match(r.out, /盘上现持锁 1 把（现状，不是判决）/, `没有现状段：\n${r.out}`);
+  assert.match(r.out, /__board__\s+持有者=ghost#99999/, `板锁没被点名：\n${r.out}`);
+  assert.match(r.out, /已占 \d+(\.\d+)?s\s+剩 \d+(\.\d+)?s \/ TTL 60s/, `age / 剩余 TTL 没写全：\n${r.out}`);
+  assert.match(r.out, /未到期/, "该锁还没到期，必须写清楚，否则读者以为马上就能拿到");
+  assert.match(r.out, /本机查不到\(尸体\?\)/, "pid 在本机查不到就该给提示——但要带问号，跨机时这一列不适用");
+  // 只报不拒：现场里有一把活着的板锁时，board 该是排队超时 12，而不是被 audit 这条路径拒掉
+  const a = await claim(d, ["--file=src/q.js", "--who=qoder", "--ttl=600"]);
+  const tok = /--at=(\d+)/.exec(a.out)[1];
+  const b = await board(d, ["--file=src/q.js", "--who=qoder", "--at=" + tok, `--board=${bd}`,
+    "--row=| src/q.js | qoder | now |", "--wait=150"]);
+  assert.equal(b.code, 12, `幽灵板锁在场时写板该排队退 12（实退 ${b.code}）：\n${b.out}${b.err}`);
+});
+
+test("audit 的现状段要能同时说出\"这把已经到期了\"和\"跨机时 pid 列不适用\"", async () => {
+  const d = mkChannel();
+  const bd = path.join(d, "PROGRESS.md");
+  fs.writeFileSync(bd, "# 进度板\n");
+  const t = Date.now() - 10 * 60 * 1000;
+  plantLock(d, "src_exp.js.lock", { who: "b", at: t, ttl: 60 }, t);   // 两个钟都老 ⇒ 真过期
+  const r = await audit(d, [`--board=${bd}`]);
+  assert.equal(r.code, 0, `现状段本身不改判据，干净板子还是退 0：\n${r.out}${r.err}`);
+  assert.match(r.out, /已到期可回收/, "已过期的锁必须在现状里写明，否则读者以为还得等它 release");
+  assert.match(r.out, /无 pid 后缀/, "普通 handle 没有 #pid，这一列要明说'无后缀'而不是留空");
+});
+
+// ============ 少报方向：读不懂的东西不能整块当成"没有" ============
+// 通令里那句"旧规则只会多报不会少报"被证伪之后，在本仓找到的同形有两处：
+// ① 续期标记读不懂时当成"没有标记"（= 到期时刻算少 = 抢走别人刚续过的活锁，这是丢数据）；
+// ② `audit` 对无令牌行只打印、不进退码（= 靠退码自动化的脚本会漏掉这一类）。
+// ① 用行为钉，② 用文档与代码同一句话钉（见 docs-drift）。
+test("半截续期标记不被当成\"没有标记\"：那是把到期时刻算少，方向是丢数据", async () => {
+  const d = mkChannel();
+  fs.mkdirSync(path.join(d, "claims"), { recursive: true });
+  const p = path.join(d, "claims", "src_m.js.lock");
+  const baseAt = Date.now() - 60 * 1000;
+  fs.writeFileSync(p, JSON.stringify({ who: "owner", at: baseAt, ttl: 1 }));
+  fs.utimesSync(p, new Date(baseAt), new Date(baseAt));                 // 基锁本身确实过期了
+  const mk = markerOf(p, baseAt);
+  fs.writeFileSync(mk, '{"at": 17');                                    // 半截标记：很可能是正在写的那一次续期
+  const r = await claim(d, ["--file=src/m.js", "--who=other", "--ttl=600"]);
+  assert.equal(r.code, 3, `读不懂的标记被当成"没有标记"，抢占照样动手（实退 ${r.code}）：\n${r.out}${r.err}`);
+  assert.equal(JSON.parse(fs.readFileSync(p, "utf8")).who, "owner", "活锁被人搬走了");
+  // 但不能因此变成无限期锁：标记自己躺够上界后必须还能回收
+  const old = Date.now() - (120 + 30) * 1000;
+  fs.utimesSync(mk, new Date(old), new Date(old));
+  const r2 = await claim(d, ["--file=src/m.js", "--who=other", "--ttl=600"]);
+  assert.equal(r2.code, 0, `标记躺了 150s 仍不可回收 = 又造出一把永不超期的锁（实退 ${r2.code}）：\n${r2.out}${r2.err}`);
+});
+
+test("目录读失败不许整块吞成\"没有标记\"（只有 ENOENT 才是真的没有）", () => {
+  const src = fs.readFileSync(path.join(ROOT, "src/claims/lock.js"), "utf8");
+  const start = src.indexOf("function markersFor(");
+  assert.ok(start >= 0, "找不到 markersFor");
+  const fn = src.slice(start, src.indexOf("\n}\n", start));
+  // 两句一起才是一条判据：ENOENT 之外必须**往外抛**。只查"有没有 ENOENT 分支"的话，
+  // 把下面的 throw 改成 return [] 也照样过关——那正是本条要防的整块吞（变异 M36 就是这么打的）。
+  assert.match(fn, /if \(e\.code === "ENOENT"\) return \[\];\s*\n\s*throw e;/,
+    "readdir 只有 ENOENT 能当\"没有标记\"；EMFILE/EACCES 被吞掉等于把所有续期一笔勾销");
+  assert.ok(!/catch \{ return \[\]; \}/.test(fn), "整块吞掉目录读失败：少报的方向是丢数据，不是多等");
+  // 单个标记读不懂也必须留下条目，而不是 continue 掉
+  assert.match(fn, /out\.push\(\{ corrupt: true/, "读不懂的标记要留 corrupt 条目，让 deadlineOf 保守延长");
+});
+
+// ============ 少报的另一半：无令牌行不进退码，但必须有机读出口 ============
+test("audit 的机读汇总行把 stale 与 untagged 分开报：退码只管越写者，漏报那一类仍有出口", async () => {
+  const d = mkChannel();
+  const bd = path.join(d, "PROGRESS.md");
+  // 一行绕过 board 手写的（根本没令牌）+ 一行伪造化身的（越写者）
+  fs.writeFileSync(bd, "# 进度板\n| src/x.js | ghost | now\n| src/y.js | qoder | now <at=999999> |\n");
+  const r = await audit(d, [`--board=${bd}`]);
+  const line = (r.out.match(/RELAY-SUMMARY \{.*\}/) || [null])[0];
+  assert.ok(line, `audit 没打到机读汇总行：\n${r.out}`);
+  const s = JSON.parse(line.slice("RELAY-SUMMARY ".length));
+  assert.equal(s.kind, "audit");
+  assert.equal(s.stale, 1, "伪造化身那一行必须算进 stale");
+  assert.equal(s.untagged, 1, "没令牌那一行必须**单独成数**：退码不管它，机读行必须管");
+  assert.equal(s.rows, 2, "两行都该被算进数据行（不能因为不末尾带 | 就整行跳过——那正是漏报形状）");
+  assert.equal(r.code, 11, `有越写者就该退 11，实退 ${r.code}：\n${r.out}`);
+  assert.ok(Array.isArray(s.codes) && s.codes.includes(11), "汇总行要带上本命令可能退的码，读的人不用猜");
+});
+
+test("表头会被算进 untagged：所以它绝不进退码（否则每张正常板子都判有问题）", async () => {
+  const d = mkChannel();
+  const bd = path.join(d, "PROGRESS.md");
+  fs.writeFileSync(bd, "# 进度板\n| 文件 | 谁 | 状态 |\n|---|---|---|\n");
+  const r = await audit(d, [`--board=${bd}`]);
+  const s = JSON.parse((r.out.match(/RELAY-SUMMARY \{.*\}/) || ["{}"])[0].slice("RELAY-SUMMARY ".length));
+  assert.equal(r.code, 0, `一张只有表头的板子不该吃退码：\n${r.out}`);
+  // 结构与"手写而无令牌"的那一行**完全一样**：audit 不靠猜区分它们。
+  // 这正是 untagged 只能点名、不能判 11 的理由；README 的退码 11 那行必须这么写。
+  assert.equal(s.untagged, 1, "表头现在被计入 untagged（已知行为，不是缺陷）");
+  assert.equal(s.stale, 0);
+  assert.equal(s.rows, 1, "分隔行不该被算成数据行");
+});
+
+test("少一个尾巴的手写行不许整行跳过：那是把越写者读成\"没问题\"", async () => {
+  const d = mkChannel();
+  const bd = path.join(d, "PROGRESS.md");
+  // 手写、行尾少一个 | ——旧版因为"必须行尾也有 |"而整行 continue 掉
+  fs.writeFileSync(bd, "# 进度板\n| src/ghost.js | intruder | now <at=424242>\n");
+  const r = await audit(d, [`--board=${bd}`]);
+  assert.equal(r.code, 11, `不规整的伪造行被静默跳过（实退 ${r.code}）：\n${r.out}`);
+  assert.match(r.out, /越写者/);
 });

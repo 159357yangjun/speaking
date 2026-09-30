@@ -12,10 +12,14 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { printSummary, crossCheck, HARNESS_EXIT } from "../../src/claims/summary.js";
+
+// 退码声明表（见 board-race.mjs 同名表的注释）
+const EXIT_CODES = { measured: 0, boardFailed: 8, badUsage: 9, harness: HARNESS_EXIT };
 
 const ROOT = process.argv[2];
 const N = parseInt(process.argv[3] ?? "20", 10);
-if (!ROOT) { console.error("用法：node tools/claims/window-measure.mjs <仓库绝对路径> [次数=20]"); process.exit(9); }
+if (!ROOT) { console.error("用法：node tools/claims/window-measure.mjs <仓库绝对路径> [次数=20]"); process.exit(EXIT_CODES.badUsage); }
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "relay-window-"));
 fs.cpSync(path.join(ROOT, "src"), path.join(tmp, "src"), { recursive: true });
@@ -29,7 +33,7 @@ const VERIFY_ANCHOR = "    const held = verifyHold({ claimsDir, file, who, at })
 
 let src = fs.readFileSync(lock, "utf8").replace(/\r\n/g, "\n");
 for (const a of [START_ANCHOR, END_ANCHOR, VERIFY_ANCHOR]) {
-  if (!src.includes(a)) { console.error(`!! 插桩锚点没命中：${a.slice(0, 40)}…\n   停下——静默没插桩就是一场空跑。`); process.exit(9); }
+  if (!src.includes(a)) { console.error(`!! 插桩锚点没命中：${a.slice(0, 40)}…\n   停下——静默没插桩就是一场空跑。`); process.exit(EXIT_CODES.badUsage); }
 }
 // 两个计时点分别贴着 README 那两行：
 //   __t0 在第二次复验**之前**取表 → "复验 + 落盘"整段（这一整段都是别人可以插进来的时间）
@@ -54,7 +58,7 @@ src = src.replace(END_ANCHOR, END_ANCHOR + [
 fs.writeFileSync(lock, src);
 const back = fs.readFileSync(lock, "utf8");
 for (const probe of ["__t0", "__w0", "RELAY_WINDOW_LOG"]) {
-  if (!back.includes(probe)) { console.error(`!! 回读没有 ${probe}：插桩没落地。`); process.exit(9); }
+  if (!back.includes(probe)) { console.error(`!! 回读没有 ${probe}：插桩没落地。`); process.exit(EXIT_CODES.badUsage); }
 }
 
 const cli = path.join(tmp, "src", "cli.js");
@@ -73,23 +77,36 @@ for (let i = 1; i <= N; i++) {
   const file = `src/f${String(i).padStart(3, "0")}.js`;
   const c = run(["claim", `--channel=${dir}`, `--file=${file}`, "--who=qoder", "--ttl=600"]);
   const at = /--at=(\d+)/.exec(c.out)?.[1];
-  if (!at) { console.error(`第 ${i} 次：claim 没给出令牌，夹具失效\n${c.out}`); process.exit(9); }
+  if (!at) { console.error(`第 ${i} 次：claim 没给出令牌，夹具失效\n${c.out}`); process.exit(EXIT_CODES.badUsage); }
   const r = run(["board", `--channel=${dir}`, `--file=${file}`, "--who=qoder", `--at=${at}`,
     `--board=${path.join(dir, "PROGRESS.md")}`, `--row=| ${file} | qoder | now |`]);
   if (r.code !== 0) { failed++; console.error(`第 ${i} 次 board 退 ${r.code}：${r.out}`); }
   fs.rmSync(dir, { recursive: true, force: true });
 }
 
-if (!fs.existsSync(LOG)) { console.error("!! 一份样本都没写出来：注入的代码没被执行到，这条测量不作数。"); process.exit(9); }
-for (const line of fs.readFileSync(LOG, "utf8").split("\n")) {
-  const m = /^(VERIFY|WINDOW|TOTAL) (-?[\d.]+)$/.exec(line.trim());
-  if (m) samples[m[1].toLowerCase() === "verify" ? "verify" : m[1].toLowerCase() === "window" ? "window" : "total"].push(parseFloat(m[2]));
+if (!fs.existsSync(LOG)) { console.error("!! 一份样本都没写出来：注入的代码没被执行到，这条测量不作数。"); process.exit(EXIT_CODES.badUsage); }
+// 逐行判读，**读不懂的行必须报出来**：早先这里用 `^(VERIFY|WINDOW|TOTAL) 数字$` 去匹配，
+// 不匹配的行被静默丢弃——万一打印格式漂了，samples 会比成功次数少，
+// 而"少一份"当时也会因下面这条不齐检查被抓到；但反过来"多打一行重复的"就看不见了。
+// 所以现在两个方向都判：解析出的条数必须**正好**等于行数，任何一行没归类都是失败。
+const lines = fs.readFileSync(LOG, "utf8").split(/\r?\n/).map((l) => l.trim()).filter(Boolean);
+const junk = [];
+for (const line of lines) {
+  const m = /^(VERIFY|WINDOW|TOTAL) (-?[\d.]+)$/.exec(line);
+  if (!m) { junk.push(line.slice(0, 60)); continue; }
+  samples[m[1].toLowerCase()].push(parseFloat(m[2]));
+}
+if (junk.length) {
+  console.error(`!! 样本文件里有 ${junk.length} 行读不懂（打印方改了字段名/顺序，判读方正则就失配）：`);
+  console.error(`   ${junk.slice(0, 3).join(" | ")}`);
+  console.error("   停下来，不量下一个数——失配后剩下的样本仍然是合法的一堆数，那种均值最会骗人。");
+  process.exit(EXIT_CODES.badUsage);
 }
 const ok = N - failed;
 if (samples.window.length !== ok || samples.verify.length !== ok || samples.total.length !== ok) {
   console.error(`!! 样本数不齐：verify=${samples.verify.length} window=${samples.window.length} total=${samples.total.length}，成功落盘 ${ok} 次。`);
   console.error("   少一份就意味着有一段没被量到——这种数不能拿去写进 README。");
-  process.exit(9);
+  process.exit(EXIT_CODES.badUsage);
 }
 const stat = (a) => {
   const s = [...a].sort((x, y) => x - y);
@@ -103,4 +120,18 @@ console.log(`  复验开始 → 落盘完成（整段）    均值 ${t.mean}ms  
 console.log("  这段窗口里能被抢走的只有自己那把文件锁（板级锁已拿着）；");
 console.log('  后果是写出一行"化身已失效"的声明、被 audit 点名，而不是抹掉别人的行。');
 fs.rmSync(tmp, { recursive: true, force: true });
-process.exit(failed ? 8 : 0);
+// 机读汇总 + 双向印证：这里的"bad"是"有几次 board 非零"，退 0 当且仅当它是 0。
+// 单独设一个退 8 是为了把"量到了但有失败轮"与"测具不可信"(9) 分开——
+// 早先它两都塞进非零，读的人分不清"窗口没量成"和"board 挂了"。
+// 退码由现场重算的 raw 推；对外报的数从打印出去的那份对象里读回来（详见 board-race 同段注释）
+const raw = failed;
+const code = raw > 0 ? EXIT_CODES.boardFailed : EXIT_CODES.measured;
+const summary = {
+  kind: "window-measure", rounds: N, measured: samples.window.length, lost: failed,
+  windowMean: w.mean, windowMax: w.max, totalMean: t.mean,
+  code, codes: [...new Set(Object.values(EXIT_CODES))],
+};
+printSummary(summary);
+const why = crossCheck(code, { reported: summary.lost, raw, expect: N, measured: summary.measured });
+if (why) { console.error(`!! 测具不可信：${why}\n   这份毫秒数不进 README。`); process.exit(EXIT_CODES.harness); }
+process.exit(code);

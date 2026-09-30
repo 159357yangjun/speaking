@@ -59,11 +59,32 @@ function readLock(p) {
   if (!raw) return corruptLock(p, "空文件");
   try {
     const obj = JSON.parse(raw);
-    if (obj && typeof obj === "object") return obj;
-    return corruptLock(p, `不是对象（${typeof obj}）`);
+    // JSON 解析成功 ≠ 读得懂。字段残缺的锁必须走同一条脏锁路径，理由见 lockShapeOk 的注释。
+    if (obj && typeof obj === "object" && lockShapeOk(obj)) return obj;
+    return corruptLock(p, obj && typeof obj === "object"
+      ? `字段残缺或非法（who=${typeof obj.who} at=${obj.at} ttl=${obj.ttl}）`
+      : `不是对象（${typeof obj}）`);
   } catch {
     return corruptLock(p, "JSON 解析失败");
   }
+}
+
+// 一把能参与归属判定的锁至少要能算出到期时刻。
+// 为什么必须显式校验：`{"who":"a"}`（没有 at / ttl）在旧版里是一把**合法**锁，
+// 而它的 deadline 是 NaN——`Date.now() > NaN` 恒为 false，于是它谁也抢不走。
+// 那正是本文件开头承诺"不允许存在"的无限期锁，只是换了个入口进来
+// （实测：claim 拿它没办法，退 3 说"被 a 占着 / TTL ?s"，旁观者连原因都看不到）。
+// 归入脏锁=复用已经定义好的行为：退码 8、躺够 CORRUPT_GRACE_S 后由 claim 回收、release 不给裸删。
+// 不新增退码，因为没必要——它和"截断文件"对旁观者是同一个诊断："读不懂，等上界"。
+//
+// 边界要说准：`ttl=0` **不在这里拦**。它算得出到期时刻（就是 at），语义是"立刻可回收"，
+// 而且 README 承诺过一条"存量违规锁由 claim 回收、locks 标成违规(无TTL)"的路径——
+// 把它改成脏锁会凭空多等 120s，是把一条已经能走通的出口堵死。
+// 拦的是 `at`/`ttl` **根本不是数**（缺失、字符串、NaN）：那才是算不出到期时刻的锁。
+function lockShapeOk(o) {
+  return typeof o.who === "string" && o.who !== ""
+    && Number.isFinite(Number(o.at))
+    && Number.isFinite(Number(o.ttl));
 }
 
 function validateTtl(ttl) {
@@ -141,25 +162,63 @@ function createMarker(m, baseAt, ttl) {
 }
 
 // 某个基锁化身的所有标记。前缀里带上 baseAt，所以只可能读到同一化身的标记。
+// 两个方向都不能"整块跳过"（这是隔壁仓那条被证伪的"只会多报不会少报"在我仓里的同形）：
+//  · readdir 失败：只有 ENOENT 才是"真的没有标记"。EMFILE/EACCES 之类被当成空列表，
+//    等于把所有续期一笔勾销 ⇒ 到期时刻被算**少** ⇒ 抢走别人刚续过的活锁，那是丢数据的方向。
+//  · 单个标记读不懂：不能当"这个标记不存在"。半截标记很可能就是**正在写的那一次续期**，
+//    忽略它同样把到期算少。归入 corrupt，由 deadlineOf 按 CORRUPT_GRACE_S 保守延长。
 function markersFor(p, baseAt) {
   const dir = path.dirname(p), pre = `${path.basename(p)}.r-${baseAt}`;
   let names;
-  try { names = fs.readdirSync(dir); } catch { return []; }
+  try { names = fs.readdirSync(dir); }
+  catch (e) {
+    if (e.code === "ENOENT") return [];
+    throw e;                       // 交给 lockOp 收敛成退码 10：环境坏了，不是"没续期"
+  }
   const out = [];
   for (const f of names.filter((n) => n.startsWith(pre))) {
+    const full = path.join(dir, f);
     try {
-      const o = JSON.parse(fs.readFileSync(path.join(dir, f), "utf8"));
-      if (o && o.base === baseAt && typeof o.at === "number") out.push(o);
-    } catch { /* 半截标记：忽略，它不延长任何东西 */ }
+      const o = JSON.parse(fs.readFileSync(full, "utf8"));
+      if (o && o.base === baseAt && typeof o.at === "number") { out.push({ ...o, mtimeMs: safeMtime(full) }); continue; }
+      out.push({ corrupt: true, mtimeMs: safeMtime(full), why: "字段不完整" });
+    } catch (e) {
+      out.push({ corrupt: true, mtimeMs: safeMtime(full), why: e.code === "ENOENT" ? "刚被清掉" : `读不出（${e.code}）` });
+    }
   }
   return out;
 }
 
-// 有效到期时刻 = 基锁自身 与 每个续期标记 里最晚的那个。
-// 没有这一步，续期就只是写了个文件、锁照样被抢——那比不写更坏。
+function safeMtime(p) {
+  try { return fs.statSync(p).mtimeMs; } catch { return 0; }
+}
+
+/**
+ * 有效到期时刻 = **max(头部 at, 锁文件 mtime)** + ttl，再对每个续期标记同法取最大。
+ *
+ * 为什么取 max（下一个读代码的人很容易当冗余删掉，所以写全）：
+ * `at` 是**写方时钟**盖的，`mtime` 是**这台机器的文件系统**在文件落地那一刻盖的。
+ * 频道目录经云盘/同步盘流转时这两个钟不是同一个东西，而两个偏差方向的危害不对称：
+ *   · 写方钟**偏早** ⇒ `at + ttl` 提前到期 ⇒ 后来者把一把还活着的锁抢走 ⇒ 回到双写（**丢数据**）
+ *   · 写方钟**偏晚** ⇒ 到期时刻被推到未来 ⇒ 后来者白等（**只卡不丢**）
+ * 取 max 关掉的是那个会丢数据的方向：at 偏早时，本地 mtime 还站在真实时刻上。
+ * **别改成 min、也别只信 mtime**：那等于把"偏早 ⇒ 提前抢 ⇒ 双写"重新请回来。
+ *
+ * 要说清它**没**关掉的：偏晚那侧 max 无能为力（两个钟里挑晚的，只会更晚）。
+ * 它的代价是等待而不是丢数据，处置方式是**可见**而不是自动收敛——
+ * `locks` 与 `audit` 会打出 `时钟差`（at 比 mtime 晚多少秒）并标 `时钟可疑`，
+ * 因为没有任何本地信息能区分"写方钟快了 40 分钟"和"这锁真能持 40 分钟"。
+ * 同步盘还可能把 mtime 改成"同步落地时刻"（比 at 更晚），那会让等待变长——同样是只卡不丢。
+ */
 function deadlineOf(p, c) {
-  let d = c.at + c.ttl * 1000;
-  for (const m of markersFor(p, c.at)) d = Math.max(d, m.at + (m.ttl || c.ttl) * 1000);
+  let d = Math.max(Number(c.at) || 0, safeMtime(p)) + c.ttl * 1000;
+  for (const m of markersFor(p, c.at)) {
+    // 读不懂的标记**不能当"没有标记"**：那会把到期时刻算少，等于抢走别人刚续过的活锁（丢数据方向）。
+    // 也不能让它的 NaN 渗进 max——NaN 一旦进 deadline，`Date.now() > NaN` 恒 false 就又造出一把永不超期的锁。
+    // 归到 CORRUPT_GRACE_S：保守延长，但躺够上界照样能回收，不给无限期留后门。
+    if (m.corrupt) { d = Math.max(d, (m.mtimeMs || 0) + CORRUPT_GRACE_S * 1000); continue; }
+    d = Math.max(d, Math.max(m.at, m.mtimeMs || 0) + (m.ttl || c.ttl) * 1000);
+  }
   return d;
 }
 
@@ -378,11 +437,17 @@ export function list({ claimsDir }) {
     // state 必须和 acquire 的过期判定**用同一个函数**算。
     // 各算各的会出现：一把刚续过的锁在 `locks` 里被标成"已过期可回收"，
     // 而 claim 实际返回 3——旁观者照着板子做决定，决定是错的。
-    const left = ((deadlineOf(path.join(claimsDir, f), cur) - Date.now()) / 1000).toFixed(1);
+    const dl = deadlineOf(path.join(claimsDir, f), cur);
+    const left = ((dl - Date.now()) / 1000).toFixed(1);
     const renewals = markersFor(path.join(claimsDir, f), cur.at).length;
+    // 跨机时钟偏移在观测面上必须可见：`at` 是写方钟，mtime 是本地钟，差得远就说明
+    // 这把锁的"剩多少秒"不能被当成本机秒数读。判定用 max 兜住了提前抢，
+    // 但等待变长那一侧只能靠这里喊出来。
+    const skew = +(((cur.at - safeMtime(path.join(claimsDir, f))) / 1000).toFixed(1));
+    const skewTag = Math.abs(skew) > SKEW_ALERT_S ? `  时钟差 ${skew > 0 ? "+" : ""}${skew}s(可疑)` : "";
     const state = !(cur.ttl > 0) ? "违规(无TTL)"
-      : Date.now() > deadlineOf(path.join(claimsDir, f), cur) ? "已过期可回收"
-      : `持有中(剩 ${left}s${renewals ? `，含 ${renewals} 次续期` : ""})`;
+      : Date.now() > dl ? "已过期可回收"
+      : `持有中(剩 ${left}s${renewals ? `，含 ${renewals} 次续期` : ""})${skewTag}`;
     return { lock: f, holder: cur.who ?? "?", ageS, ttl: cur.ttl ?? null, state };
   });
   // 仲裁残留：搬错人又放不回去的那把锁留在这儿。它后缀不是 .lock、不参与归属判定，
@@ -501,37 +566,94 @@ export function writeBoard({ claimsDir, boardPath, file, who, at, row, waitMs = 
 /**
  * 检测：板上哪些行声称自己持锁、盘上却没有对应的活锁。
  * **只报不拒**——拒写就要改信封（把令牌纳入签名域），那是跳客户端的契约变更，本轮不做。
+ *
+ * 第二段输出是"盘上现在谁持着锁"的现状（`holders`）。它存在的原因很具体：
+ * 上一场崩溃留下的板锁还没到期时，下一个写者只会吃到退码 12，
+ * 而他分不清"现在真有人在并发重写这张板"和"前面死了一个人、还剩 4 秒自动好"。
+ * 这块现状就是让后者看得见。**仍然只做点名，不做拒绝**——
+ * 同 `seal` 那条划分：能点名的不要拦（拦它就要把一个进程的可交付性挂在另一个进程的命运上）。
  */
 export function auditBoard({ claimsDir, boardPath }) {
   // 活锁索引要带**文件名**：只比 who+at 的话，A 在 src/x.js 上的化身会被 src/y.js 的行对上，
   // 越写者就漏报了。三个字段一起才是"这一行声称的那把锁"。
   const liveKeys = new Set();
+  const holders = [];
   if (fs.existsSync(claimsDir)) {
     for (const f of fs.readdirSync(claimsDir).filter((n) => n.endsWith(".lock"))) {
-      const c = readLock(path.join(claimsDir, f));
-      if (c && !c.corrupt) {
-        const logical = f.replace(/\.lock$/, "").replace(/_/g, "/");
-        liveKeys.add(`${logical}|${c.who}|${c.at}`);
-        liveKeys.add(`${f.replace(/\.lock$/, "")}|${c.who}|${c.at}`);   // 两种写法都认
+      const p = path.join(claimsDir, f);
+      const c = readLock(p);
+      if (!c) continue;
+      // 反mangle 只对"文件路径型"的锁名成立（src_x.js → src/x.js）。
+      // 板锁的名字本来就不是路径（__board__），照着上一条规则会得到 //board// 这种鬼东西。
+      const logical = f === lockFileName(BOARD_LOCK) ? BOARD_LOCK : f.replace(/\.lock$/, "").replace(/_/g, "/");
+      if (c.corrupt) {
+        const idleS = +(((Date.now() - c.mtimeMs) / 1000).toFixed(1));
+        holders.push({ lock: logical, file: f, corrupt: true, who: "(内容不可解析)",
+          ageS: idleS, leftS: +(CORRUPT_GRACE_S - idleS).toFixed(1), ttl: CORRUPT_GRACE_S,
+          clockNote: `脏锁：按本地 mtime 计时，躺 ${idleS}s / 上界 ${CORRUPT_GRACE_S}s` });
+        continue;
       }
+      liveKeys.add(`${logical}|${c.who}|${c.at}`);
+      liveKeys.add(`${f.replace(/\.lock$/, "")}|${c.who}|${c.at}`);   // 两种写法都认
+      holders.push(holderOf(p, f, logical, c));
     }
   }
+  // 板锁排在最前：吃 12 的人第一眼看的就是它
+  holders.sort((a, b) => (a.lock === BOARD_LOCK ? -1 : b.lock === BOARD_LOCK ? 1 : a.lock.localeCompare(b.lock)));
   const text = fs.existsSync(boardPath) ? fs.readFileSync(boardPath, "utf8") : "";
   const stale = [], untagged = [];
   let total = 0;
   for (const line of text.split(/\r?\n/)) {
+    // 判"是不是一张表的行"只看一件事：这一行以 | 开头。
+    // 原来还额外要求**行尾也必须是 |**，于是 `| src/x.js | ghost | now`（手写的、少一个尾巴）
+    // 整行被 continue 掉——audit 一句都没说，退码还是 0。那是漏报，不是少报：
+    // 越写者恰恰最可能长得不规整。分隔行单独排掉，因为它本来就只是一串 - 和 |。
     if (!/^\s*\|/.test(line)) continue;
     if (/^\s*\|[-\s|:]+\|\s*$/.test(line)) continue;          // 表格分隔行
-    if (!/\|\s*$/.test(line.trimEnd())) continue;
     const cols = line.split("|").map((s) => s.trim()).filter(Boolean);
-    if (cols.length < 2) continue;                            // 表头/残缺行不参与判定
+    if (cols.length < 2) continue;                            // 只有一格的不参与判定
     total++;
     const m = /<at=(\d+)>/.exec(line);
     if (!m) { untagged.push(line.trim()); continue; }
     const [fileCol, whoCol] = cols;
     if (!liveKeys.has(`${fileCol}|${whoCol}|${m[1]}`)) stale.push({ row: line.trim(), who: whoCol, file: fileCol, at: m[1] });
   }
-  return { stale, untagged, total };
+  return { stale, untagged, total, holders };
+}
+
+// 时钟差超过这个秒数才打"可疑"标注（秒级同步抖动不该刷屏）。
+export const SKEW_ALERT_S = 120;
+
+const pidSuffix = (who) => {
+  const m = /#(\d+)$/.exec(who || "");
+  return m ? Number(m[1]) : null;
+};
+
+// 只看本机 pid 表。跨机时这一列没有意义，所以调用方必须把它当"提示"而不是"结论"：
+// 报不出"这个 pid 在另一台机器上还活着"，也不能反过来说"pid 查不到 ⇒ 一定是尸体"。
+function pidAlive(pid) {
+  if (pid === null || !Number.isInteger(pid)) return null;
+  try { process.kill(pid, 0); return true; }
+  catch (e) { return e.code === "EPERM"; }        // EPERM=存在但没权限；ESRCH=不存在
+}
+
+function holderOf(p, f, logical, c) {
+  const mtime = safeMtime(p);
+  const leftS = +((deadlineOf(p, c) - Date.now()) / 1000).toFixed(1);
+  const skewS = +((c.at - mtime) / 1000).toFixed(1);
+  const h = {
+    lock: logical, file: f, who: c.who, at: c.at, ttl: c.ttl,
+    ageS: +((Date.now() - c.at) / 1000).toFixed(1),
+    leftS, expired: leftS <= 0,
+    holderPid: pidSuffix(c.who), samePid: pidSuffix(c.who) === process.pid,
+    pidAlive: pidAlive(pidSuffix(c.who)), clockSkewS: skewS, clockNote: null,
+  };
+  if (skewS > SKEW_ALERT_S) {
+    h.clockNote = `头部时刻比本地文件系统晚 ${skewS}s：写方钟超前（或同步盘重写过 mtime）。到期被推到未来 ⇒ 只是等得久，不丢数据`;
+  } else if (skewS < -SKEW_ALERT_S) {
+    h.clockNote = `头部时刻比本地文件系统早 ${Math.abs(skewS)}s：写方钟偏早。到期取的是 max(at, mtime)，没按 at 提前抢走它`;
+  }
+  return h;
 }
 
 /**

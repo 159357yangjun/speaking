@@ -20,6 +20,10 @@ import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { printSummary, crossCheck, HARNESS_EXIT } from "../../src/claims/summary.js";
+
+// 退码声明表（与 README 逐值核对，判读方不再正则扫 process.exit —— 见 board-race.mjs 同名表的注释）
+const EXIT_CODES = { doubleOwner: 0, singleWinner: 3, precondition: 4, badUsage: 9, harness: HARNESS_EXIT };
 
 const flag = (name) => {
   const hit = process.argv.find((a) => a.startsWith(`--${name}=`));
@@ -34,11 +38,12 @@ const LABEL = flag("label") ?? "";
 // 整场跑的是未注入的实现，报出"0 轮双主"。判据自己骗了自己。
 const INJECT = parseInt(flag("inject") ?? "", 10);
 const REF = flag("lockref");
+const REVERTCAS = process.argv.includes("--revertcas");
 const DEBUG = process.argv.includes("--debug");
 const TRACE = process.argv.includes("--trace-putback");
 if (!ROOT) {
   console.error("用法：node tools/claims/renew-race.mjs <仓库绝对路径> [轮数] [LEAD_MS] [--inject=MS] [--lockref=REV] [--debug] [--label=文本]");
-  process.exit(9);
+  process.exit(EXIT_CODES.badUsage);
 }
 
 const FILE = "src/a.js";
@@ -72,19 +77,36 @@ function anchorFor(src) {
 
 function gitShow(rev, file) {
   const r = spawnSync("git", ["show", `${rev}:${file}`], { cwd: ROOT, encoding: "utf8" });
-  if (r.status !== 0) { console.error(`!! git show ${rev}:${file} 失败：${(r.stderr || "").trim()}`); process.exit(9); }
+  if (r.status !== 0) { console.error(`!! git show ${rev}:${file} 失败：${(r.stderr || "").trim()}`); process.exit(EXIT_CODES.badUsage); }
   return r.stdout;
 }
 
 let CLI, tmpCopy = null, INJECTED = false, GEN = "工作区当前实现";
-if (REF || (Number.isInteger(INJECT) && INJECT > 0)) {
+if (REF || REVERTCAS || (Number.isInteger(INJECT) && INJECT > 0)) {
   tmpCopy = fs.mkdtempSync(path.join(os.tmpdir(), "relay-race-src-"));
   fs.cpSync(path.join(ROOT, "src"), path.join(tmpCopy, "src"), { recursive: true });
   CLI = path.join(tmpCopy, "src", "cli.js");
   const lock = path.join(tmpCopy, "src", "claims", "lock.js");
   if (REF) {
     fs.writeFileSync(lock, gitShow(REF, "src/claims/lock.js"));
+    // 只换 lock.js 会造出**混合代**：现在的 cli.js 导入 auditBoard / writeBoard，
+    // 而 0414ffa 那版 lock.js 根本没这些导出 ⇒ 每个子进程在 import 阶段就崩，
+    // 40 家全崩、续期分支一次没走到，探针退 4 报"前提不成立"。
+    // 数字本身没错，错的是"这一代长这样"的假设。取旧代必须连入口一起取。
+    fs.writeFileSync(path.join(tmpCopy, "src", "cli.js"), gitShow(REF, "src/cli.js"));
     GEN = `git ${REF}`;
+    // 冒烟一次：副本里的 cli 与 lock 必须能装起来。装不起来就直接退 9，
+    // 不要拿一份"全部崩溃"的轮表去解释成"没有双主"。
+    const smokeDir = fs.mkdtempSync(path.join(os.tmpdir(), "relay-race-smoke-"));
+    fs.mkdirSync(path.join(smokeDir, "claims"), { recursive: true });
+    const smoke = spawnSync(process.execPath, [CLI, "locks", `--channel=${smokeDir}`], { encoding: "utf8" });
+    fs.rmSync(smokeDir, { recursive: true, force: true });
+    if (smoke.status !== 0) {
+      console.error(`!! 混合代：git ${REF} 的 lock.js 装不进当前入口（退出 ${smoke.status}）：`);
+      console.error(String(smoke.stderr || smoke.stdout).split("\n").slice(0, 6).map((l) => "   " + l).join("\n"));
+      console.error("   停下，不出数字。");
+      process.exit(EXIT_CODES.badUsage);
+    }
   }
   const src = fs.readFileSync(lock, "utf8").replace(/\r\n/g, "\n");
   // 先把副本的行尾统一成 LF：在库的 lock.js 全文是 CRLF，多行锚点若按 \n 比对会**静默不命中**，
@@ -93,20 +115,51 @@ if (REF || (Number.isInteger(INJECT) && INJECT > 0)) {
   if (!a) {
     console.error("!! 续期分支的注入点判据没命中（三代写法都不匹配）。");
     console.error("   停下来，不出数字——静默失配会被读成「0 轮双主」，那是空跑的绿灯。");
-    process.exit(9);
+    process.exit(EXIT_CODES.badUsage);
   }
   GEN += ` / ${a.gen}`;
   if (Number.isInteger(INJECT) && INJECT > 0) {
     const busy = `    Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ${INJECT});`;
     const patched = src.replace(a.find, a.put.replace("@BUSY@", busy));
-    if (patched === src) { console.error("!! replace() 没改动任何字节——注入静默失效，停下。"); process.exit(9); }
+    if (patched === src) { console.error("!! replace() 没改动任何字节——注入静默失效，停下。"); process.exit(EXIT_CODES.badUsage); }
     fs.writeFileSync(lock, patched);
     // 回读确认：这条自检就是用来抓"探针说注入了、其实没有"的假绿灯
     if (!fs.readFileSync(lock, "utf8").includes(busy)) {
       console.error("!! 回读看不到注入语句，停下。");
-      process.exit(9);
+      process.exit(EXIT_CODES.badUsage);
     }
     INJECTED = true;
+  }
+  if (REVERTCAS) {
+    // 把续期改回"洞 1"的形状：裸覆盖写 + 只比名字不比化身。
+    // 为什么要有这个开关：README 那对 `2/2 轮双主 → 0/2` 的"改前"一列之前只能靠
+    // `--lockref` 取整代旧代码，而旧那代跑不出双主（抢占方一家都没赢，探针退 4 拒收）——
+    // 于是一列可重跑、一列不可。和 board-race 的 `--unlocked` 同一个道理：
+    // **对照列必须也能用一条命令跑出来**，否则它就是叙述。
+    // 两处都要改：只把 createMarker 换成覆盖写，后面那句"比化身"的复查仍会判输（退 9），
+    // 量到的是现行 CAS 的失败路径而不是旧代的成功路径——红的方向会骗人。
+    const cur = fs.readFileSync(lock, "utf8").replace(/\r\n/g, "\n");
+    const ops = [
+      ["    const m = markerOf(p, cur.at);\n    const wrote = createMarker(m, cur.at, t.value);   // EEXIST 也算握过：同化身已有标记\n    const now = readLock(p);",
+       "    fs.writeFileSync(p, JSON.stringify({ who, at: Date.now(), ttl: t.value }));   // --revertcas：裸覆盖写\n    const m = markerOf(p, cur.at);\n    const wrote = false;\n    const now = readLock(p);"],
+      ["    if (now.who === who && now.at === cur.at) {",
+       "    if (now.who === who) {   // --revertcas：旧代没有化身复查"],
+    ];
+    let patched = cur;
+    for (const [from, to] of ops) {
+      if (!patched.includes(from)) {
+        console.error(`!! --revertcas 锚点没命中：${from.slice(0, 46)}…`);
+        console.error("   停下，不出数字：锚点失配的对照跑出来会被读成\"旧代也没双主\"。");
+        process.exit(EXIT_CODES.badUsage);
+      }
+      patched = patched.replace(from, to);
+    }
+    fs.writeFileSync(lock, patched);
+    const back = fs.readFileSync(lock, "utf8");
+    if (!back.includes("--revertcas：裸覆盖写") || !back.includes("--revertcas：旧代没有化身复查")) {
+      console.error("!! 回读看不到 --revertcas 的两处改动，停下。"); process.exit(EXIT_CODES.badUsage);
+    }
+    GEN += " / --revertcas：续期改回裸覆盖写";
   }
   if (TRACE) {
     // 一次性诊断开关：把"谁在什么时候动了哪个文件"整条打出来。
@@ -128,7 +181,7 @@ if (REF || (Number.isInteger(INJECT) && INJECT > 0)) {
     let patched = "const trace = (m) => process.stderr.write(`[T ${process.pid}] ${m}\\n`);\n" + cur;
     for (const [from, to] of ops) {
       const f = from.split("\n").join("\n");
-      if (!patched.includes(f)) { console.error(`!! TRACE 锚点没命中：${from.slice(0, 40)}…`); process.exit(9); }
+      if (!patched.includes(f)) { console.error(`!! TRACE 锚点没命中：${from.slice(0, 40)}…`); process.exit(EXIT_CODES.badUsage); }
       patched = patched.replace(f, to);
     }
     fs.writeFileSync(lock, patched);
@@ -232,11 +285,35 @@ const renewRefusedAll = rows.reduce((s, x) => s + x.renewRefused, 0);
 if (renewOkAll + renewRefusedAll === 0) {
   console.log(`  ✗ 续期分支一次都没被走到（LEAD ${LEAD}ms 比 40 个进程的冷启动还短，持有者读到的是"已过期"）。`);
   console.log(`    这份数字不作数——把 LEAD 调到大于进程启动时间再跑。`);
-  process.exit(4);
+  printSummary({ kind: "renew-race", rounds: ROUNDS, measured: rows.length, lost: bad.length,
+    precondition: 1, inject: Number.isInteger(INJECT) ? INJECT : 0, code: EXIT_CODES.precondition,
+    codes: [...new Set(Object.values(EXIT_CODES))] });
+  process.exit(EXIT_CODES.precondition);
 }
 if (!stealersWon) {
   console.log(`  ✗ 抢占方一家都没赢，双主判据没被执行到。加大 --inject 或 LEAD 再跑。`);
-  process.exit(4);
+  printSummary({ kind: "renew-race", rounds: ROUNDS, measured: rows.length, lost: bad.length,
+    precondition: 1, inject: Number.isInteger(INJECT) ? INJECT : 0, code: EXIT_CODES.precondition,
+    codes: [...new Set(Object.values(EXIT_CODES))] });
+  process.exit(EXIT_CODES.precondition);
 }
 console.log(`  前置条件满足：续期成功 ${renewOkAll} 次 / 续期被拒 ${renewRefusedAll} 次，且抢占方至少赢过一轮`);
-process.exit(bad.length > 0 ? 0 : 3);
+
+// 机读汇总 + 三向印证（详见 tools/claims/summary.mjs 的注释）：
+// 退码必须由**对外报出的那个数**推出，并且那个数要等于现场重算的值。
+// 退码由现场重算的 raw 推；对外报的数从打印出去的那份对象里读回来（详见 board-race 同段注释）
+const raw = rows.filter((x) => x.winners > 1).length;
+const code = raw > 0 ? EXIT_CODES.doubleOwner : EXIT_CODES.singleWinner;
+const summary = {
+  kind: "renew-race", rounds: ROUNDS, measured: rows.length, lost: bad.length,
+  renewOk: renewOkAll, renewRefused: renewRefusedAll, precondition: 0,
+  inject: Number.isInteger(INJECT) ? INJECT : 0, revertcas: REVERTCAS ? 1 : 0,
+  code, codes: [...new Set(Object.values(EXIT_CODES))],
+};
+printSummary(summary);
+const why = crossCheck(code, { reported: summary.lost, raw, expect: ROUNDS, measured: summary.measured, badIsSuccess: true });
+if (why) {
+  console.error(`\n!! 测具不可信：${why}\n   这份"几轮双主"不进 README。`);
+  process.exit(EXIT_CODES.harness);
+}
+process.exit(code);
