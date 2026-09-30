@@ -2,7 +2,7 @@
 // 上一轮的教训：断言写成内部函数调用，就测不到参数解析、退出码、日志落盘这三件事。
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { spawn, spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -400,19 +400,10 @@ test("被抢占后原方回来续期：拿到 9（停手），不是 0", async (
   assert.equal(fs.readFileSync(lockOf(d, "src/r.js"), "utf8"), snap, "非持有者的那一次动了锁内容");
 });
 
-test("真并发下续期不许抹掉抢占者：20 家续期 + 20 家抢占，自称赢的名字只能有 1 个", async () => {
-  // 这条跑的是出厂实现 + 注入窗口（在临时副本里，不动在库文件）。
-  // 判据若没被执行到（抢占方一家没赢），探针退出码 4，这条直接算失败——
-  // 因为"0 轮双主"在这种情形下是空跑出来的绿灯，不是证据。
-  const probe = path.join(ROOT, "tools", "claims", "renew-race.mjs");
-  const r = spawnSync(process.execPath,
-    [probe, ROOT, "1", "1000", "--inject=2500", "--stealdelay=1100", "--label=CI"],
-    { encoding: "utf8", timeout: 180000 });
-  const out = (r.stdout || "") + (r.stderr || "");
-  assert.equal(r.status, 3,
-    `探针退出码应为 3（判据被执行到且 0 轮双主）。实得 ${r.status}：\n${out}`);
-  assert.match(out, /前置条件满足/);
-});
+// 这里**不放**并发探针当门。`tools/claims/renew-race.mjs` 的量是 20 轮前后对比（证据），
+// 不是断言：npm test 六个文件并发跑时 CPU 抢不到，注入窗口就失效，实测会闪红。
+// 计时窗口不能当门——门是上面那两条靠 .at-gate 报到的确定性用例，
+// 它们分别被 M12 / M13 / M15 打得红，不需要运气。
 
 test("脏锁不许被 release 抹掉（那会把别人正在写的锁当垃圾删）", async () => {
   const d = mkChannel();
