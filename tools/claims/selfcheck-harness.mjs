@@ -15,8 +15,11 @@
 // 任何一面没被抓到，本脚本就退非 0：说明那个印证只在原地好看，不咬人。
 //
 // 只改临时副本，不动在库文件。副本必须是一棵**能解析相对导入的小树**：
-// `<tmp>/tools/claims/*` + `<tmp>/src/**`，并把 `<tmp>` 当 ROOT 传给被检工具。
+// `<tmp>/tools/claims/*` + `<tmp>/src/**` + `<tmp>/README.md`，并把 `<tmp>` 当 ROOT 传给被检工具。
 // 只拷 tools/claims 是不够的——判读模块在 src/claims 下，相对路径会指到 tmp 外面去。
+// README 也得拷：red-demo 有一处变异的靶子就是 README，而它现在还要从 ROOT 读"测试总数"那一行
+// 来构造锚点（本轮就是漏了这一步，面 B 直接崩在 readFileSync，报的是"没咬住"而不是"咬不住"——
+// 差别正是要点：一棵装不全的树会让证伪脚本自己变成假信号）。
 import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
@@ -37,6 +40,10 @@ function sabotage(target, patch) {
   const dir = path.join(tmp, "tools", "claims");
   fs.cpSync(path.join(ROOT, "tools", "claims"), dir, { recursive: true });
   fs.cpSync(path.join(ROOT, "src"), path.join(tmp, "src"), { recursive: true });
+  // README 也进树：red-demo 从 ROOT 读 `测试总数 **N**` 来构造它那条文档变异锚点。
+  // 少了这一步，面 B 会在 red-demo 的 readFileSync 里崩成 exit 1——一个"装不全的副本"
+  // 表现出来却像"印证没咬住"，那是测具自己造的假信号，比没测更糟。
+  fs.copyFileSync(path.join(ROOT, "README.md"), path.join(tmp, "README.md"));
   const file = path.join(dir, target);
   const before = fs.readFileSync(file, "utf8");
   patch(file, before);

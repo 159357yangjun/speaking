@@ -2,7 +2,7 @@
 // 目的不是"检查文档写得好"，是让"改了代码忘了改文档"这件事变成非零退出。
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync, existsSync } from "node:fs";
+import { readFileSync, existsSync, readdirSync } from "node:fs";
 import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
@@ -261,7 +261,7 @@ test("README 引用的探针与夹具必须真实存在，且写明的参数、�
   assert.ok(Number.isInteger(SYMBOLS.HARNESS_EXIT),
     "summary.js 里必须给『测具不可信』一个具名退码：它和『抓到缺陷』『没抓到』都要分得开");
   const PROBE_ROWS = [
-    ["tools/claims/board-race.mjs", [0, 3, 9]],
+    ["tools/claims/board-race.mjs", [0, 3, 4, 9]],
     ["tools/claims/renew-race.mjs", [0, 3, 4, 9]],
     ["tools/claims/window-measure.mjs", [0, 8, 9]],
     ["tools/claims/red-demo.mjs", [0, 7, 8, 9]],
@@ -378,6 +378,24 @@ test("探针必须真被跑起来：board-race 的入参契约与两条对照列
   assert.ok(s2.lost > 0, `改前形状必须抓到丢行，实际 lost=${s2.lost}`);
   assert.equal(s2.rulerMismatch, 0, "改前那列两把尺子不同向：这张对照表不可用");
   assert.equal(s2.unlocked, 1, "汇总行没记 unlocked：读的人分不出这是改前还是改后");
+
+  // 注入超过板级锁的排队预算 ⇒ 第二家一律被拒 ⇒ "两家都自称写成功"这个前提一次都没成立。
+  // 上一版这里错得很典型：板子上自然只剩一行，旧判据把它数成 lost=6/6 还退 0（=指控"缺陷在场"），
+  // 而那其实是"这场竞争根本没跑成"。现在必须退 4，并把被拒的轮单独报出来。
+  const over = run([ROOT, "1", "--inject=3000"]);
+  assert.equal(over.status, 4, `注入 3000ms ≥ BOARD_WAIT_MS 时应退 4（前提不成立），实际退 ${over.status}\n${over.stdout}\n${over.stderr}`);
+  const s3 = parseSummary(over.stdout, "board-race", [...need, "refused", "applicable"]);
+  assert.equal(s3.applicable, 0, "这一档没有任何一轮两家都写成：判据没被走到");
+  assert.equal(s3.lost, 0, "『没跑成竞争』不许计进 lost——那是指控，不是测量");
+  assert.equal(s3.refused, 1, "被拒的轮必须单独报出来，否则读表的人会以为这些轮不存在");
+  // 退 4 这个数字本身不解释自己：`code` 是按 applicable 算的，摘掉那段诊断输出后**退码照旧是 4**，
+  // 读的人只剩一个孤零零的 4（M55 实测就是这么绿的）。归因必须印在报警行里，所以按文本核。
+  assert.match(over.stderr, /前提不成立/,
+    "退 4 却没打出『前提不成立』那句：一个没有归因的退码等于让下一个人重新猜一遍");
+  assert.match(over.stderr, /BOARD_WAIT_MS/,
+    "诊断里必须给出为什么没跑成（注入 ≥ 板级锁排队预算），否则只知道'这次没量到'");
+  assert.match(over.stdout, /有一家被拒\/没退 0/,
+    "人读的那份逐轮表也要标出'本轮没跑成竞争'，不许留成一行★ 有一行整块丢了那种误导");
 });
 
 test("README 写的板锁 TTL 与代码常量一致（数字抄错=文档说谎）", () => {
@@ -389,6 +407,24 @@ test("README 写的板锁 TTL 与代码常量一致（数字抄错=文档说谎�
     `代码里板锁 TTL 是 ${n}s，README 写的不是这个数——回收窗口对外承诺就错了`);
 });
 
+// 探针的 stdout 不落盘这件事，必须**写在文档里**而不是留着让人猜。
+// 不写出来的话，下一个会话看到的只是 README 那些 N/N 分数，很容易当成"仓里有运行产物可查"，
+// 进而把"我跑过"当成证据——而这三个量是随机的，同一命令本轮就给出过 12/12 与 10/10。
+test("探针的读数只作即时判别：README 明写了'不落盘'与'引用一次=重跑一次'", () => {
+  const md = readFileSync(README, "utf8");
+  assert.match(md, /即时判别/, "README 没说清探针读数的制品形态：那些数字会被当成历史证据");
+  assert.match(md, /不落盘/, "必须明写 stdout 不落盘——否则'仓里查得到 log'会被默认成真的");
+  assert.match(md, /引用一次 = 重跑一次/, "要当场成立只能重跑：这句话不能只活在提交信息里");
+  const block = /先说清这些探针的制品形态([\s\S]*?)这一条由 `docs-drift`/.exec(md);
+  assert.ok(block, "README 里找不到那段'即时判别'的正文：这三个字不能只出现在标题式的一句话里");
+  for (const p of ["board-race", "renew-race", "window-measure"]) {
+    assert.ok(block[1].includes(p), `那段话没点名 ${p}：不点名就等于没说清"哪些数字不可事后核对"`);
+  }
+  // 反过来也要钉住"确实没有 log 制品"：文档说有、盘上没有，比文档没写更坏。
+  const stray = readdirSync(new URL("../tools/claims/", import.meta.url)).filter((f) => f.endsWith(".log"));
+  assert.deepEqual(stray, [], `tools/claims 下出现了 ${stray.join(", ")}：README 那句"不落盘"就过期了，两处必须一起改`);
+});
+
 test("README 写的变异条数必须等于 red-demo 的条目数（两处数字不许各飘各的）", () => {
   // 上一段刚把 46 改成 52，而 README 那句"锁这组 46 处变异"是手抄的：
   // 测试计数有断言钉，变异条数没有——同一族漂移只是还没被抓到而已。
@@ -397,8 +433,13 @@ test("README 写的变异条数必须等于 red-demo 的条目数（两处数字
   const n = (demo.match(/^    name: "M\d+/gm) || []).length;
   assert.ok(n >= 40, `只从 MUT 数出 ${n} 条变异，少得可疑——是判据读错了形状，不是真少了那么多条`);
   const md = readFileSync(README, "utf8");
-  assert.ok(md.includes(`${n} 处变异`),
-    `README 写的变异条数不是 ${n}：加/撤变异时没同步文档，那句"逐条打红"就没有可核对的分母`);
+  // README 里这个数写了**两处**（探针表那行写"35 处变异逐条打靶"，发布约束表那格写"锁这组 46 处变异"），
+  // 只核对其中一处等于放过另一处——同一数字两处各飘正是这条断言要抓的形状。
+  const stated = [...md.matchAll(/(\d+) 处变异/g)].map((m) => Number(m[1]));
+  assert.ok(stated.length >= 2,
+    `README 里只数到 ${stated.length} 处"变异条数"的说法：探针表与发布约束表各写了一份，两处都要核`);
+  assert.deepEqual([...new Set(stated)], [n],
+    `README 写的变异条数是 ${stated.join(" / ")}，red-demo 实际 ${n} 条——有一处已经过期`);
 });
 
 test("README 的测试计数必须等于各套件 test( 的行数之和", () => {

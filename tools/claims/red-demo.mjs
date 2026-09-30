@@ -18,6 +18,18 @@ const SUM = join(ROOT, "src/claims/summary.js");
 const BR = join(ROOT, "tools/claims/board-race.mjs");
 const DEMO = join(ROOT, "tools/claims/red-demo.mjs");
 
+// M27 的锚点是**从 README 当场读出来的**，不是手抄的。
+// 上一版手抄了"121"，本轮 121→122→123 连炸两次"锚点没命中"——那是测具自己的固定故障，
+// 与被测代码无关，却会把一次真跑降级成"结论不成立"。改成：读出当前那个数，写回"它 −4"。
+// 命中因此是必然的，错也是必然的（断言那边数的是各套件的真值）。
+const README_TOTAL = (() => {
+  const m = /测试总数 \*\*(\d+)\*\*/.exec(readFileSync(join(ROOT, "README.md"), "utf8"));
+  if (!m) {
+    console.error("!! README 里找不到 `测试总数 **N**`：M27 的锚点读不出来，停下（不静默跳过，那等于少测一条）");
+    process.exit(EXIT_CODES.badUsage);
+  }
+  return Number(m[1]);
+})();
 const MUT = [
   {
     name: "M1 TTL 必填被去掉（允许 ttl=0 的永久脏锁存在）",
@@ -209,7 +221,7 @@ const MUT = [
     name: "M27 README 的测试总数与分项对不上代码",
     file: README,
     suite: "test/docs-drift.test.js",
-    pairs: [["测试总数 **122**（protocol 20 · claims 55", "测试总数 **116**（protocol 20 · claims 55"]],
+    pairs: [[`测试总数 **${README_TOTAL}**`, `测试总数 **${README_TOTAL - 4}**`]],
     test: "测试计数",
   },
   {
@@ -340,14 +352,15 @@ const MUT = [
     pairs: [["      if (skew !== null && skew > SKEW_UNTRUSTED_S) {", "      if (false) {"]],
     test: "一整个小时",
   },
-  {
-    name: "M46 第二把尺子被改成『永远同向』（同源两数一起错时没人发现）",
-    file: BR,
-    pairs: [["const mismatch = rows.filter((x) => x.agree === false).length;",
-             "const mismatch = 0;   // 变异：第二把尺子的结论被丢掉"]],
-    test: "五面自证",
-    suite: "test/docs-drift.test.js",
-  },
+  // M46 已撤回，ID 不复用。理由要留在这儿，不然下一个人会以为是漏了：
+  //   它把 `mismatch` 归零，指望"两把尺子不同向 ⇒ 退 9"这道门独自失火。
+  //   本轮把 raw 改成"现场按 n1/n2 独立重算"之后，面 E 那份"格子尺说两行都在"的伪证
+  //   会同时造成 reported=0 与 raw>0 ⇒ crossCheck 先报"退 0 却报 bad=0" ⇒ 探针仍然退 9。
+  //   也就是说 mismatch 那道门在这一个场景里**已被上游的门替掉**，不再独自决定任何一次观测——
+  //   一条没人独自依赖的变异会被记成"没咬住"，那是测具在骗人。
+  //   它仍然留在探针代码里（"板上那一行不是声称那一行"这种改写只有它看得见，raw/lost 都看不见），
+  //   但要给它配红，得先造出"两把尺子不同向而 reported 与 raw 恰好相等"的现场——本轮没造出来，
+  //   所以宁可撤条并写明，也不留一条注定报绿的变异冒充覆盖率。
   {
     name: "M47 parseSummary 允许同一 kind 出现两条（挑一条当结论）",
     file: SUM,
@@ -401,6 +414,21 @@ const MUT = [
             ["  else if (!Number.isFinite(measured)) bad.push(", "  else if (false) bad.push("],
             ["  else if (measured !== expect) bad.push(", "  else if (false) bad.push("]],
     test: "双向印证",
+    suite: "test/docs-drift.test.js",
+  },
+  {
+    name: "M54 丢行判据把『有一家被拒、竞争没跑成』也数成丢行（凭空指控缺陷）",
+    file: BR,
+    pairs: [["const lost = rows.filter((x) => x.applicable && !x.both);",
+             "const lost = rows.filter((x) => !x.both);   // 变异：回到本轮之前的错判据"]],
+    test: "探针必须真被跑起来",
+    suite: "test/docs-drift.test.js",
+  },
+  {
+    name: "M55 摘掉『一轮都没跑成竞争 ⇒ 退 4』（空跑被读成结论）",
+    file: BR,
+    pairs: [["if (applicable === 0) {\n  const byCode = {};", "if (false) {\n  const byCode = {};"]],
+    test: "探针必须真被跑起来",
     suite: "test/docs-drift.test.js",
   },
 ];

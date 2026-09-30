@@ -822,3 +822,141 @@ audit 不靠猜区分；并进 11 会把每张正常板子判成有问题。改�
 一条只报退码串，不足以分辨。现在两条都会摊出：20 个退码分布、异常码那几家的原文、赢家的第一句话，
 以及 `waiters.log` 的全文。**没有放宽判据、没有加 retry**——那两条处置都会把这条门变成假安全。
 下次再红，报出来的就是现场而不是计数。
+
+---
+
+## 廿二、探针自己把命令读错这一族（2026-09-30，HEAD `289538c` 之后那一批）
+
+### 22.1 起点：一条 ENOENT，而 `npm test` 121/121 全绿
+
+上一批改 strict argv 时我把 `process.argv[2]` 重写成了 `const argv = process.argv.slice(3)`。
+`process.argv = [node, 脚本, 参数…]`，`slice(3)` 少了一位，于是**仓库路径被整个吞掉**：
+
+```
+$ node tools/claims/board-race.mjs <仓> 3 --inject=600 --unlocked
+node:internal/fs/cp/cp-sync:56
+  fsBinding.cpSyncCheckPaths(src, dest, opts.dereference, opts.recursive);
+Error: ENOENT: no such file or directory, lstat '<仓>\3\src'
+    at file:///…/tools/claims/board-race.mjs:62:6
+```
+
+`ROOT` 变成了轮数 `"3"`，`join("3","src")` 相对 cwd 解析成仓内一个不存在的目录。
+**值得记下来的不是这个 typo，是它当时的环境**：`npm test` 报 121/121 全绿，`red-demo` 报全部打红，
+`selfcheck-harness` 报 5/5——而 README 引用的"唯一现场证据源"一跑就炸。
+根因是**没有任何一条用例子进程真的跑过 board-race**：docs-drift 只在文本里核 `--flag` 锚点与退码表。
+所以这一节的所有新增，都围绕"读文本的核对不能代替真跑一次"。
+
+### 22.2 我新加的护栏里，有一条根本不放行它自己说要防的那个错
+
+`known()` 当时写的是 `|| /^\d+$/.test(a)`（理由："轮数也是数字"——但轮数在位置 1，位置 ≥2 的裸数字
+只可能是漏写 `--inject=` 前缀的那个注入值）。实测：
+
+```
+$ node tools/claims/board-race.mjs <仓> 2 600
+RELAY-SUMMARY {"kind":"board-race","rounds":2,"measured":2,"lost":0,…,"inject":0,…,"code":3,…}   EXIT=3
+```
+
+一声不吭按**不注入**跑了 2 轮并退 3（=干净）。这正是那条护栏的注释里写着要防的事，
+而它自己把猎物放行了。改成"位置 ≥2 只认带前缀的开关"后：
+
+```
+!! 不认识的参数：600（注入必须写成 --inject=<毫秒>）
+   停下：被静默忽略的参数会让『跑过了』与『跑的是我以为的那件事』分不开。        EXIT=9
+```
+
+同类两处一起补：轮数写成 `3x`（`parseInt` 得 3 → 只跑 3 轮还照报）与 `--inject=abc`
+（`parseInt` 得 NaN → 走"不注入"分支，而汇总行**照样打印 `inject: 0`，与"真的没注入"同一个数）。
+
+### 22.3 归因对了才算门：只断言"退 9"会让 M51 变绿
+
+新增的执行用例第一版只断言 `status === 9`。M51（摘掉 ROOT 那道护栏）跑出来是**绿**的：
+参数写反时错误会一路走到 `spawn` 一个不存在的 `src/cli.js`，最后由"没拿到令牌，夹具失效"替它报 9。
+退码对、归因错，读的人仍然会去查错的地方。现在每类写错的命令各自钉自己那句话：
+
+```
+[[["3", ROOT], /不像仓库/], [["5"], /不像仓库/], [[ROOT,"2","600"], /不认识的参数/],
+ [[ROOT,"3x"], /轮数必须是正整数/], [[ROOT,"2","--inject=abc"], /--inject= 必须是正整数/],
+ [[ROOT,"2","--inject=600","--unlocked","--typo=1"], /不认识的参数/]]      → 六类全退 9 且各归各位
+```
+
+### 22.4 `crossCheck` 会因为拿不到参数而**自己下岗**（还返"可信"）
+
+上一版是 `if (Number.isFinite(raw) && raw !== reported) return …`，读起来像"没传就不管"，
+实际是：调用方漏一个字段 ⇒ 那条比对静默跳过 ⇒ 函数照旧返 `null`（=可信）。
+这是隔壁仓那课"修完欠剥（假红）换过剥（假绿）"的正镜像：**欠检不报错，反而更绿**。
+现在四个数按必需项判，缺一个就打印原因（=通令里的 `skipped-because=` 那一半）：
+
+```
+--- 缺 raw ---     现场重算的 raw 不是数（undefined）：没有第二个数可比，"对外报的数被手滑改掉"这一类没人管
+--- 缺 expect ---  安排的样本数 expect 不是数（undefined）：样本齐不齐这条整条跳过＝漏计不被发现
+--- 缺 measured --- 实测样本数 measured 不是数（undefined）
+```
+
+### 22.5 本轮最贵的一条：把"没跑成竞争"读成"缺陷在场"
+
+`--inject=3000`（≥ 板级锁排队预算 `BOARD_WAIT_MS=2000`）时第二家一律退 **12 BOARD_BUSY**，
+板子上只有一行是**正确行为**。旧判据 `lost = rows.filter(x => !x.both)` 不区分"行被抹掉"和"根本没写成"：
+
+```
+$ node tools/claims/board-race.mjs <仓> 6 --inject=3000        # 改前那一版判据
+第 1轮：退码 qoder=0 workbuddy=12  one行数=1 two行数=0  claim尺=(在,不在)  ★ 有一行整块丢了
+RELAY-SUMMARY {… "lost":6, "bothZero":0, …, "rulerApplicable":0, "code":0 …}      **EXIT=0 = 宣布缺陷在场**
+```
+
+而同一份输出里 `rulerApplicable: 0` 已经明说"第二把尺子一轮都没说话"。三处一起改：
+① 判据分母换成 `applicable`（只数两家都退 0 的轮）；② `refused` 单独计数并打进汇总行与逐轮表；
+③ **退 4 = 前提不成立**，与 `renew-race` 同一个约定：没量到既不是通过、也不是缺陷。
+
+M55（摘掉那段诊断）第一版也是绿的——因为 `code` 是按 `applicable` 单独算的，摘掉输出后**退码照旧是 4**，
+只剩一个孤零零的数字。于是补了按文本核的那三条（归因必须印在报警行）。
+
+### 22.6 改前/改后对照：每格独立跑 3 次（同一命令给出过两种读数，n=1 不进结论）
+
+| 命令（`node tools/claims/board-race.mjs <仓> …`） | 改前 `--unlocked` 丢行/跑成 | 改后 丢行/跑成 | 退码 |
+|---|---|---|---|
+| `12 --inject=100 [--unlocked]` | 11/11、11/11、12/12 | 0/12、0/12、0/12 | 0 · 3 |
+| `12 --inject=600 [--unlocked]` | 12/12、10/10、10/10 | 0/12、0/12、0/12 | 0 · 3 |
+| `6 --inject=1500 [--unlocked]` | 6/6、6/6、6/6 | 0/6、0/6、0/6 | 0 · 3 |
+| `6 --inject=3000 --unlocked` / `2 --inject=3000` | 6/6、4/4、5/5（refused 0/2/1） | **0/2，退 4** | 0 · 4 |
+
+`renew-race` 两列同批紧邻跑（均 `3 400 --inject=2500`，工作树 = `289538c` + 本批未提交改动）：
+
+```
+改前 --revertcas：第1/2/3轮 自称赢 21 家 → 双主 owner+stealer-16 / -14 / -10
+RELAY-SUMMARY {"kind":"renew-race","rounds":3,"measured":3,"lost":3,"renewOk":60,"renewRefused":0,…,"code":0}  EXIT=0
+改后 现行 CAS ：exit0=[20,1,1]，名字数恒 1，最终锁内容 owner/stealer-9/stealer-14
+RELAY-SUMMARY {"kind":"renew-race","rounds":3,"measured":3,"lost":0,"renewOk":19,"renewRefused":40,…,"code":3}  EXIT=3
+```
+
+### 22.7 变异覆盖率不写"更多"：M46 撤回，理由写在代码里
+
+把 `mismatch` 归零（M46）之后测试**没有变红**：`raw` 现在按 `n1/n2` 独立重算，面 E 那份伪证会同时造成
+`reported=0` 与 `raw>0` ⇒ `crossCheck` 先报"退 0 却报 bad=0" ⇒ 探针仍然退 9。
+也就是说 `mismatch` 那道门在这个场景已被上游替掉，不再独自决定任何一次观测。
+处置是**撤条并写明**（ID 不复用），而不是留着一条注定报绿的变异冒充覆盖率，也不是顺手加一条
+"两把尺子不同向而 reported==raw"的假想夹具——那个现场本轮没造出来。
+覆盖数因此从 54 降到 **53**；README 两处 `53 处变异` 由新增的那条"变异条数由 MUT 数出来核对"钉住
+（这条断言一上线就抓到我自己写的 52/54 过期了两次）。
+
+`npm test` 124/124；`red-demo` 53/53 全部打红（绿 0／空跑 0／测具不可信 0／锚点没命中 0）；
+`selfcheck-harness` 5/5 面都被抓到。
+
+### 22.8 顺手补的：mini 副本装不全，证伪脚本自己会变成假信号
+
+面 B 一度报"没咬住"，实际是 red-demo 在临时副本里 `readFileSync(ROOT/README.md)` 炸 ENOENT → exit 1。
+`selfcheck-harness` 的小树原来只拷 `tools/claims` + `src`；现在也拷 `README.md`，
+因为 red-demo 那条文档变异的锚点要从 ROOT 的 README 当场读。
+同一处把 M27 的锚点从手抄数字改成"读出来再减 4"：本轮 121→122→123→124 连炸三次"锚点没命中"，
+那是测具自己的固定故障，却会把一次真跑降级成"结论不成立"。
+
+### 22.9 这一节没有覆盖到的（下一轮的头等账）
+
+- `renew-race` / `window-measure` **还没有** board-race 那套入参纪律：两者都靠 `parseInt(argv[n])`，
+  未知开关静默忽略；`renew-race` 的 `parseInt(flag("renew") ?? "", 10) || 20` 更糟——
+  `--renew=abc` 与 `--renew=0` 都被 `|| 20` 吃掉，等于把显式写错的选项改写成默认值。
+  按本轮定的修法是同一个形状，本轮没动它们（边界：不改 lock/配置），已登记。
+- `board-race` 的 `mismatch` 那道门目前没有独自开过火（见 22.7），留着但没有红过。
+- 探针读数**不落盘**：本轮按"要么落盘带 commit、要么明写只作即时判别"选了后者，
+  写进 README 并由 `探针的读数只作即时判别…` 那条用例钉住（含"仓里确实没有 `.log`"的反向断言）。
+  真需要历史证据时，缺的是那套 log+出处机器，本轮没开。
+- 20 路并发那条假红（累计 2 次）仍未定位；真频道跨 agent 一轮仍欠（须本人）。

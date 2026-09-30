@@ -9,7 +9,13 @@
 //
 // --inject    把 src/ 整棵树拷到临时目录，在 writeBoard 的"读板"与"落盘"之间插入忙等。
 //             不注入时窗口只有 ~2ms，12 轮也可能一次都没撞上——**"没复现"不等于"没这个洞"**，
-//             这条纪律是本项目用两条假绿灯换来的。注入只改变命中概率，不改变可能性。
+//             这条纪律是本项目用两条假绿灯换来的。
+//             **注入有上限**：一旦 `--inject ≥ BOARD_WAIT_MS`（板级锁排队预算，现 2000ms），
+//             第二家等满就退 12，"两家都自称写成功"这个前提一次都不成立 ⇒ 本探针退 4（不是退 0）。
+//             上一轮我把 3000ms 那一档读成"改后也丢行 6/6"，那其实是"没跑成竞争"——指控错了对象。
+// 退出码：0 = 抓到丢行（缺陷在场）· 3 = 跑成的轮里两行都在（干净）·
+//         4 = 前提不成立（没有任何一轮两家都退 0，判据没被走到，不许当结论）·
+//         9 = 用法错 / 注入或 --unlocked 锚点没命中 / 计数与状态不互相印证。注入只改变命中概率，不改变可能性。
 //             注入打的是副本，不动在库文件。
 // --unlocked  在**同一份临时副本**里把板级锁队列拆掉（`if (true) break`），用来重跑"加板锁之前"那一列。
 //             README 里那对 0/6 ↔ 6/6 必须两个方向都能从这条命令跑出来；
@@ -22,13 +28,15 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { printSummary, crossCheck, HARNESS_EXIT } from "../../src/claims/summary.js";
+// 只是把"排队预算"这个数从被测实现里取过来写进诊断话术，免得话术里手抄一个会过期的常量。
+import { BOARD_WAIT_MS } from "../../src/claims/lock.js";
 
 // 本工具的退码表——**打印与判读共用这一处定义**。
 // 为什么不让判读方（docs-drift）去正则扫 `process.exit(...)`：上一轮它就因为收尾写成
 // `process.exit(lost.length > 0 ? 0 : 3)` 而漏读了 0 和 3，把"实际退码集合"读成 [9]。
 // 那次的正确处置是改判据而不是放宽断言；而更稳的判据是**声明表**：
 // 这里声明了什么，README 就必须解释什么，且每个都真被某条出口用到。
-const EXIT_CODES = { foundLoss: 0, clean: 3, badUsage: 9, harness: HARNESS_EXIT };
+const EXIT_CODES = { foundLoss: 0, clean: 3, precondition: 4, badUsage: 9, harness: HARNESS_EXIT };
 
 // 注意偏移：process.argv = [node, 脚本, 参数...]，必须 slice(2)。
 // 上一版这里写成 slice(3)，把仓库路径整个吞掉——`ROOT` 变成轮数，探针在 cpSync 里炸 ENOENT。
@@ -219,48 +227,68 @@ for (let r = 1; r <= ROUNDS; r++) {
   const p1 = rowPresent(board, c1), p2 = rowPresent(board, c2);
   const agree = applicable ? ((p1 && p2) === (has1 && has2) && (p1 ? 1 : 0) + (p2 ? 1 : 0) === n1 + n2) : null;
   rows.push({ round: r, c1: r1.code, c2: r2.code, has1, has2, both: has1 && has2, n1, n2, agree, applicable });
-  console.log(`  第${String(r).padStart(2)}轮：退码 qoder=${r1.code} workbuddy=${r2.code}  one行数=${n1} two行数=${n2}  claim尺=(${p1 ? "在" : "不在"},${p2 ? "在" : "不在"})  ${has1 && has2 ? "两行都在" : "★ 有一行整块丢了"}${agree === false ? "  ✗两把尺子不同向" : ""}`);
+  console.log(`  第${String(r).padStart(2)}轮：退码 qoder=${r1.code} workbuddy=${r2.code}  one行数=${n1} two行数=${n2}  claim尺=(${p1 ? "在" : "不在"},${p2 ? "在" : "不在"})  ` +
+    (applicable ? (has1 && has2 ? "两行都在" : "★ 有一行整块丢了") : `○ 有一家没退 0（${r1.code === 0 ? "workbuddy" : "qoder"} 被拒），本轮没跑成竞争`) +
+    (agree === false ? "  ✗两把尺子不同向" : ""));
   fs.rmSync(dir, { recursive: true, force: true });
 }
 
-const lost = rows.filter((x) => !x.both);
+const lost = rows.filter((x) => x.applicable && !x.both);
+// 有一家在板上被拒（没轮到写）的轮：这些轮**没有跑成这场竞争**，不是"缺陷没撞上"更不是"丢了行"。
+const refused = rows.filter((x) => !x.applicable);
 if (tmpCopy) fs.rmSync(tmpCopy, { recursive: true, force: true });
 const bothZero = rows.filter((x) => x.c1 === 0 && x.c2 === 0);
 console.log(`\n判据：两个进程都各自持有一把合法的锁（不同文件），board 都复验通过时，`);
 console.log(`      最终板子必须同时含两行——少任何一行都是"别人的声明被抹掉"。`);
-console.log(`  ${ROUNDS} 轮里两行都在：${rows.length - lost.length}/${ROUNDS}`);
+console.log(`  ${ROUNDS} 轮里两行都在：${rows.filter((x) => x.both).length}/${ROUNDS}`);
 console.log(`  两个进程都退 0 的轮数：${bothZero.length}/${ROUNDS}`);
-console.log(`  **两家都自称写成功、板子上却只剩一行**的轮数：${rows.filter((x) => x.c1 === 0 && x.c2 === 0 && !x.both).length}/${ROUNDS}`);
+console.log(`  **两家都自称写成功、板子上却只剩一行**的轮数：${lost.length}/${ROUNDS}   ← 判据看的就是这个数`);
+console.log(`  有一家被拒/没退 0（这一轮没跑成竞争，不计入上面那个数）：${refused.length}/${ROUNDS}`);
 
 // 机读汇总行 + 三向印证。为什么要有这一段：这一族的失败不是"数字难看"，是
 // **读不到计数与计数为 0 长得一样**——打印方改了字段名，判读方正则失配，
 // 于是 "NOT REPORTED" 被当成 "PASSED"（隔壁仓刚实出来一次）。
 // 形状要求：退码由**现场重算的 raw** 推；对外报的数从**打印出去的那份对象**里读回来。
 // 于是"临时把计数打印错但不改退码"这种改动必定被 crossCheck 抓到，两个方向都是。
-const raw = rows.filter((x) => !x.both).length;
+const raw = rows.filter((x) => x.applicable && (x.n1 !== 1 || x.n2 !== 1)).length;
 // 第二把尺子不同向 ⇒ 这份数不可信（不管它偏向"丢了"还是"没丢"）
 const mismatch = rows.filter((x) => x.agree === false).length;
 const applicable = rows.filter((x) => x.applicable).length;
-const code = raw > 0 ? EXIT_CODES.foundLoss : EXIT_CODES.clean;
+// 退码 4（与 renew-race 同一个约定）：**一家都没写成 ⇒ 这场竞争一次都没发生**，
+// 那种现场既不能读成"抓到丢行"，也不能读成"没丢行"，只能读成"没量到"。
+// 上一轮我就差点把 renew-race 的一次空跑当成"没有双主"，这次是同一个坑的另一半：
+// 实测 `--inject=3000`（超过板级锁排队预算 BOARD_WAIT_MS）时第二家一律退 12，
+// 板子上自然只有一行——旧判据把这份"没跑成"报成 lost=6/6 并退 0，等于**凭空指控了一次缺陷**。
+const code = applicable === 0 ? EXIT_CODES.precondition : (raw > 0 ? EXIT_CODES.foundLoss : EXIT_CODES.clean);
 const summary = {
   kind: "board-race", rounds: ROUNDS, measured: rows.length,
   lost: lost.length,
   bothZero: bothZero.length,
+  refused: refused.length, applicable,
   inject: Number.isInteger(INJECT) ? INJECT : 0, unlocked: UNLOCKED ? 1 : 0,
   rulerMismatch: mismatch, rulerApplicable: applicable,
   code, codes: [...new Set(Object.values(EXIT_CODES))],
 };
 printSummary(summary);
 const why = crossCheck(code, { reported: summary.lost, raw, expect: ROUNDS, measured: summary.measured, badIsSuccess: true });
-if (mismatch > 0) {
-  // 这一条与 crossCheck 是两件事：crossCheck 只能发现"报出去的和现场重算的不一样"，
-  // 两边同源时它一定通过。第二把尺子不同向说明**两个同源数一起错**，那种数最难看穿。
-  console.error(`\n!! 两把尺子不同向：${mismatch}/${ROUNDS} 轮上"按格子数"与"按令牌数"结论不一致。`);
-  console.error("   停下不出表：检测器失去判别力时，\"两行都在 N/N\"与\"什么都没数到\"是同一句话。");
-  process.exit(EXIT_CODES.harness);
-}
 if (why) {
   console.error(`\n!! 测具不可信：${why}\n   这份表不进 README——它可能只是"没量到"，不是"没撞上"。`);
   process.exit(EXIT_CODES.harness);
+}
+if (mismatch > 0) {
+  // 这一条与 crossCheck 是两件事：crossCheck 只能发现"报出去的和现场重算的不一样"，
+  // 两边同源时它一定通过。第二把尺子不同向说明**两个同源数一起错**，那种数最难看穿。
+  console.error(`\n!! 两把尺子不同向：${mismatch}/${ROUNDS} 轮上"按格子数"与"按 claim 整行"结论不一致。`);
+  console.error("   停下不出表：检测器失去判别力时，\"两行都在 N/N\"与\"什么都没数到\"是同一句话。");
+  process.exit(EXIT_CODES.harness);
+}
+if (applicable === 0) {
+  const byCode = {};
+  for (const x of rows) for (const c of [x.c1, x.c2]) byCode[c] = (byCode[c] || 0) + 1;
+  console.error(`\n!! 前提不成立：${ROUNDS} 轮里没有一轮是"两家都退 0"（单次退码分布 ${JSON.stringify(byCode)}）。`);
+  console.error(`   注入 ${INJECT}ms ≥ 板级锁排队预算 BOARD_WAIT_MS=${BOARD_WAIT_MS}ms：第二家等满就退 12，`);
+  console.error(`   "两个都自称写成功"这个前提一次都没成立，所以本表既不说"丢了行"也不说"没丢"。`);
+  console.error("   要么把注入调小到 BOARD_WAIT_MS 以内，要么给 board 传 --wait=<更大值>（那是另一件事：改的是被测实现）。");
+  process.exit(EXIT_CODES.precondition);
 }
 process.exit(code);
