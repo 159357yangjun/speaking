@@ -1158,7 +1158,13 @@ realpath = 同上                     realpath===cwd ? true
 ② "同步盘永远不会参与" = **未验、且不可保证** —— 协议对频道目录的唯一要求只是"两个 agent 都能写"，
 而这台机器上 OneDrive / WPS 客户端都在，把 `--channel` 指过去是一个字节的动作。
 所以 `[MTIME_CLAMPED]` 的**来因字段写"未判定 + 候选"**，不写"同步盘重写"这种我们没观测到的结论。
-重跑命令：`node <临时>/synccheck.cjs`（逐段 `lstat` + `fsutil` + 云根枚举，一次性脚本，不进仓）。
+重跑配方（不依赖任何临时文件——我这次用的临时脚本删掉就没了，写它等于写一条死链）：
+① `fs.realpathSync(process.cwd()) === path.resolve(process.cwd())`；
+② 从盘根逐段 `fs.lstatSync()` 走到仓库，看 `isSymbolicLink()`，并对每段跑
+   `fsutil reparsepoint query <该段>`（非 0 返回 = 不是 reparse，那正是我们要的答案）；
+③ 枚举并检查祖先关系：`OneDrive`、`WPS Cloud`、`WPS Cloud Files`、`WPSDrive`、`Dropbox`、
+   `Google Drive`、`Nutstore`、`iCloudDrive` 是否存在、仓库路径是否 `startsWith(它 + path.sep)`。
+三条都走文件脚本而不是 `node -e`：反斜杠在 bash→node 这一层会被吞（本仓已记过一次同形故障）。
 
 ### 23.2 两面夹具与它们各自的变异
 
