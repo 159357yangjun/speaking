@@ -431,6 +431,17 @@ const MUT = [
     test: "探针必须真被跑起来",
     suite: "test/docs-drift.test.js",
   },
+  {
+    // 这不是假想：本轮我把一条用例的声明写成了**缩进**，于是"核对测试总数"那条断言少数一条、
+    // 照报绿，而 runner 实际多跑一条（README 写 124 / 实跑 127）。判据只认顶格声明，
+    // 就等于判据替一个真实的错记账。M56 把那条声明重新缩进一次，验这条 strengthened 断言真会红。
+    name: "M56 把一条用例声明缩进（顶格数法少数一条，README 的测试总数变假账）",
+    file: join(ROOT, "test/docs-drift.test.js"),
+    pairs: [['test("README 写的板锁 TTL 与代码常量一致（数字抄错=文档说谎）", () => {',
+             '   test("README 写的板锁 TTL 与代码常量一致（数字抄错=文档说谎）", () => {']],
+    test: "测试计数",
+    suite: "test/docs-drift.test.js",
+  },
 ];
 
 // 计数行的正则与判读放在**同一处**定义：`node --test` 的报告格式一改，

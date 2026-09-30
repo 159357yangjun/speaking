@@ -74,6 +74,22 @@ test("schema 的 done 描述不得声称刻意排除在签名域外", () => {
 const README = new URL("../README.md", import.meta.url);
 const CORRUPT_GRACE = 120;   // 与 lock.js 的 CORRUPT_GRACE_S 同值，下面有断言核它
 const rootDir = path.resolve(fileURLToPath(import.meta.url), "..", "..");
+
+// 【全机位口径】凡被文档当证据引用的可执行探针，套件里必须有一条**真的 spawn 它一次**的用例。
+// 这条口径的来由：上一批 `board-race.mjs:35` 写成 `process.argv.slice(3)`，仓库路径被整个吞掉，
+// 探针一跑就 ENOENT —— 而 `npm test` 当时报 121/121 全绿。原因不是"测试不够严"，
+// 是**套件与探针之间根本没有执行边**：所有用例都在读它的源码文本，全绿只证明"关于它的断言对"，
+// 不证明"它能跑"。文本核对永远看不见"参数偏移"这类错，因为它从没把参数喂进去过。
+//
+// 记法用"真跑一次就往 Set 里登记"，不用"扫源码里有没有 spawn 字样"：
+// 后者会被注释、被 readFileSync 的字符串、被一条从不执行的分支骗过去；前者只能由实际发生凑齐。
+const SPAWNED = new Set();
+function runProbe(rel, args, opts = {}) {
+  SPAWNED.add(rel);
+  return spawnSync(process.execPath,
+    [fileURLToPath(new URL("../" + rel, import.meta.url)), ...args],
+    { encoding: "utf8", timeout: 300000, ...opts });
+}
 const { EXIT } = await import("../src/claims/lock.js");
 
 function exitTableFromDoc() {
@@ -252,6 +268,16 @@ test("测试专用延时闸口只能由环境变量打开（生产路径上这�
 // ============ README 引用的"现场证据源"：文件在、参数在、退码在 ============
 // 本轮唯一的现场证据是那两个并发探针加一个夹具。它们只在提交信息里存在过一次的账，
 // 这次一起清：README 按文件名引用，就得能按文件名跑到，且引用的参数/退码与脚本自己一致。
+// 现场证据表里点名的那几个探针：既用来核对 README 与脚本自己的退码表，
+// 也用来核对"套件里是不是真的 spawn 过它"（见文件末尾那条覆盖断言）。
+const PROBE_ROWS = [
+  ["tools/claims/board-race.mjs", [0, 3, 4, 9]],
+  ["tools/claims/renew-race.mjs", [0, 3, 4, 9]],
+  ["tools/claims/window-measure.mjs", [0, 8, 9]],
+  ["tools/claims/red-demo.mjs", [0, 7, 8, 9]],
+  ["tools/claims/selfcheck-harness.mjs", [0, 8, 9]],
+];
+
 test("README 引用的探针与夹具必须真实存在，且写明的参数、退码与脚本一致", () => {
   const md = readFileSync(README, "utf8");
   // 具名退码从 summary.mjs 取数：判读方与打印方共用一处定义，改常量名/值都会被这里抓到。
@@ -260,13 +286,6 @@ test("README 引用的探针与夹具必须真实存在，且写明的参数、�
   for (const m of sumSrc.matchAll(/export const ([A-Z0-9_]+) = (\d+);/g)) SYMBOLS[m[1]] = Number(m[2]);
   assert.ok(Number.isInteger(SYMBOLS.HARNESS_EXIT),
     "summary.js 里必须给『测具不可信』一个具名退码：它和『抓到缺陷』『没抓到』都要分得开");
-  const PROBE_ROWS = [
-    ["tools/claims/board-race.mjs", [0, 3, 4, 9]],
-    ["tools/claims/renew-race.mjs", [0, 3, 4, 9]],
-    ["tools/claims/window-measure.mjs", [0, 8, 9]],
-    ["tools/claims/red-demo.mjs", [0, 7, 8, 9]],
-    ["tools/claims/selfcheck-harness.mjs", [0, 8, 9]],
-  ];
   for (const [rel, codes] of PROBE_ROWS) {
     const url = new URL("../" + rel, import.meta.url);
     assert.ok(existsSync(url), `README 按文件名引用了 ${rel}，可它不在仓里——那等于不存在`);
@@ -340,9 +359,9 @@ test("README 引用的探针与夹具必须真实存在，且写明的参数、�
 // 而 `npm test` 121/121 全绿——因为没有任何一条用例子进程真的跑过它。
 // 文档里写着"这一列能用这条命令重跑"，就必须有人把那条命令真跑一遍。
 test("探针必须真被跑起来：board-race 的入参契约与两条对照列都由现跑核对", () => {
-  const ROOT = path.resolve(fileURLToPath(import.meta.url), "../..");
-  const PROBE = path.join(ROOT, "tools", "claims", "board-race.mjs");
-  const run = (args) => spawnSync(process.execPath, [PROBE, ...args], { encoding: "utf8", timeout: 180000 });
+  // 每组参数里已经带了仓库路径（写错的用例正是要把路径放在错的位置），这里不再补一次。
+  const run = (args) => runProbe("tools/claims/board-race.mjs", args);
+  const ROOT = rootDir;
 
   // 这几类写错的命令：必须在入口就响，而且**要响在该响的那一处**——
   // 只断言"退了 9"是不够的：摘掉 ROOT 那道护栏后，同一个错误会一路走到 spawn 一个不存在的
@@ -378,6 +397,8 @@ test("探针必须真被跑起来：board-race 的入参契约与两条对照列
   assert.ok(s2.lost > 0, `改前形状必须抓到丢行，实际 lost=${s2.lost}`);
   assert.equal(s2.rulerMismatch, 0, "改前那列两把尺子不同向：这张对照表不可用");
   assert.equal(s2.unlocked, 1, "汇总行没记 unlocked：读的人分不出这是改前还是改后");
+  // 一句"丢了 N 行"必须自带非零分母：没有一轮跑成竞争时，不许凭空签发缺陷结论。
+  assert.ok(s2.applicable > 0, `报 lost=${s2.lost} 却只有 applicable=${s2.applicable}：结论没有承载它的样本`);
 
   // 注入超过板级锁的排队预算 ⇒ 第二家一律被拒 ⇒ "两家都自称写成功"这个前提一次都没成立。
   // 上一版这里错得很典型：板子上自然只剩一行，旧判据把它数成 lost=6/6 还退 0（=指控"缺陷在场"），
@@ -396,6 +417,32 @@ test("探针必须真被跑起来：board-race 的入参契约与两条对照列
     "诊断里必须给出为什么没跑成（注入 ≥ 板级锁排队预算），否则只知道'这次没量到'");
   assert.match(over.stdout, /有一家被拒\/没退 0/,
     "人读的那份逐轮表也要标出'本轮没跑成竞争'，不许留成一行★ 有一行整块丢了那种误导");
+});
+
+// README 写的板锁 TTL 与代码常量一致（数字抄错=文档说谎）
+test("renew-race 也必须有执行边：真跑 1 轮，判据被走到、汇总行的 code 就是真退码", () => {
+  // 上一批 board-race 坏了而套件全绿那件事之后，"探针只被读文本核对过"就不能再留成缺口。
+  // 这一条不重复 22.6 那对统计数字（那是测量），它只验**这台仪器能开机**：
+  // 判据没被走到时探针自己会退 4（precondition=1），那正是"跑了但什么都没量"的形状。
+  const r = runProbe("tools/claims/renew-race.mjs", [rootDir, "1", "400", "--inject=2500"]);
+  const out = (r.stdout || "") + (r.stderr || "");
+  assert.ok(r.status === 0 || r.status === 3,
+    `renew-race 实退 ${r.status}：0=抓到双主（缺陷回归）、3=单胜者；4=判据没被走到，9=用法/锚点——都不是"仪器正常"：\n${out.split(/\r?\n/).slice(-12).join("\n")}`);
+  const s = parseSummary(r.stdout, "renew-race", ["rounds", "measured", "lost", "precondition", "code"]);
+  assert.equal(s.measured, s.rounds, "安排的轮数必须都实测到");
+  assert.equal(s.precondition, 0, "precondition≠0：这一轮的续期/抢占分支没被执行到，退码再好看也不算量过");
+  assert.equal(s.code, r.status, "汇总行里写的 code 必须就是进程真实退码（两份数不能各说各话）");
+});
+
+test("window-measure 也必须有执行边：真跑 2 次，样本齐且窗口量为正", () => {
+  const r = runProbe("tools/claims/window-measure.mjs", [rootDir, "2"]);
+  const out = (r.stdout || "") + (r.stderr || "");
+  assert.equal(r.status, 0, `window-measure 实退 ${r.status}（8=有 board 非零退出，9=锚点没命中/样本不齐）：\n${out.split(/\r?\n/).slice(-12).join("\n")}`);
+  const s = parseSummary(r.stdout, "window-measure", ["rounds", "measured", "lost", "windowMax", "code"]);
+  assert.equal(s.measured, 2, "两次落盘必须都量到：少一次就是有一段没被量");
+  assert.equal(s.lost, 0, "有落盘没被量到：那份窗口表的分母就不诚实");
+  assert.ok(Number.isFinite(s.windowMax) && s.windowMax >= 0, `窗口最大值得是个正数（拿到 ${s.windowMax}）`);
+  assert.equal(s.code, r.status, "汇总行的 code 与真退码不能两份数各说各话");
 });
 
 test("README 写的板锁 TTL 与代码常量一致（数字抄错=文档说谎）", () => {
@@ -447,7 +494,20 @@ test("README 的测试计数必须等于各套件 test( 的行数之和", () => 
   // 断言结果不能当断言证据，所以数字从代码里数出来，不写在测试里。
   const md = readFileSync(README, "utf8");
   const files = ["protocol", "claims", "cli-keys", "docs-drift", "docs-coverage", "sim"];
-  const per = files.map((f) => [f, (readFileSync(new URL(`./${f}.test.js`, import.meta.url), "utf8").match(/^test\(/gm) || []).length]);
+  // 两种数法都要数：`^test\(` 只认顶格声明。本轮我把一条用例的声明写成了缩进（挪代码时误伤了它），
+  // 于是这条"核对计数"的断言自己少数了一条——README 写 124、runner 实际跑 127，而它照样报绿。
+  // 判据只认顶格 ⇒ 判据会替一个真实的错记账。现在顶格数与全量数必须相等，不等就把行号摊出来。
+  const per = files.map((f) => {
+    const src = readFileSync(new URL(`./${f}.test.js`, import.meta.url), "utf8");
+    const top = (src.match(/^test\(/gm) || []).length;
+    const any = (src.match(/^[ \t]*test\(/gm) || []).length;
+    const indented = src.split(/\r?\n/).map((l, i) => [i + 1, l])
+      .filter(([ , l]) => /^[ \t]+test\(/.test(l)).map(([n]) => n);
+    assert.equal(any, top,
+      `${f}.test.js 里有 ${indented.length} 条缩进的 test( 声明（行 ${indented.join(", ")}）：` +
+      "顶格数法会静默少数，README 那个'测试总数'就成假账——把声明挪回顶格，别放宽这条断言");
+    return [f, top];
+  });
   const total = per.reduce((s, [, n]) => s + n, 0);
   const docLine = /测试总数 \*\*(\d+)\*\*（([^）]*)）/.exec(md);
   assert.ok(docLine, "README 里找不到'测试总数 **N**（…）'那行");
@@ -623,12 +683,9 @@ test("README 说清了两件事：退码 11 只管越写者，无令牌行走机
 // 判读器的对照表不能只在"我手动跑了 red-demo"时才生效：npm test 里就子进程跑一次。
 // 上一版我只在测试里断言"源码里有 runSelftest() 且顺序在前"——那证明的是形状，不是行为。
 test("red-demo 的 classify 对照表在 npm test 里真跑一次（子进程，不退 7 才算过）", () => {
-  const r = spawnSync(process.execPath, [
-    // 必须走 fileURLToPath：Windows 上 `new URL(...).pathname` 得到 "/C:/Users/…"，
-    // 那个前导斜杠会让 node 按 CJS 解析模块直接失败（实退 1，红在测具自己身上）。
-    fileURLToPath(new URL("../tools/claims/red-demo.mjs", import.meta.url)),
-    rootDir, "--selftest-only",
-  ], { encoding: "utf8" });
+  // 必须走 fileURLToPath：Windows 上 `new URL(...).pathname` 得到 "/C:/Users/…"，
+  // 那个前导斜杠会让 node 按 CJS 解析模块直接失败（实退 1，红在测具自己身上）。—— 现在由 runProbe 统一做。
+  const r = runProbe("tools/claims/red-demo.mjs", [rootDir, "--selftest-only"]);
   const out = (r.stdout || "") + (r.stderr || "");
   assert.equal(r.status, 0, `判读器自测没退 0（实退 ${r.status}）：\n${out.split("\n").slice(-14).join("\n")}`);
   const oks = (out.match(/^ {2}ok /gm) || []).length;
@@ -639,9 +696,7 @@ test("red-demo 的 classify 对照表在 npm test 里真跑一次（子进程，
 // 五面自证不能只在我手动跑的时候算数：npm test 里以子进程真跑一次。
 // 面 C/D（行数契约）与面 E（第二把尺子）都只有"真起一个被改坏的副本"才作数。
 test("五面自证：harness 的五个面在 npm test 里真跑一次（任一面没咬住就红）", () => {
-  const r = spawnSync(process.execPath, [
-    fileURLToPath(new URL("../tools/claims/selfcheck-harness.mjs", import.meta.url)), rootDir,
-  ], { encoding: "utf8", cwd: rootDir });
+  const r = runProbe("tools/claims/selfcheck-harness.mjs", [rootDir], { cwd: rootDir });
   const out = (r.stdout || "") + (r.stderr || "");
   const faces = (out.match(/咬住 [✓✗]/g) || []).length;
   assert.equal(faces, 5, `只跑到 ${faces} 个面，预期 5 个：\n${out.split("\n").slice(-16).join("\n")}`);
@@ -675,4 +730,21 @@ test("被解析的文本里含分隔符：不许静默少读一行，也不许�
   assert.equal(sum.rows, 2, `含竖线的那行被漏掉了（rows=${sum.rows}）：\n${r.stdout}`);
   assert.equal(sum.stale, 2, "两行都对不上活锁，必须都点名");
   assert.equal(r.status, 11, "有越写者就该退 11");
+});
+
+// ============ 全机位口径：文档引用的每个可执行探针，套件里必须真 spawn 过它 ============
+// 上一批 board-race 的 `slice(3)` 把仓库路径吞掉、探针一跑就 ENOENT，而 `npm test` 121/121 全绿。
+// 根因不是断言不够严，是**套件与探针之间没有执行边**：所有用例都在读它的源码文本，
+// 全绿只证明"关于它的断言对"，不证明"它能跑"。文本核对天生看不见参数偏移这类错——它从没喂过参数。
+//
+// 这条断言用"真跑一次才登记"而不是"扫源码里有没有 spawn 字样"：后者会被注释、
+// 被 readFileSync 的字符串、被一条永不执行的分支骗过去。SPAWNED 只能由实际发生凑齐。
+// 顺序依赖：node:test 顶层用例按登记顺序执行，本条放在文件最末，前面五个探针都已真跑过。
+test("现场证据表点名的五个探针都被套件真 spawn 过（没有执行边就不许写'N/N 全绿'）", () => {
+  const missing = PROBE_ROWS.map(([rel]) => rel).filter((rel) => !SPAWNED.has(rel));
+  assert.deepEqual(missing, [],
+    `这几个探针只被"读文本"核对过、从没被 spawn 过一次：${missing.join("、")}。` +
+    "把它的烟雾用例补上（runProbe 一条即登记），否则对外那句'npm test 全绿'不成立。");
+  assert.equal(SPAWNED.size >= PROBE_ROWS.length, true,
+    `登记到 ${SPAWNED.size} 个 spawn，少于现场证据表的 ${PROBE_ROWS.length} 个：覆盖断言自身没被喂到`);
 });
