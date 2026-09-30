@@ -30,11 +30,53 @@ import { printSummary, crossCheck, HARNESS_EXIT } from "../../src/claims/summary
 // 这里声明了什么，README 就必须解释什么，且每个都真被某条出口用到。
 const EXIT_CODES = { foundLoss: 0, clean: 3, badUsage: 9, harness: HARNESS_EXIT };
 
-const ROOT = process.argv[2];
-const ROUNDS = parseInt(process.argv[3] ?? "20", 10);
-const INJECT = parseInt((process.argv.find((a) => a.startsWith("--inject=")) ?? "").split("=")[1], 10);
-const UNLOCKED = process.argv.includes("--unlocked");
+// 注意偏移：process.argv = [node, 脚本, 参数...]，必须 slice(2)。
+// 上一版这里写成 slice(3)，把仓库路径整个吞掉——`ROOT` 变成轮数，探针在 cpSync 里炸 ENOENT。
+const argv = process.argv.slice(2);
+const ROOT = argv[0];
+const ROUNDS = parseInt(argv[1] ?? "20", 10);
+const INJECT = parseInt((argv.find((a) => a.startsWith("--inject=")) ?? "").split("=")[1], 10);
+const UNLOCKED = argv.includes("--unlocked");
+// 参数必须逐个认得。上一版我把注入写成裸数字（`… 6 600 --unlocked`），
+// 探针一声不吭地按"不注入"跑了 12 轮 —— 那是最容易读成"改前也干净"的一种错法：
+// 命令看起来跑了、跑完了还退了非 0、只是量的根本不是同一件事。
+//
+// 判据只放**带前缀的开关**：位置 2 之后不认裸数字。
+// 曾经写成 `|| /^\d+$/.test(a)`，理由是"轮数也是数字"——但轮数在位置 1，位置 2 之后的数字
+// 只可能是"忘了写 --inject= 的那个注入值"，放它过去等于把本条注释描述的错法原样放行
+// （实测：`… 2 600` 退 3 报"干净"，注入根本没生效）。裸数字现在必撞 stray。
+const known = (a) => a.startsWith("--inject=") || a === "--unlocked" || a === "--detector-selftest-only";
+const stray = argv.slice(2).filter((a) => !known(a));
+if (stray.length) {
+  console.error(`!! 不认识的参数：${stray.join(" ")}（注入必须写成 --inject=<毫秒>）`);
+  console.error("   停下：被静默忽略的参数会让『跑过了』与『跑的是我以为的那件事』分不开。");
+  process.exit(EXIT_CODES.badUsage);
+}
 if (!ROOT) { console.error("用法：node tools/claims/board-race.mjs <仓库绝对路径> [轮数] [--inject=毫秒] [--unlocked]"); process.exit(EXIT_CODES.badUsage); }
+// ROOT 必须认得出是仓库。参数写反（`6 <路径>`）时旧版会在 cpSync 里炸一串 ENOENT 栈：
+// 那至少是响的，但"响得看不懂"与"静默跑错"对读的人是一样的下场，所以在入口就报清。
+if (!fs.existsSync(path.join(ROOT, "src", "cli.js"))) {
+  console.error(`!! ROOT 不像仓库：找不到 ${path.join(ROOT, "src", "cli.js")}`);
+  console.error("   参数顺序是 <仓库绝对路径> [轮数]，别把轮数写在第一位。");
+  process.exit(EXIT_CODES.badUsage);
+}
+// 轮数要么不写（默认 20），要么写成正整数；`parseInt` 会把 "6a" 读成 6、把 "--x" 读成 NaN，
+// 而 NaN 会让 crossCheck 的"样本数不齐"那道自洽校验**整条跳过**（Number.isFinite(expect) 为假）：
+// 那正好是"宽容解析把猎物抹掉"的形状，所以在校验入口就堵掉，不靠下游兜。
+if (argv[1] !== undefined && !/^[1-9]\d*$/.test(argv[1])) {
+  console.error(`!! 轮数必须是正整数（或整段不写走默认 20），收到 ${JSON.stringify(argv[1])}`);
+  process.exit(EXIT_CODES.badUsage);
+}
+// --inject= 要么不写，要么写成正整数毫秒。两种写坏在旧版里都会**静默降级**：
+//   `--inject=abc` → parseInt 得 NaN → 走"不注入"分支，而汇总行照样打印 `inject: 0`，
+//                   于是"没注入"和"注入值写坏了"共用同一个数，跑完退 3 报"干净"；
+//   `--inject=6o0` → parseInt 得 6 → 真的只注入 6ms（窗口 ~2ms，基本撞不上），报的却是 6。
+// 命令与现场对不上而对外看不出来，就是本轮通令要杀的形状。
+const injectRaw = (argv.find((a) => a.startsWith("--inject=")) ?? "").slice("--inject=".length);
+if (injectRaw && !/^[1-9]\d*$/.test(injectRaw)) {
+  console.error(`!! --inject= 必须是正整数毫秒，收到 ${JSON.stringify(injectRaw)}（不注入就整个开关别写）`);
+  process.exit(EXIT_CODES.badUsage);
+}
 if (UNLOCKED && !(Number.isInteger(INJECT) && INJECT > 0)) {
   // --unlocked 而不注入：窗口只有 ~2ms，很可能一轮都撞不上，于是"改前也干净"——
   // 那是一条会被读成"板级锁其实没必要"的假绿灯，比不跑更糟。
@@ -98,13 +140,18 @@ function countRow(board, f, w) {
   return board.split(/\r?\n/).filter((l) => l.includes(`| ${f} |`) && l.includes(`| ${w} |`)).length;
 }
 
-// 第二把尺子：按**令牌**数，而不是按"文件名 + 人"这两个格子数。
-// 为什么必须换一把：`reported` 与现场重算的 `raw` 若是同一个函数算出来的，它们一致只证明
-// "没人手滑改数"，证明不了"数得对"——countRow 的锚点一变（本项目真踩过：行尾被盖上
-// `<at=…>` 之后逐字匹配静默失配），两把同源尺子会一起错、一起报"干净"。
-// 令牌这一把的值来自 claim 的 stdout（不是从板子上读出来的），所以来源是独立的。
-function countToken(board, token) {
-  return board.split(/\r?\n/).filter((l) => l.includes(`<at=${token}>`)).length;
+// 第二把尺子：拿**每个进程自己打印的那行"落的那一行：…"**去板子上按整行找。
+// 为什么不用令牌数：claim 是先后两次独占创建，同一毫秒里两家的 `at` 可以完全相同
+// （本轮实测 `--unlocked` 就撞上过），那一刻令牌尺失去判别力；而且令牌仍是"从板子上读出来的东西"，
+// 与第一把尺子同源。claim 行是子进程 stdout，来源独立，且整行相等比对与格子切分无关。
+function claimOf(out) {
+  const m = /落的那一行：(.*)/.exec(String(out));
+  return m ? m[1].trim() : null;
+}
+
+function rowPresent(board, row) {
+  if (!row) return false;
+  return board.split(/\r?\n/).some((l) => l.trim() === row);
 }
 
 function detectorSelfTest() {
@@ -155,11 +202,24 @@ for (let r = 1; r <= ROUNDS; r++) {
   const n2 = countRow(board, "src/two.js", "workbuddy");
   const has1 = n1 === 1, has2 = n2 === 1;
   // 两把尺子必须同向；不同向就是测具在骗人，不是缺陷"没撞上"
-  if (ta === tb) { console.error(`第${r}轮：两家令牌相同（${ta}），第二把尺子失去独立性，停下`); process.exit(9); }
-  const t1 = countToken(board, ta), t2 = countToken(board, tb);
-  const agree = (t1 === 1 && t2 === 1) === (has1 && has2);
-  rows.push({ round: r, c1: r1.code, c2: r2.code, has1, has2, both: has1 && has2, n1, n2, agree });
-  console.log(`  第${String(r).padStart(2)}轮：退码 qoder=${r1.code} workbuddy=${r2.code}  one行数=${n1} two行数=${n2}  令牌尺=(${t1},${t2})  ${has1 && has2 ? "两行都在" : "★ 有一行整块丢了"}${agree ? "" : "  ✗两把尺子不同向"}`);
+  const c1 = claimOf(r1.out), c2 = claimOf(r2.out);
+  const applicable = r1.code === 0 && r2.code === 0;   // 两家都自称写成功，第二把尺子才有话说
+  // "第二把尺子读不出 claim 行" 绝不能和 "板上没有那一行" 长成一样。
+  // 上一版这里是静默的：claimOf 失配返 null ⇒ rowPresent 返 false ⇒ 尺子说"不在"，
+  // 而那一刻若格子尺也说"不在"（行真的被覆盖了），两把尺子"同向"、agree=true、一切照常退 0——
+  // 也就是说：把 claim 的输出格式改掉，测具不会变红，只会**少一把尺子**继续跑。
+  // 所以凡是"两家都退 0（尺子本该有话说）却读不到 claim 行"的轮，当场停下并打原文。
+  if (applicable && (!c1 || !c2)) {
+    console.error(`第${r}轮：两家都退 0 但读不到"落的那一行"（c1=${JSON.stringify(c1)} c2=${JSON.stringify(c2)}）。`);
+    console.error("  停下：这是『读不出』冒充『不存在』，第二把尺子已经不在场，本表的结论不成立。");
+    console.error(`  qoder 原文：\n${String(r1.out).split(/\r?\n/).slice(0, 12).map((l) => "    " + l).join("\n")}`);
+    console.error(`  workbuddy 原文：\n${String(r2.out).split(/\r?\n/).slice(0, 12).map((l) => "    " + l).join("\n")}`);
+    process.exit(EXIT_CODES.harness);
+  }
+  const p1 = rowPresent(board, c1), p2 = rowPresent(board, c2);
+  const agree = applicable ? ((p1 && p2) === (has1 && has2) && (p1 ? 1 : 0) + (p2 ? 1 : 0) === n1 + n2) : null;
+  rows.push({ round: r, c1: r1.code, c2: r2.code, has1, has2, both: has1 && has2, n1, n2, agree, applicable });
+  console.log(`  第${String(r).padStart(2)}轮：退码 qoder=${r1.code} workbuddy=${r2.code}  one行数=${n1} two行数=${n2}  claim尺=(${p1 ? "在" : "不在"},${p2 ? "在" : "不在"})  ${has1 && has2 ? "两行都在" : "★ 有一行整块丢了"}${agree === false ? "  ✗两把尺子不同向" : ""}`);
   fs.rmSync(dir, { recursive: true, force: true });
 }
 
@@ -179,14 +239,15 @@ console.log(`  **两家都自称写成功、板子上却只剩一行**的轮数�
 // 于是"临时把计数打印错但不改退码"这种改动必定被 crossCheck 抓到，两个方向都是。
 const raw = rows.filter((x) => !x.both).length;
 // 第二把尺子不同向 ⇒ 这份数不可信（不管它偏向"丢了"还是"没丢"）
-const mismatch = rows.filter((x) => !x.agree).length;
+const mismatch = rows.filter((x) => x.agree === false).length;
+const applicable = rows.filter((x) => x.applicable).length;
 const code = raw > 0 ? EXIT_CODES.foundLoss : EXIT_CODES.clean;
 const summary = {
   kind: "board-race", rounds: ROUNDS, measured: rows.length,
   lost: lost.length,
   bothZero: bothZero.length,
   inject: Number.isInteger(INJECT) ? INJECT : 0, unlocked: UNLOCKED ? 1 : 0,
-  rulerMismatch: mismatch,
+  rulerMismatch: mismatch, rulerApplicable: applicable,
   code, codes: [...new Set(Object.values(EXIT_CODES))],
 };
 printSummary(summary);

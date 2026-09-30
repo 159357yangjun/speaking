@@ -73,6 +73,16 @@ export function crossCheck(code, { reported, raw, expect, measured, badIsSuccess
   const bad = [];
   if (!Number.isFinite(code)) bad.push(`退出码不是数（${code}）`);
   if (!Number.isFinite(reported)) bad.push(`报出的 bad 不是数（${reported}）`);
+  // 这四道护栏**不能因为入参缺失就自动跳过**。上一版写的是
+  //   `if (Number.isFinite(raw) && raw !== reported)`、`if (Number.isFinite(expect) && …)`，
+  // 读起来像"没传就不管"，实际是：调用方漏一个字段 ⇒ 那条保护静默消失，而 crossCheck 仍返 null（=可信）。
+  // 隔壁仓同族的一课是"修完欠剥（假红）换过剥（假绿）"——这里是它的正镜像：欠检不报错、反而更绿。
+  // 五个调用方本来就四个数全传，所以把它们当**必需项**才是原意；缺数必须响。
+  if (!Number.isFinite(raw)) bad.push(`现场重算的 raw 不是数（${raw}）：没有第二个数可比，"对外报的数被手滑改掉"这一类没人管`);
+  else if (raw !== reported) bad.push(`报出的 bad=${reported} 与现场重算的 bad=${raw} 不一致：对外说的那个数不是判据用的那个数`);
+  if (!Number.isFinite(expect)) bad.push(`安排的样本数 expect 不是数（${expect}）：样本齐不齐这条整条跳过＝漏计不被发现`);
+  else if (!Number.isFinite(measured)) bad.push(`实测样本数 measured 不是数（${measured}）`);
+  else if (measured !== expect) bad.push(`样本数不齐：安排 ${expect}，实测到 ${measured}`);
   if (bad.length) return bad.join("；");
   if (badIsSuccess) {
     // 探针：0 必须伴随 bad>0；非 0（除 harness 通道）必须伴随 bad=0
@@ -81,14 +91,6 @@ export function crossCheck(code, { reported, raw, expect, measured, badIsSuccess
   } else {
     if (code === 0 && reported > 0) return `退 0 却报 bad=${reported}：状态说没事发生、计数说有 ⇒ 判读器不能只信一边`;
     if (code !== 0 && code !== HARNESS_EXIT && reported === 0) return `退 ${code} 但报 bad=0：状态说有事发生、计数说没有 ⇒ 多半是崩在打印之前`;
-  }
-  // 对外报的数必须等于现场重算的数（抓"临时把计数打印错"这一类）
-  if (Number.isFinite(raw) && raw !== reported) {
-    return `报出的 bad=${reported} 与现场重算的 bad=${raw} 不一致：对外说的那个数不是判据用的那个数`;
-  }
-  // 样本必须齐（少一份就是有一段没被量到，那种表不能写进 README）
-  if (Number.isFinite(expect) && measured !== expect) {
-    return `样本数不齐：安排 ${expect}，实测到 ${measured}`;
   }
   return null;
 }

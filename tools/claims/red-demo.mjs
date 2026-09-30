@@ -209,7 +209,7 @@ const MUT = [
     name: "M27 README 的测试总数与分项对不上代码",
     file: README,
     suite: "test/docs-drift.test.js",
-    pairs: [["测试总数 **121**（protocol 20 · claims 55", "测试总数 **116**（protocol 20 · claims 55"]],
+    pairs: [["测试总数 **122**（protocol 20 · claims 55", "测试总数 **116**（protocol 20 · claims 55"]],
     test: "测试计数",
   },
   {
@@ -304,7 +304,7 @@ const MUT = [
   {
     name: "M40 双向印证不看\"打印的数 vs 现场重算的数\"",
     file: SUM,
-    pairs: [["  if (Number.isFinite(raw) && raw !== reported) {", "  if (false && raw !== reported) {"]],
+    pairs: [["  else if (raw !== reported) bad.push(", "  else if (false) bad.push("]],
     test: "双向印证",
     suite: "test/docs-drift.test.js",
   },
@@ -343,7 +343,8 @@ const MUT = [
   {
     name: "M46 第二把尺子被改成『永远同向』（同源两数一起错时没人发现）",
     file: BR,
-    pairs: [["  const agree = (t1 === 1 && t2 === 1) === (has1 && has2);", "  const agree = true;   // 变异：尺子二变成常数"]],
+    pairs: [["const mismatch = rows.filter((x) => x.agree === false).length;",
+             "const mismatch = 0;   // 变异：第二把尺子的结论被丢掉"]],
     test: "五面自证",
     suite: "test/docs-drift.test.js",
   },
@@ -352,6 +353,54 @@ const MUT = [
     file: SUM,
     pairs: [["  if (hits.length > 1) {", "  if (false) {"]],
     test: "五面自证",
+    suite: "test/docs-drift.test.js",
+  },
+  // ↓ 这一组是"探针自己把命令读错"一族。起因是本轮真实踩中的 slice(3)：
+  //   仓库路径被吞、探针炸 ENOENT，而 npm test 121/121 全绿——因为没人真的跑过它。
+  {
+    name: "M48 探针入参偏移（slice(2)→slice(3)，仓库路径整个被吞掉）",
+    file: BR,
+    pairs: [["const argv = process.argv.slice(2);", "const argv = process.argv.slice(3);   // 变异：本轮真写过的一版"]],
+    test: "探针必须真被跑起来",
+    suite: "test/docs-drift.test.js",
+  },
+  {
+    name: "M49 参数白名单重新放行裸数字（漏写 --inject= 前缀又被静默忽略）",
+    file: BR,
+    pairs: [['const known = (a) => a.startsWith("--inject=") || a === "--unlocked" || a === "--detector-selftest-only";',
+             'const known = (a) => a.startsWith("--inject=") || a === "--unlocked" || /^\\d+$/.test(a);   // 变异']],
+    test: "探针必须真被跑起来",
+    suite: "test/docs-drift.test.js",
+  },
+  {
+    name: "M50 注入值写坏不再拦（--inject=abc 退化成『没注入』、还照样打印 inject:0）",
+    file: BR,
+    pairs: [["if (injectRaw && !/^[1-9]\\d*$/.test(injectRaw)) {", "if (false) {"]],
+    test: "探针必须真被跑起来",
+    suite: "test/docs-drift.test.js",
+  },
+  {
+    name: "M51 摘掉『ROOT 必须像仓库』（参数写反时只剩一串 cpSync 的 ENOENT 栈）",
+    file: BR,
+    pairs: [['if (!fs.existsSync(path.join(ROOT, "src", "cli.js"))) {', "if (false) {"]],
+    test: "探针必须真被跑起来",
+    suite: "test/docs-drift.test.js",
+  },
+  {
+    name: "M52 护栏因入参缺失静默跳过：漏传 raw 时 crossCheck 仍返『可信』",
+    file: SUM,
+    pairs: [["  if (!Number.isFinite(raw)) bad.push(", "  if (false) bad.push("],
+            ["  else if (raw !== reported) bad.push(", "  else if (false) bad.push("]],
+    test: "双向印证",
+    suite: "test/docs-drift.test.js",
+  },
+  {
+    name: "M53 样本齐不齐那道护栏因漏传 expect 而整条跳过",
+    file: SUM,
+    pairs: [["  if (!Number.isFinite(expect)) bad.push(", "  if (false) bad.push("],
+            ["  else if (!Number.isFinite(measured)) bad.push(", "  else if (false) bad.push("],
+            ["  else if (measured !== expect) bad.push(", "  else if (false) bad.push("]],
+    test: "双向印证",
     suite: "test/docs-drift.test.js",
   },
 ];

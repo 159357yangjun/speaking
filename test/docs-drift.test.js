@@ -7,6 +7,9 @@ import { spawnSync } from "node:child_process";
 import { fileURLToPath } from "node:url";
 import path from "node:path";
 import { digestOf } from "../src/proto/envelope.js";
+// 计数行的判读函数与打印函数同处定义（src/claims/summary.js）。
+// 这里**直接 import 它**而不是正则读它：文档说"汇总行能被读到"，就得用真的判读器验一遍。
+import { parseSummary } from "../src/claims/summary.js";
 
 const SIGNING_DOC = new URL("../docs/specs/03-signing.md", import.meta.url);
 const SCHEMA = new URL("../proto/envelope.schema.json", import.meta.url);
@@ -332,6 +335,51 @@ test("README 引用的探针与夹具必须真实存在，且写明的参数、�
   }
 });
 
+// 上一条用例只**读文本**核对锚点，它挡不住"参数偏移"：本轮 board-race 把
+// `process.argv.slice(2)` 写成 slice(3)，仓库路径被整个吞掉，探针在 cpSync 里炸 ENOENT，
+// 而 `npm test` 121/121 全绿——因为没有任何一条用例子进程真的跑过它。
+// 文档里写着"这一列能用这条命令重跑"，就必须有人把那条命令真跑一遍。
+test("探针必须真被跑起来：board-race 的入参契约与两条对照列都由现跑核对", () => {
+  const ROOT = path.resolve(fileURLToPath(import.meta.url), "../..");
+  const PROBE = path.join(ROOT, "tools", "claims", "board-race.mjs");
+  const run = (args) => spawnSync(process.execPath, [PROBE, ...args], { encoding: "utf8", timeout: 180000 });
+
+  // 这几类写错的命令：必须在入口就响，而且**要响在该响的那一处**——
+  // 只断言"退了 9"是不够的：摘掉 ROOT 那道护栏后，同一个错误会一路走到 spawn 一个不存在的
+  // cli.js，最后由"没拿到令牌"替它报 9（M51 实测就是这么绿的）。退码对、归因错，
+  // 读的人照样会去查错的地方，所以每条都钉它自己的那句话。
+  const wrong = [
+    [["3", ROOT], "参数顺序写反（轮数占了仓库路径的位置）", /不像仓库/],
+    [["5"], "第一个参数根本不是仓库", /不像仓库/],
+    [[ROOT, "2", "600"], "注入值漏写 --inject= 前缀（裸数字）", /不认识的参数/],
+    [[ROOT, "3x"], "轮数不是正整数", /轮数必须是正整数/],
+    [[ROOT, "2", "--inject=abc"], "注入值写坏（旧版静默当成『没注入』并照样打印 inject:0）", /--inject= 必须是正整数/],
+    [[ROOT, "2", "--inject=600", "--unlocked", "--typo=1"], "多出不认识的开关", /不认识的参数/],
+  ];
+  for (const [args, why, msg] of wrong) {
+    const r = run(args);
+    assert.equal(r.status, 9, `${why}：期望退 9（用法错），实际退 ${r.status}\n--- stdout\n${r.stdout}\n--- stderr\n${r.stderr}`);
+    assert.match(r.stderr, msg, `${why}：退了 9，但那句话不是这一类的归因`);
+  }
+
+  const need = ["rounds", "measured", "lost", "rulerMismatch", "rulerApplicable", "code"];
+  // 改后那一列：板级锁在，3 轮都不许丢行
+  const after = run([ROOT, "3", "--inject=600"]);
+  assert.equal(after.status, 3, `带板级锁的对照应退 3（干净），实际退 ${after.status}\n${after.stdout}\n${after.stderr}`);
+  const s1 = parseSummary(after.stdout, "board-race", need);
+  assert.equal(s1.measured, 3, "实测轮数必须等于安排的轮数");
+  assert.equal(s1.lost, 0, `板级锁在却丢了 ${s1.lost} 行：README 那句"改后 0/6"就是假的`);
+  assert.equal(s1.rulerApplicable, 3, "第二把尺子一轮都没说话，等于这张表只有一把尺子");
+  assert.equal(s1.rulerMismatch, 0, "两把尺子不同向：这份表不可信");
+  // 改前那一列：拆掉板级锁 + 注入 600ms，必须**当场抓到丢行**（退 0 才是好消息）
+  const before = run([ROOT, "3", "--inject=600", "--unlocked"]);
+  assert.equal(before.status, 0, `拆掉板级锁后仍退 ${before.status}（= 没撞出缺陷）：README 的"改前"一列不可重跑\n${before.stdout}\n${before.stderr}`);
+  const s2 = parseSummary(before.stdout, "board-race", need);
+  assert.ok(s2.lost > 0, `改前形状必须抓到丢行，实际 lost=${s2.lost}`);
+  assert.equal(s2.rulerMismatch, 0, "改前那列两把尺子不同向：这张对照表不可用");
+  assert.equal(s2.unlocked, 1, "汇总行没记 unlocked：读的人分不出这是改前还是改后");
+});
+
 test("README 写的板锁 TTL 与代码常量一致（数字抄错=文档说谎）", () => {
   const md = readFileSync(README, "utf8");
   const src = readFileSync(new URL("../src/claims/lock.js", import.meta.url), "utf8");
@@ -339,6 +387,18 @@ test("README 写的板锁 TTL 与代码常量一致（数字抄错=文档说谎�
   assert.ok(n, "代码里没有 BOARD_LOCK_TTL_S 常量，README 那句'5s'没有真源");
   assert.ok(md.includes(`BOARD_LOCK_TTL_S = ${n}`),
     `代码里板锁 TTL 是 ${n}s，README 写的不是这个数——回收窗口对外承诺就错了`);
+});
+
+test("README 写的变异条数必须等于 red-demo 的条目数（两处数字不许各飘各的）", () => {
+  // 上一段刚把 46 改成 52，而 README 那句"锁这组 46 处变异"是手抄的：
+  // 测试计数有断言钉，变异条数没有——同一族漂移只是还没被抓到而已。
+  const demo = readFileSync(new URL("../tools/claims/red-demo.mjs", import.meta.url), "utf8");
+  assert.ok(/^const MUT = \[/m.test(demo), "red-demo 里找不到 `const MUT = [`：这条断言失去真源，先去修它");
+  const n = (demo.match(/^    name: "M\d+/gm) || []).length;
+  assert.ok(n >= 40, `只从 MUT 数出 ${n} 条变异，少得可疑——是判据读错了形状，不是真少了那么多条`);
+  const md = readFileSync(README, "utf8");
+  assert.ok(md.includes(`${n} 处变异`),
+    `README 写的变异条数不是 ${n}：加/撤变异时没同步文档，那句"逐条打红"就没有可核对的分母`);
 });
 
 test("README 的测试计数必须等于各套件 test( 的行数之和", () => {
@@ -472,6 +532,16 @@ test("双向印证：退 0 但 bad>0 与 退非 0 但 bad=0 两面都判测具�
   // ③报出去的数 ≠ 现场重算的数 / 样本不齐：两种"计数在骗人"都要咬
   assert.match(crossCheck(8, { reported: 1, raw: 3, expect: 3, measured: 3 }), /bad=1 与现场重算的 bad=3/);
   assert.match(crossCheck(0, { reported: 0, raw: 0, expect: 12, measured: 11 }), /样本数不齐：安排 12，实测到 11/);
+  // ④护栏**不能因为入参缺失就自动跳过**。旧写法是 `if (Number.isFinite(raw) && raw !== reported)`：
+  // 调用方漏一个字段 ⇒ 那条比对整条静默失效 ⇒ crossCheck 仍返 null（=可信）。
+  // 隔壁仓那一课是"修完欠剥（假红）换过剥（假绿）"，这里是同一族：欠检不报错、反而更绿。
+  assert.equal(typeof crossCheck(0, { reported: 0, expect: 3, measured: 3 }), "string",
+    "漏传 raw 必须判不可信：没有第二个数可比，『对外报的数被手滑改掉』这一类就没人管了");
+  assert.match(crossCheck(0, { reported: 0, expect: 3, measured: 3 }), /raw 不是数/);
+  const b2 = crossCheck(0, { reported: 0, raw: 0, measured: 3 });
+  assert.equal(typeof b2, "string",
+    "漏传 expect 必须判不可信：『样本齐不齐』这条不能因为没人传就整条跳过");
+  assert.match(b2, /expect 不是数/);
 });
 
 // ============ 计数定义的"单一出处"：谁都不许再自己写一份判读正则 ============
