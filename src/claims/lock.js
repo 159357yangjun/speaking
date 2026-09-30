@@ -21,6 +21,8 @@ export const EXIT = {
   DIRTY_LOCK: 8,    // 锁文件内容不可解析（截断/空/非 JSON），且还没躺够回收上界
   RENEW_FAILED: 9,  // 续期失败：锁在"我读到它"和"我动手改它"之间已被他人拿走
   LOCK_IO: 10,      // 文件系统层面的失败：频道目录被删/只读/不可写。不是协议结论，是环境问题
+  STALE_BOARD_ROW: 11,  // audit：板上有行声称持锁、盘上已无对应活锁。**只报不拒**
+  BOARD_BUSY: 12,       // board：这张板正被另一个进程重写，等满上界仍未轮到（可重试）
 };
 
 // 不可解析锁的回收上界（秒）。这类锁没有 TTL 可读，只能拿文件 mtime 当钟。
@@ -414,22 +416,107 @@ export function verifyHold({ claimsDir, file, who, at }) {
   return { status: "held", code: EXIT.OK, file, path: p, holder: who, at: cur.at };
 }
 
+// ---- 板级锁 ----
+// 为什么还要第二把锁：`board` 复验的是**自己那把文件锁**，可它落盘是"读整张板 → 改 → 写回整张板"。
+// 两个各自合法持锁的进程（不同文件、不同的人）可以同时复验通过，然后先后 rename 同一张板——
+// 后写的那一次把前一个人的行**整块抹掉**，而两个人都拿到退码 0。
+// 实测（tools/claims/board-race.mjs --inject=600，6 轮）：两行都在 0/6，
+// "都自称成功、板上只剩一行" 6/6。这就是本项目最初那个 5/5 丢失更新，被我原地复制了一份。
+// 所以：文件锁管"谁可以改这个文件"，板级锁管"谁此刻可以重写这张板"——两件事，两把锁。
+export const BOARD_LOCK = "__board__";
+export const BOARD_LOCK_TTL_S = 10;
+export const BOARD_WAIT_MS = 2000;
+const BOARD_POLL_MS = 20;
+
+const sleepMs = (ms) => Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+
+// 令牌写进**已有单元格内部**，不新增列：板的列数是对话层在读的，动列数等于动契约。
+export function stampToken(row, at) {
+  const trimmed = row.replace(/\s+$/, "");
+  if (!trimmed.endsWith("|")) return `${trimmed} <at=${at}> |`;
+  const body = trimmed.slice(0, -1).trimEnd();
+  if (/<at=\d+>/.test(body)) return `${trimmed}`;
+  return `${body} <at=${at}> |`;
+}
+
 /**
- * 在锁的保护下写板：先复验归属，**过不了就一个字节都不写**。
- * 这把"拿到锁才写板"从一句约定变成一条能测的性质：写板与归属判定在同一个调用里，
- * 中间不给调用方留伸手的时间。落盘用 .part → rename（与消息封帧同一个边界）。
+ * 在锁的保护下写板：**复验归属 → 拿板级锁 → 复验一次 → 落盘**，过不了就一个字节都不写。
+ * 复验要跑两次，是因为等板级锁的那几毫秒里自己的文件锁照样可能被抢走；
+ * 只在入口验一次，等于把"我以为我拿着"从写板前挪到了写板前前一瞬。
  */
-export function writeBoard({ claimsDir, boardPath, file, who, at, row }) {
-  const held = verifyHold({ claimsDir, file, who, at });
-  if (held.status !== "held") return { ...held, wrote: false };
-  const before = fs.existsSync(boardPath) ? fs.readFileSync(boardPath, "utf8") : "";
-  const body = before.includes(row.trimEnd() + "\n") || before.trimEnd().endsWith(row.trimEnd())
-    ? before                                   // 幂等：同一行重复写不产生第二行
-    : before + (before.endsWith("\n") || before === "" ? "" : "\n") + row + "\n";
-  const part = `${boardPath}.part-${process.pid}`;
-  fs.writeFileSync(part, body);
-  fs.renameSync(part, boardPath);             // rename 是原子边界，读者不会看到半截板
-  return { status: "written", code: EXIT.OK, file, path: lockPath(claimsDir, file), wrote: true, at: held.at };
+export function writeBoard({ claimsDir, boardPath, file, who, at, row, waitMs = BOARD_WAIT_MS }) {
+  // waitMs 必须是有限非负数：`--wait=abc` 会 parse 成 NaN，而 `Date.now() >= NaN` 永远为 false，
+  // 排队循环就再也没有退出条件——一个拼错的参数变成挂死。
+  const budget = Number.isFinite(waitMs) && waitMs >= 0 ? waitMs : BOARD_WAIT_MS;
+  const held0 = verifyHold({ claimsDir, file, who, at });
+  if (held0.status !== "held") return { ...held0, wrote: false };
+
+  // 板级锁的持有者要带上 pid：同一个 agent 的两个进程必须互相排斥。
+  // 用裸 who 的话第二个进程会走到"同持有者→续期"分支，把并发当成自己的重复调用。
+  const boardWho = `${who}#${process.pid}`;
+  const deadline = Date.now() + budget;
+  let b = null;
+  for (;;) {
+    b = acquire({ claimsDir, file: BOARD_LOCK, who: boardWho, ttl: BOARD_LOCK_TTL_S });
+    if (b.status === "acquired" || b.status === "stolen") break;
+    if (Date.now() >= deadline) {
+      return { status: "board-busy", code: EXIT.BOARD_BUSY, file, wrote: false, path: lockPath(claimsDir, BOARD_LOCK),
+        holder: b.holder, reason: `这张板正被别人重写（${b.holder} 持板级锁 ${b.ageS?.toFixed?.(1) ?? "?"}s），等满 ${budget}ms 仍未轮到` };
+    }
+    sleepMs(BOARD_POLL_MS);
+  }
+  try {
+    const held = verifyHold({ claimsDir, file, who, at });   // 拿到板级锁后再验一次
+    if (held.status !== "held") return { ...held, wrote: false, boardLockHeldBy: boardWho };
+    const before = fs.existsSync(boardPath) ? fs.readFileSync(boardPath, "utf8") : "";
+    const stamped = stampToken(row, held.at);
+    const body = before.includes(stamped + "\n") || before.trimEnd().endsWith(stamped)
+      ? before                                   // 幂等：同一行重复写不产生第二行
+      : before + (before.endsWith("\n") || before === "" ? "" : "\n") + stamped + "\n";
+    const part = `${boardPath}.part-${process.pid}`;
+    fs.writeFileSync(part, body);
+    fs.renameSync(part, boardPath);             // rename 是原子边界，读者不会看到半截板
+    return { status: "written", code: EXIT.OK, file, path: lockPath(claimsDir, file),
+      wrote: true, at: held.at, row: stamped };
+  } finally {
+    release({ claimsDir, file: BOARD_LOCK, who: boardWho });
+  }
+}
+
+/**
+ * 检测：板上哪些行声称自己持锁、盘上却没有对应的活锁。
+ * **只报不拒**——拒写就要改信封（把令牌纳入签名域），那是跳客户端的契约变更，本轮不做。
+ */
+export function auditBoard({ claimsDir, boardPath }) {
+  // 活锁索引要带**文件名**：只比 who+at 的话，A 在 src/x.js 上的化身会被 src/y.js 的行对上，
+  // 越写者就漏报了。三个字段一起才是"这一行声称的那把锁"。
+  const liveKeys = new Set();
+  if (fs.existsSync(claimsDir)) {
+    for (const f of fs.readdirSync(claimsDir).filter((n) => n.endsWith(".lock"))) {
+      const c = readLock(path.join(claimsDir, f));
+      if (c && !c.corrupt) {
+        const logical = f.replace(/\.lock$/, "").replace(/_/g, "/");
+        liveKeys.add(`${logical}|${c.who}|${c.at}`);
+        liveKeys.add(`${f.replace(/\.lock$/, "")}|${c.who}|${c.at}`);   // 两种写法都认
+      }
+    }
+  }
+  const text = fs.existsSync(boardPath) ? fs.readFileSync(boardPath, "utf8") : "";
+  const stale = [], untagged = [];
+  let total = 0;
+  for (const line of text.split(/\r?\n/)) {
+    if (!/^\s*\|/.test(line)) continue;
+    if (/^\s*\|[-\s|:]+\|\s*$/.test(line)) continue;          // 表格分隔行
+    if (!/\|\s*$/.test(line.trimEnd())) continue;
+    const cols = line.split("|").map((s) => s.trim()).filter(Boolean);
+    if (cols.length < 2) continue;                            // 表头/残缺行不参与判定
+    total++;
+    const m = /<at=(\d+)>/.exec(line);
+    if (!m) { untagged.push(line.trim()); continue; }
+    const [fileCol, whoCol] = cols;
+    if (!liveKeys.has(`${fileCol}|${whoCol}|${m[1]}`)) stale.push({ row: line.trim(), who: whoCol, file: fileCol, at: m[1] });
+  }
+  return { stale, untagged, total };
 }
 
 /**

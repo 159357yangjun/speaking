@@ -472,7 +472,10 @@ test("renewed 之后被合法抢占，board 必须拒写并且板子一个字节
     `--board=${bd}`, "--row=| src/b.js | other | now |"]);
   assert.equal(ok.code, 0, ok.out + ok.err);
   const after = fs.readFileSync(bd, "utf8");
-  assert.match(after, /\| src\/b\.js \| other \| now \|/);
+  // 行尾被 board 盖了化身令牌（`| src/b.js | other | now <at=..> |`），
+  // 逐字匹配 `| now |` 的断言会因为多了一个字段而静默失效——按前缀匹配，并单独验令牌。
+  assert.match(after, /\| src\/b\.js \| other \| now\b/);
+  assert.match(after, /other \| now <at=\d+> \|/, "令牌没盖进已有单元格（它得在不改列数的前提下可被 audit 读到）");
   assert.doesNotMatch(after, /\| src\/b\.js \| owner \|/, "丢锁一方的行留在了板上 = 双重声明");
 });
 
@@ -501,4 +504,102 @@ test("board 不许在没有令牌时放行（否则 CAS 写板退化成裸 appen
     `--board=${bd}`, "--row=| src/n.js | qoder | now |"]);
   assert.equal(wrongArg.code, 5, `乱给令牌应该退 5，实退 ${wrongArg.code}：\n${wrongArg.out}${wrongArg.err}`);
   assert.ok(!fs.existsSync(bd), "令牌被拒却还是落了盘");
+});
+
+// ============ 板级锁：两个各自合法持锁的人不得互相抹行 ============
+test("board 拿不到板级锁时退 12（可重试），且不动板子", async () => {
+  const d = mkChannel();
+  const bd = path.join(d, "PROGRESS.md");
+  fs.writeFileSync(bd, "# 进度板\n");
+  const before = fs.readFileSync(bd, "utf8");
+  const a = await claim(d, ["--file=src/q.js", "--who=qoder", "--ttl=600"]);
+  const token = /--at=(\d+)/.exec(a.out)[1];
+  // 别人正持有这张板（__board__.lock 由另一家的 pid 命名）
+  fs.mkdirSync(path.join(d, "claims"), { recursive: true });
+  fs.writeFileSync(path.join(d, "claims", "__board__.lock"),
+    JSON.stringify({ who: "workbuddy#99999", at: Date.now(), ttl: 600 }));
+  const r = await board(d, ["--file=src/q.js", "--who=qoder", "--at=" + token, `--board=${bd}`,
+    "--row=| src/q.js | qoder | now |", "--wait=300"]);
+  assert.equal(r.code, 12, `该退 12（板级排队超时），实退 ${r.code}：\n${r.out}${r.err}`);
+  assert.match(r.out + r.err, /可以重试/, "退码 12 必须和 9 分清：这是没排到队，不是丢了归属");
+  assert.equal(fs.readFileSync(bd, "utf8"), before, "排队超时却动了板子");
+});
+
+test("board 写的行里带化身令牌，且不改表的列数", async () => {
+  const d = mkChannel();
+  const bd = path.join(d, "PROGRESS.md");
+  const a = await claim(d, ["--file=src/t.js", "--who=qoder", "--ttl=600"]);
+  const token = /--at=(\d+)/.exec(a.out)[1];
+  const r = await board(d, ["--file=src/t.js", "--who=qoder", "--at=" + token, `--board=${bd}`,
+    "--row=| src/t.js | qoder | now |"]);
+  assert.equal(r.code, 0, r.out + r.err);
+  const line = fs.readFileSync(bd, "utf8").split("\n").find((l) => l.includes("src/t.js"));
+  assert.ok(line.includes(`<at=${token}>`), `行里没带化身令牌，检测无从下手：${line}`);
+  assert.equal(line.split("|").length - 2, 3, `令牌不该新增一列（列数是对话层在读的东西）：${line}`);
+});
+
+// ============ 检测：只报不拒 ============
+function audit(d, args) { return run(CLI, ["audit", `--channel=${d}`, ...args]); }
+
+test("伪造一行、其化身盘上没有活锁 —— audit 必须报出来（退码 11）", async () => {
+  const d = mkChannel();
+  const bd = path.join(d, "PROGRESS.md");
+  const a = await claim(d, ["--file=src/real.js", "--who=qoder", "--ttl=600"]);
+  const token = /--at=(\d+)/.exec(a.out)[1];
+  await board(d, ["--file=src/real.js", "--who=qoder", "--at=" + token, `--board=${bd}`,
+    "--row=| src/real.js | qoder | now |"]);
+  // 手写的越写者行：名字像真的、化身是编的
+  fs.appendFileSync(bd, "| src/fake.js | workbuddy | now <at=1234567890123> |\n");
+  // 不经 board 写上去的行：没令牌，锁管不到它——也必须被点名
+  fs.appendFileSync(bd, "| src/notoken.js | someone | now |\n");
+
+  const r = await audit(d, [`--board=${bd}`]);
+  assert.equal(r.code, 11, `该退 11（板上有越写者），实退 ${r.code}：\n${r.out}${r.err}`);
+  assert.match(r.out, /src\/fake\.js/, "伪造行没被点名");
+  assert.match(r.out, /无令牌行/, "不经 board 写的行必须被点成'锁管不到它'，而不是当成干净");
+  // 合法行压根不该出现在输出里——出现了就是误报。
+  // （上一版我写成 assert.match(r.out, /src\/real\.js/)，把"没被点名"判成失败，方向反了。）
+  assert.doesNotMatch(r.out, /越写者：\| src\/real\.js/, "合法行被误报成越写者");
+  assert.doesNotMatch(r.out, /无令牌行.*src\/real\.js/, "合法行被误报成无令牌行");
+});
+
+test("--wait 不是摆设：把它传成非数字也不许挂死", async () => {
+  // `--wait=abc` → parseInt → NaN → `Date.now() >= NaN` 永假 → 排队循环没有退出条件。
+  // 一个拼错的参数不该变成挂死，所以这条专门钉：给定非法值也必须在上界内返回。
+  const d = mkChannel();
+  const bd = path.join(d, "PROGRESS.md");
+  fs.writeFileSync(bd, "# 进度板\n");
+  const a = await claim(d, ["--file=src/w2.js", "--who=qoder", "--ttl=600"]);
+  const token = /--at=(\d+)/.exec(a.out)[1];
+  fs.mkdirSync(path.join(d, "claims"), { recursive: true });
+  fs.writeFileSync(path.join(d, "claims", "__board__.lock"),
+    JSON.stringify({ who: "workbuddy#99998", at: Date.now(), ttl: 600 }));
+  const t0 = Date.now();
+  const r = await board(d, ["--file=src/w2.js", "--who=qoder", "--at=" + token, `--board=${bd}`,
+    "--row=| src/w2.js | qoder | now |", "--wait=abc"]);
+  const took = Date.now() - t0;
+  assert.equal(r.code, 12, `非法 --wait 该走上界返回 12，实退 ${r.code}：\n${r.out}${r.err}`);
+  assert.ok(took < 8000, `非法参数后等了 ${took}ms，疑似没有退出条件`);
+});
+
+test("audit 只报不拒：报出没改板子一个字节", async () => {
+  const d = mkChannel();
+  const bd = path.join(d, "PROGRESS.md");
+  fs.writeFileSync(bd, "# 进度板\n| src/x.js | ghost | now <at=1> |\n");
+  const before = fs.readFileSync(bd, "utf8");
+  const r = await audit(d, [`--board=${bd}`]);
+  assert.equal(r.code, 11, r.out + r.err);
+  assert.equal(fs.readFileSync(bd, "utf8"), before, "audit 说了'只报不拒'，却动了板子");
+});
+
+test("板全干净时 audit 退 0（否则'没问题'和'没检查'分不开）", async () => {
+  const d = mkChannel();
+  const bd = path.join(d, "PROGRESS.md");
+  const a = await claim(d, ["--file=src/clean.js", "--who=qoder", "--ttl=600"]);
+  const token = /--at=(\d+)/.exec(a.out)[1];
+  await board(d, ["--file=src/clean.js", "--who=qoder", "--at=" + token, `--board=${bd}`,
+    "--row=| src/clean.js | qoder | now |"]);
+  const r = await audit(d, [`--board=${bd}`]);
+  assert.equal(r.code, 0, `干净板子应该退 0：\n${r.out}${r.err}`);
+  assert.match(r.out, /每一行都对得上活锁/);
 });

@@ -132,7 +132,11 @@ const MUT = [
   {
     name: "M18 board 跳过归属复验（写板退回裸 append）",
     file: LOCK,
-    pairs: [['  if (held.status !== "held") return { ...held, wrote: false };', "  if (false) return { ...held, wrote: false };"]],
+    // 两次复验都得拆：writeBoard 现在有入口 + 拿到板级锁之后两道。
+    // 只拆一道它仍会被另一道拦住——那种"摘一层不红"不等于另一层是多余的，
+    // 但作为变异演示，它必须整体拆掉才算测到了"复验这件事本身"。
+    pairs: [['  if (held0.status !== "held") return { ...held0, wrote: false };', "  if (false) return { ...held0, wrote: false };"],
+            ['    if (held.status !== "held") return { ...held, wrote: false, boardLockHeldBy: boardWho };', "    if (false) return { ...held, wrote: false, boardLockHeldBy: boardWho };"]],
     test: "board 必须拒写",
   },
   {
@@ -146,6 +150,20 @@ const MUT = [
     file: LOCK,
     pairs: [["if (at !== undefined && at !== null && String(cur.at) !== String(at)) {", "if (false) {"]],
     test: "没有令牌时放行",
+  },
+  {
+    name: "M21 拆掉板级锁（board 只验自己的文件锁就重写整张板）",
+    file: LOCK,
+    pairs: [['    if (b.status === "acquired" || b.status === "stolen") break;',
+             '    if (true) break;   // 变异：不排队，直接读整张板再写回去']],
+    test: "板级锁时退 12",
+  },
+  {
+    name: "M22 audit 只看不报（越写者被算成干净）",
+    file: LOCK,
+    pairs: [["if (!liveKeys.has(`${fileCol}|${whoCol}|${m[1]}`)) stale.push({ row: line.trim(), who: whoCol, file: fileCol, at: m[1] });",
+             "void liveKeys; void whoCol; void fileCol;"]],
+    test: "伪造一行",
   },
 ];
 

@@ -3,7 +3,7 @@ import { readFileSync, writeFileSync, existsSync, readdirSync, mkdirSync, rename
 import { join, resolve, sep } from "node:path";
 import { loadRoster, keyringOf } from "./proto/roster.js";
 import { seal, verifyEnvelope, msgFileName, newNonce } from "./proto/envelope.js";
-import { acquire, release, list, noteWait, verifyHold, writeBoard, EXIT } from "./claims/lock.js";
+import { acquire, release, list, noteWait, verifyHold, writeBoard, auditBoard, EXIT } from "./claims/lock.js";
 
 const args = process.argv.slice(2);
 const cmd = args[0];
@@ -280,7 +280,15 @@ if (cmd === "board") {
   const at = needArg(opt.at, "at=<claim 打出的化身令牌>");
   const boardPath = needArg(opt.board, "board=<PROGRESS.md 路径>");
   const row = needArg(opt.row, "row=<要写的那一行>");
-  const r = lockOp(writeBoard, { claimsDir: CLAIMS, boardPath, file, who, at, row });
+  // --wait 必须真接进去：测试传了它而代码不读，等于留了一个静默失效的开关
+  const waitMs = opt.wait === undefined ? undefined : parseInt(opt.wait, 10);
+  const r = lockOp(writeBoard, { claimsDir: CLAIMS, boardPath, file, who, at, row, waitMs });
+  if (r.status === "board-busy") {
+    // 这一支**可以重试**（和 9 正好相反）：不是归属丢了，是没排到写板的队。
+    console.log(`✗ 板级排队超时（exit ${r.code}）：${file} —— ${r.reason}`);
+    console.log("  这一条可以重试；不用重新 claim，归属没变。");
+    process.exit(r.code);
+  }
   if (r.wrote !== true) {
     // 没过复验就一个字节都不写。这一支不产生任何可以被当成"可以继续"的输出。
     console.log(`✗ 写板被拒（exit ${r.code}）：${file} —— ${r.reason ?? "归属复验未通过"}`);
@@ -288,7 +296,22 @@ if (cmd === "board") {
     process.exit(r.code);
   }
   console.log(`✓ 已写板 ${boardPath}：${file} → ${who}（写前复验通过，化身 ${r.at}）`);
+  console.log(`  落的那一行：${r.row}`);
   process.exit(EXIT.OK);
+}
+
+// 一条命令看出"这块板子上有没有越写者"：板上的行声称持锁，盘上却没有对应的活锁。
+// **只报不拒**——要拒就得把令牌纳入签名域，那是跳客户端的契约变更。
+if (cmd === "audit") {
+  const CLAIMS = join(CH, "claims");
+  const boardPath = needArg(opt.board, "board=<PROGRESS.md 路径>");
+  const a = lockOp(auditBoard, { claimsDir: CLAIMS, boardPath });
+  if (a && a.status === "io-error") { console.error(`✗ 读不到（exit ${a.code}）：${a.reason}`); process.exit(a.code); }
+  console.log(`板 ${boardPath}：数据行 ${a.total} 条`);
+  for (const s of a.stale) console.log(`  ✗ 越写者：${s.row}\n      声称 ${s.who} 持锁（化身 ${s.at}），盘上没有这把活锁`);
+  for (const u of a.untagged) console.log(`  ? 无令牌行（不经 board 写上去的，锁管不到它）：${u}`);
+  if (!a.stale.length && !a.untagged.length) console.log("  板上每一行都对得上活锁。");
+  process.exit(a.stale.length ? EXIT.STALE_BOARD_ROW : EXIT.OK);
 }
 
 function scanNew(me, keys, since) {
@@ -336,16 +359,19 @@ console.log(`agent-relay CLI
 
   claim    --channel=<目录> --file=<路径> --who=<handle> --ttl=<正整数秒>
   release  --channel=<目录> --file=<路径> --who=<handle> [--at=<化身令牌>]
-  board    --channel=<目录> --file=<路径> --who=<handle> --at=<化身令牌> --board=<PROGRESS.md> --row=<一行>
+  board    --channel=<目录> --file=<路径> --who=<handle> --at=<化身令牌> --board=<PROGRESS.md> --row=<一行> [--wait=2000]
+  audit    --channel=<目录> --board=<PROGRESS.md>     看这块板有没有越写者（只报不拒）
   locks    --channel=<目录>
 
 封帧：seal 先写 msg-N.json.part，再改名为 msg-N.json。读者只看 .json，永远读不到半截文件。
 done 在签名域内——翻动它即验签失败。
 
-锁的退码：0 拿到/续期/释放成功，2 参数缺失，3 被别人占着（非阻塞，已写 waiters.log），
+锁的退码：0 拿到/续期/写板/释放成功，2 参数缺失，3 被别人占着（非阻塞，已写 waiters.log），
 4 没有这把锁，5 持有者不是你不是我（含令牌对不上），6 TTL 非法（缺失、非正整数），
 8 锁文件内容读不懂（脏锁）；躺过 120s 上界后 claim 会回收它，release 一律不给裸删，
-9 续期失败：复查时基锁已换化身 —— 那一行不许写、已写的要撤，
-10 文件系统本身不可用（目录被删/只读/是个普通文件）；这不是锁判负，修环境。
+9 续期失败：复查时基锁已换化身 —— **停笔**，那一行不许写、已写的要撤，不许原地重试，
+10 文件系统本身不可用（目录被删/只读/是个普通文件）；这不是锁判负，修环境，
+11 audit 发现越写者（板上行声称持锁而盘上无对应活锁）；只报不拒，
+12 board 板级排队超时：**可以重试**，归属没丢，只是没排到重写这张板的队。
 --ttl 必填：允许 ttl=0 等于允许一把永远卡死频道的脏锁。
-续期只追加标记文件、不覆盖基锁；claim 打出的「化身令牌」在 release/提交时要带回来。`)
+锁保护的是走 board 的写；不走 board 的写不受这层保护——用 audit 去检测它。`)

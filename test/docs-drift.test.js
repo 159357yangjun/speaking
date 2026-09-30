@@ -102,6 +102,13 @@ test("README 必须把关键语义钉在对应退码上，而不是只列个数�
   assert.match(byCode[9] ?? "", /不许重试|重新 claim/, "退码 9 必须区分'停笔'与'可重试'：重试要用新令牌，不是原地再写一次");
   // 10 = 文件系统失败：必须与协议结论区分开，否则有人会把环境问题当判负去改锁
   assert.match(byCode[10] ?? "", /不是锁判负|修目录|修环境/, "退码 10 那一行没和「锁判负」划清界限");
+  // 11 = 检测：必须写明"只报不拒"，否则读者以为报了就会被拦下
+  assert.match(byCode[11] ?? "", /只报不拒/, "退码 11 必须写明它只报警、不拦写——拦写要改信封，本轮不做");
+  // 12 = 板级排队：必须写明"可重试"，且与 9（停笔） opposite，否则调用方会把两者一起当成丢锁
+  assert.match(byCode[12] ?? "", /可以重试/, "退码 12 那一行没写明可重试；它和 9 的动作正好相反");
+  const retry9 = /重试/.test(byCode[9] ?? "停笔，不许原地重试");
+  assert.doesNotMatch(byCode[9] ?? "", /可以重试|可重试/, "退码 9 绝不能被写成可重试——那是把丢锁当成排队中");
+  void retry9;
 });
 
 test("代码里 EXIT 的每个值都能被 CLI 真跑到（防「表里有、代码里永远不会返回」）", async () => {
@@ -154,6 +161,23 @@ test("代码里 EXIT 的每个值都能被 CLI 真跑到（防「表里有、代
   fsv.writeFileSync(lk, JSON.stringify({ who: "b", at: Date.now(), ttl: 600 }));   // 闸口期间换化身
   fsv.rmSync(lk + ".freeze");
   observed.add(await renewing);
+  // 11 = audit 发现越写者；12 = board 板级排队超时。两个都真跑：
+  // 表里写了码却从没被任何路径返回过，等于对外承诺了一个不存在的诊断信号。
+  const auditDir = fsv.mkdtempSync(path.join(os.tmpdir(), "relay-exit11-"));
+  fsv.mkdirSync(path.join(auditDir, "claims"), { recursive: true });
+  fsv.writeFileSync(path.join(auditDir, "PROGRESS.md"), "| src/z.js | ghost | now <at=1> |\n");
+  observed.add(spawnSync(process.execPath, [cli, "audit", `--channel=${auditDir}`,
+    `--board=${path.join(auditDir, "PROGRESS.md")}`], { encoding: "utf8" }).status);
+  const busyDir = fsv.mkdtempSync(path.join(os.tmpdir(), "relay-exit12-"));
+  fsv.mkdirSync(path.join(busyDir, "claims"), { recursive: true });
+  const held = spawnSync(process.execPath, [cli, "claim", `--channel=${busyDir}`,
+    "--file=src/b.js", "--who=a", "--ttl=600"], { encoding: "utf8" }).stdout;
+  const heldToken = /--at=(\d+)/.exec(held)?.[1];
+  fsv.writeFileSync(path.join(busyDir, "claims", "__board__.lock"),
+    JSON.stringify({ who: "b#99997", at: Date.now(), ttl: 600 }));
+  observed.add(spawnSync(process.execPath, [cli, "board", `--channel=${busyDir}`, "--file=src/b.js",
+    "--who=a", "--at=" + heldToken, `--board=${path.join(busyDir, "PROGRESS.md")}`,
+    "--row=| src/b.js | a | now |", "--wait=200"], { encoding: "utf8" }).status);
   const unreachable = [...new Set(Object.values(EXIT))].filter((c) => c !== 0 && !observed.has(c));
   assert.deepEqual(unreachable, [],
     `这些退码在 README/代码里存在，但本轮 CLI 实跑一次都没命中：${unreachable.join(", ")}。\n` +
@@ -180,18 +204,25 @@ test("README 必须写明 renewed 的承诺边界，并且 board 是那条边界
   assert.match(md, /\*\*2\.12ms\*\*/, "复验到落盘的残余窗口要写实测数，不写形容词");
 });
 
-test("写板 CAS 在代码里真的是'先复验后落盘'，且复验不过时一个字节都不写", () => {
+test("写板 CAS 在代码里真的是'先复验后落盘'，而且复验跑两次", () => {
   const src = readFileSync(new URL("../src/claims/lock.js", import.meta.url), "utf8");
-  const fn = /export function writeBoard\([\s\S]*?\n\}/.exec(src);
+  const fn = /export function writeBoard\([\s\S]*?\n\}\n/.exec(src);
   assert.ok(fn, "找不到 writeBoard：写板 CAS 被摘掉了，README 那节立刻是空话");
   const body = fn[0];
   const verifyAt = body.indexOf("verifyHold(");
   const writeAt = body.indexOf("fs.writeFileSync(part");
   assert.ok(verifyAt >= 0, "writeBoard 没做归属复验");
   assert.ok(writeAt > verifyAt, "落盘发生在复验之前，或根本没复验");
-  assert.match(body, /if \(held\.status !== "held"\) return \{ \.\.\.held, wrote: false \};/,
-    "复验失败必须原样返回且不写盘——少了这句就是'拒了但还是写了'");
+  // 复验必须是两次：入口一次，拿到板级锁之后再一次。
+  // 只验入口的话，等板级锁那几毫秒里自己的文件锁照样可能被抢走——那正是我们要消灭的信念。
+  const verifies = (body.match(/verifyHold\(/g) || []).length;
+  assert.ok(verifies >= 2, `writeBoard 只复验了 ${verifies} 次；等板级锁期间丢的锁没人再查`);
+  assert.ok((body.match(/wrote: false/g) || []).length >= 2, "两次复验都必须有不写盘的回程");
+  assert.match(body, /if \(!fs\.existsSync\(boardPath\)[\s\S]*|const before = fs\.existsSync\(boardPath\)/,
+    "读板必须先确认板子存在，否则首次写会凭空建文件而无人知晓");
   assert.match(body, /renameSync\(part, boardPath\)/, "写板必须走 .part → rename，和消息封帧同一个原子边界");
+  // 令牌进的是已有单元格，不是新列：列数是对话层在读的东西
+  assert.match(body, /stampToken\(/, "board 必须把化身令牌盖进行文本，否则 audit 无从检测");
 });
 
 test("测试专用延时闸口只能由环境变量打开（生产路径上这条代码不存在）", () => {
