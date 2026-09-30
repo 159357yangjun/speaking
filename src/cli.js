@@ -171,6 +171,14 @@ if (cmd === "claim") {
     console.error(`✗ 拒建（exit ${r.code}）：${r.reason}`);
     process.exit(r.code);
   }
+  if (r.status === "dirty-blocked") {
+    // 脏锁不是"有人在持"，也不是"没动静"。它必须用自己的退码留一行 DIRTY，
+    // 否则旁观者只看见 exit 非 0，猜不到频道是被一把读不懂的文件卡住的。
+    const line = noteWait({ claimsDir: CLAIMS, file, who, holder: r.holder, ageS: r.ageS, ttl: r.ttl, tag: "DIRTY" });
+    console.log(`✗ 脏锁挡住（exit ${r.code}）：${file} —— ${r.reason}`);
+    console.log(`  已登记：${line}`);
+    process.exit(r.code);
+  }
   if (r.status === "blocked") {
     // 被挡住必须留下一行：否则旁观者看见目录没变化，分不清「它在等锁」和「它没干活」
     const line = noteWait({ claimsDir: CLAIMS, file, who, holder: r.holder, ageS: r.ageS, ttl: r.ttl });
@@ -195,6 +203,7 @@ if (cmd === "release") {
   const r = release({ claimsDir: join(CH, "claims"), file, who });
   // 同 claim：退码只从 r.code 出处走，不在 CLI 里再抄一遍常量
   if (r.status === "no-lock") { console.log(`✗ 无锁可放（exit ${r.code}）：${file}`); process.exit(r.code); }
+  if (r.status === "dirty-blocked") { console.log(`✗ 无法释放（exit ${r.code}）：${file} —— ${r.reason}`); process.exit(r.code); }
   if (r.status === "not-holder") {
     console.log(`✗ 拒绝释放（exit ${r.code}）：${file} 现在属于 ${r.holder}，不是 ${who}`);
     console.log("  这条就是「被抢占后原方回来 release 必须被拒」：锁的归属以文件内容为准，不以谁写的为准。");
@@ -266,6 +275,7 @@ console.log(`agent-relay CLI
 done 在签名域内——翻动它即验签失败。
 
 锁的退码：0 拿到/续期/释放成功，2 参数缺失，3 被别人占着（非阻塞，已写 waiters.log），
-4 没有这把锁，5 持有者不是你不是我，6 TTL 非法（缺失、非正整数）。
+4 没有这把锁，5 持有者不是你不是我，6 TTL 非法（缺失、非正整数），
+8 锁文件内容读不懂（脏锁）；躺过 120s 上界后 claim 会回收它，release 一律不给裸删。
 --ttl 必填：允许 ttl=0 等于允许一把永远卡死频道的脏锁。
 同一持有者重复 claim = 续期（TTL 重置）；锁过期后被他人抢占，原方回来 release 得 exit 5。`)

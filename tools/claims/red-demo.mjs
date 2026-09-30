@@ -21,7 +21,7 @@ const MUT = [
   {
     name: "M2 非持有者也能 release（被抢占后原方可解，归属形同虚设）",
     file: LOCK,
-    pairs: [['if (cur.who !== who) return { status: "not-holder"', 'if (false) return { status: "not-holder"']],
+    pairs: [['if (cur.who !== who) {', 'if (false) {']],
     test: "非持有者 release",
   },
   {
@@ -53,7 +53,7 @@ const MUT = [
     file: README,
     suite: "test/docs-drift.test.js",
     pairs: [["**追加一行 `WAIT` 到 `claims/waiters.log`**", "**追加一行 `WAIT` 到板上**"]],
-    test: "三条关键语义",
+    test: "关键语义",
   },
   {
     name: "M7 代码不再返回退码 4，「每个值都能实跑」那条该红",
@@ -72,6 +72,24 @@ const MUT = [
     ],
     test: "S2b",
   },
+  {
+    name: "M9 脏锁重新抛异常（栈穿出进程顶，退码 1）",
+    file: LOCK,
+    pairs: [['  } catch {\n    return corruptLock(p, "JSON 解析失败");', '  } catch (e) {\n    throw new Error(`锁文件损坏或不可读: ${e.message}`);']],
+    test: "截断的锁文件",
+  },
+  {
+    name: "M10 去掉脏锁回收上界（等于承认存在无限期锁，永久卡死）",
+    file: LOCK,
+    pairs: [["export const CORRUPT_GRACE_S = 120;", "export const CORRUPT_GRACE_S = Infinity;"]],
+    test: "脏锁超过上界后可被回收",
+  },
+  {
+    name: "M11 locks 不认脏锁（旁观者现场被一把坏文件打瞎）",
+    file: LOCK,
+    pairs: [["    if (cur.corrupt) {\n      const idleS = +(((Date.now() - cur.mtimeMs) / 1000).toFixed(1));", "    if (false) {\n      const idleS = +(((Date.now() - cur.mtimeMs) / 1000).toFixed(1));"]],
+    test: "脏锁不再打崩 locks",
+  },
 ];
 
 function runTest(pattern, suite) {
@@ -86,8 +104,19 @@ function runTest(pattern, suite) {
     ran: /\nℹ tests (\d+)/.exec(out)?.[1],
     // 把断言消息原文抓出来：只报"红了"不够，要看得见红在哪条判据上
     msg: (out.match(/AssertionError[^\n]*/) || [])[0] || (out.match(/^\s*AssertionError[^\n]*/m) || [])[0] || "",
-    detail: (out.match(/(并发抢占出现[^\n]*|自称赢[^\n]*|TTL 必须是[^\n]*|被拒的 release[^\n]*|被挡住必须留痕[^\n]*|退码表与代码不符[^\n]*|这些退码在[^\n]*|那一行没[^\n]*)/) || [])[1] || "",
+    detail: (out.match(/(并发抢占出现[^\n]*|自称赢[^\n]*|TTL 必须是[^\n]*|被拒的 release[^\n]*|被挡住必须留痕[^\n]*|退码表与代码不符[^\n]*|这些退码在[^\n]*|那一行没[^\n]*|第\d+次：脏锁[^\n]*|躺了 \d+s 的脏锁[^\n]*|locks 自己崩了[^\n]*|应判脏锁[^\n]*|实退 \d+[^\n]*)/) || [])[1] || "",
   };
+}
+
+// 锚点必须对行尾符免疫：src/claims/lock.js 全文 CRLF，README.md 是 LF，
+// 而多行锚点用 \n 写的——不处理的话 M9/M11 会"锚点没命中"，
+// 那比报红更危险：报的是"我测不到"，很容易被读成"我测过没测到"。
+function pairOf(src, from, to) {
+  for (const nl of ["\n", "\r\n"]) {
+    const f = from.split("\n").join(nl);
+    if (src.includes(f)) return [f, to.split("\n").join(nl)];
+  }
+  return null;
 }
 
 let allRed = true;
@@ -98,8 +127,9 @@ for (const m of MUT) {
   let patched = src;
   let missed = null;
   for (const [from, to] of m.pairs) {
-    if (!patched.includes(from)) { missed = from; break; }
-    patched = patched.replace(from, to);
+    const pair = pairOf(patched, from, to);
+    if (!pair) { missed = from; break; }
+    patched = patched.replace(pair[0], pair[1]);
   }
   if (missed) {
     console.log(`!! ${m.name}\n   变异锚点没命中：${missed}\n   跳过——锚点没命中的话，报绿不算证据\n`);

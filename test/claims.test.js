@@ -204,3 +204,59 @@ test("缺 --file / --who 退 2，不退 die 的 1（退码表写了 2 就得真�
   assert.equal((await claim(d, ["--file=src/a.js", "--ttl=600"])).code, 2);
   assert.equal((await release(d, ["--file=src/a.js"])).code, 2);
 });
+
+// ============ 洞 2：不可解析的锁必须有定义好的回收路径，不能 throw ============
+test("截断的锁文件：claim 收敛到退码 8，不把异常漏到进程外", async () => {
+  const d = mkChannel();
+  fs.mkdirSync(path.join(d, "claims"), { recursive: true });
+  fs.writeFileSync(lockOf(d, "src/bad.js"), '{"who"');           // 等价于 echo -n '{"who" > 锁文件
+  for (let i = 0; i < 3; i++) {
+    const r = await claim(d, ["--file=src/bad.js", "--who=qoder", "--ttl=600"]);
+    assert.equal(r.code, 8, `第${i + 1}次：脏锁要给已定义的 8，实退 ${r.code}\n${r.out}${r.err}`);
+    assert.doesNotMatch(r.out + r.err, /SyntaxError|at readLock|锁文件损坏或不可读/,
+      "又 throw 出去了：栈不是退出码，旁观者拿它没法判断");
+    assert.match(r.out + r.err, /不可解析/);
+  }
+});
+
+test("空文件与非法 JSON 同样算脏锁（它没有 TTL，等于无限期占用）", async () => {
+  const d = mkChannel();
+  fs.mkdirSync(path.join(d, "claims"), { recursive: true });
+  for (const [name, content] of [["src/e.js", ""], ["src/n.js", "not json at all"], ["src/a2.js", '"just-a-string"']]) {
+    fs.writeFileSync(lockOf(d, name), content);
+    const r = await claim(d, ["--file=" + name, "--who=qoder", "--ttl=600"]);
+    assert.equal(r.code, 8, `${name} 内容 ${JSON.stringify(content)} 应判脏锁，实退 ${r.code}`);
+  }
+});
+
+test("脏锁不再打崩 locks——它是旁观者唯一的现场", async () => {
+  const d = mkChannel();
+  fs.mkdirSync(path.join(d, "claims"), { recursive: true });
+  fs.writeFileSync(lockOf(d, "src/bad.js"), '{"who"');
+  const r = await locks(d);
+  assert.equal(r.code, 0, `locks 自己崩了，频道就彻底没有观测面：${r.out}${r.err}`);
+  assert.match(r.out, /脏锁等上界/);
+});
+
+test("脏锁超过上界后可被回收，回收后补上合法 TTL", async () => {
+  const d = mkChannel();
+  fs.mkdirSync(path.join(d, "claims"), { recursive: true });
+  const p = lockOf(d, "src/old.js");
+  fs.writeFileSync(p, '{"who":"ghost","at":');
+  const past = Math.floor(Date.now() / 1000) - 4000;             // mtime 推到上界之外
+  fs.utimesSync(p, past, past);
+  const r = await claim(d, ["--file=src/old.js", "--who=qoder", "--ttl=600"]);
+  assert.equal(r.code, 0, `躺了 4000s 的脏锁回收不掉：${r.out}${r.err}`);
+  assert.match(r.out, /抢占/);
+  assert.equal(readLockRaw(d, "src/old.js").ttl, 600, "回收后必须带合法 TTL");
+});
+
+test("脏锁不许被 release 抹掉（那会把别人正在写的锁当垃圾删）", async () => {
+  const d = mkChannel();
+  fs.mkdirSync(path.join(d, "claims"), { recursive: true });
+  fs.writeFileSync(lockOf(d, "src/keep.js"), '{"who":"x"');
+  const r = await release(d, ["--file=src/keep.js", "--who=x"]);
+  assert.equal(r.code, 8, `${r.out}${r.err}`);
+  assert.ok(fs.existsSync(lockOf(d, "src/keep.js")), "脏锁被裸删了");
+});
+
