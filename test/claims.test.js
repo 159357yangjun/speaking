@@ -2,12 +2,12 @@
 // 上一轮的教训：断言写成内部函数调用，就测不到参数解析、退出码、日志落盘这三件事。
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { lockFileName, markerOf } from "../src/claims/lock.js";
+import { lockFileName, markerOf, BOARD_LOCK_TTL_S } from "../src/claims/lock.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const CLI = path.join(ROOT, "src", "cli.js");
@@ -602,4 +602,133 @@ test("板全干净时 audit 退 0（否则'没问题'和'没检查'分不开）"
   const r = await audit(d, [`--board=${bd}`]);
   assert.equal(r.code, 0, `干净板子应该退 0：\n${r.out}${r.err}`);
   assert.match(r.out, /每一行都对得上活锁/);
+});
+
+// ============ 新代码面的两条：崩溃回收 + 锁序 ============
+test("持板锁的进程崩溃后，板锁必须被过期回收（不许永远 BOARD_BUSY）", async () => {
+  // 夹具是一个**真子进程**：拿到板锁后 process.exit(0)，刻意不 release。
+  // 不用 mock 假装崩溃——那样测的是我对 release 的想象，不是死掉的人留在盘上的现场。
+  const d = mkChannel();
+  const bd = path.join(d, "PROGRESS.md");
+  fs.writeFileSync(bd, "# 进度板\n");
+  const a = await claim(d, ["--file=src/one.js", "--who=qoder", "--ttl=600"]);
+  const token = /--at=(\d+)/.exec(a.out)[1];
+
+  const fixture = path.join(ROOT, "test", "fixtures", "hold-board-lock-and-die.mjs");
+  const dead = spawnSync(process.execPath, [fixture, path.join(d, "claims"), "deadholder"], { encoding: "utf8" });
+  assert.equal(dead.status, 0, `夹具没拿到板锁就退了：${dead.stdout}${dead.stderr}`);
+  // 夹具那行输出必须收得到：它退出前最后一件事就是打印这行，管道上的异步写会被 exit 截掉。
+  assert.ok((dead.stdout || "").trim(), "夹具没打印出现场（stdout 为空）——这条用例的前提没法核对");
+  const witness = JSON.parse(dead.stdout.trim());
+  assert.equal(witness.status, "acquired", `夹具报的不是"新拿到"：${dead.stdout}`);
+  console.log(`  夹具（真子进程，拿锁后不 release 直接 exit）：${(dead.stdout || "").trim()}`);
+  const boardLock = path.join(d, "claims", "__board__.lock");
+  assert.ok(fs.existsSync(boardLock), "子进程退了，但盘上没有留下板锁——那这条用例没测任何东西");
+  const deadSnapshot = fs.readFileSync(boardLock, "utf8");
+  assert.match(JSON.parse(deadSnapshot).who, /^deadholder#\d+$/, `留下的板锁持有者名字不对：${deadSnapshot}`);
+  // 夹具自己报的化身号必须就是盘上那一份：否则"死者留下的锁"这个前提只是我在叙述。
+  assert.equal(String(JSON.parse(deadSnapshot).at), String(witness.at),
+    `夹具报的化身 ${witness.at} 与盘上锁记的 ${JSON.parse(deadSnapshot).at} 不是同一把`);
+
+  // (a) 当场：后来的写者拿不到，给 12（可重试），且不动板子
+  const before = fs.readFileSync(bd, "utf8");
+  const busy = await board(d, ["--file=src/one.js", "--who=qoder", "--at=" + token, `--board=${bd}`,
+    "--row=| src/one.js | qoder | now |", "--wait=200"]);
+  assert.equal(busy.code, 12, `死锁在场时应该先吃 12，实退 ${busy.code}：\n${busy.out}${busy.err}`);
+  assert.equal(fs.readFileSync(bd, "utf8"), before, "拿不到板锁却动了板子");
+
+  // (b) 回收：必须靠**过期**收回来，不是靠谁放开（死人不会 release）。
+  // 每次失败重试前，盘上的板锁必须**还是死者那份字节**——
+  // 一旦这里变了，就说明有别的代码路径把死锁删了/覆盖了，那测的就不是过期回收，而是另一条我没声明的门。
+  const t0 = Date.now();
+  let got = null, took = 0, tries = 0;
+  while (Date.now() - t0 < 15000) {
+    if (fs.existsSync(boardLock)) {
+      assert.equal(fs.readFileSync(boardLock, "utf8"), deadSnapshot,
+        `第 ${tries + 1} 次重试前，死者留下的板锁被人改动过了——回收不是靠过期发生的`);
+    }
+    const r = await board(d, ["--file=src/one.js", "--who=qoder", "--at=" + token, `--board=${bd}`,
+      "--row=| src/one.js | qoder | now |", "--wait=200"]);
+    tries++;
+    took = Date.now() - t0;
+    if (r.code === 0) { got = r; break; }
+    assert.equal(r.code, 12, `回收路上出现了没定义过的退码 ${r.code}：\n${r.out}${r.err}`);
+    await new Promise((s) => setTimeout(s, 150));
+  }
+  assert.ok(got, `等了 ${took}ms 板锁仍未被回收——崩溃的持有者把这张板永久卡死了`);
+  console.log(`  回收耗时 ${took}ms / 重试 ${tries} 次（板锁 TTL ${BOARD_LOCK_TTL_S}s）`);
+  // 判据钉在**盘上那份锁自己记的到期时刻**，不是"四千多毫秒"这种形容词：
+  // 钉墙钟数会随机器快慢飘（夹具与 t0 之间的间隔就是浮动的），钉 at+ttl 才是同一条判据的两端。
+  const deadAt = JSON.parse(deadSnapshot);
+  const deadlineMs = Number(deadAt.at) + Number(deadAt.ttl) * 1000;
+  assert.ok(t0 + took >= deadlineMs,
+    `写成功落在 ${t0 + took - deadlineMs}ms（相对到期时刻），早于盘上记录的到期——那不是过期回收，是有人替死者 release 了，前提不成立`);
+  assert.ok(tries >= 2, `只试了 ${tries} 次就成功，没经过 12 这一档，回收路径没被走到`);
+  assert.match(fs.readFileSync(bd, "utf8"), /\| src\/one\.js \| qoder \| now\b/, "回收后写进去的行没落板");
+  // 写成功后 writeBoard 在 finally 里放开板锁：盘上不该再留下锁文件。
+  // 留着 = 后来的写者要吃 12，这条用例测的"崩溃不永久卡板"就变成了"这次不卡、下次卡"。
+  assert.ok(!fs.existsSync(boardLock),
+    "回收写完还留着死者的板锁——说明这次写根本没经过板锁，或 finally 没放");
+});
+
+test("锁序不变式：全仓不存在「持板锁时再取文件锁」的形状（AB-BA）", () => {
+  const src = fs.readFileSync(path.join(ROOT, "src", "claims", "lock.js"), "utf8");
+  const wb = /export function writeBoard\([\s\S]*?\n\}\n/.exec(src);
+  assert.ok(wb, "找不到 writeBoard，锁序不变式失去对象");
+  const body = wb[0];
+  // 这条扫描必须和后面的"取锁点清点"配套才成立：只盯 writeBoard 的话，
+  // 在别处新加一个取板锁点就绕过了它。清点把板锁钉死在 writeBoard 一处、文件锁钉死在 claim 一处，
+  // "持板锁再取文件锁"这个嵌套才只剩 writeBoard 一个可能的发生地。
+  const boardTake = body.indexOf("acquire({ claimsDir, file: BOARD_LOCK");
+  assert.ok(boardTake >= 0, "writeBoard 不再取板级锁了？那第二道防线没了");
+  // 关键一条：取了板锁之后，除板锁自身的 release 外不得再出现任何 acquire。
+  // 注释里把"复验只读"写死：verifyHold 走 readLock/readFileSync，没有 wx/rename/acquire——
+  // 否则下一个人会"顺手"把复验改成重新 claim 一次，AB-BA 就成立了。
+  const nestedTake = body.slice(boardTake).split("\n")
+    .filter((l) => /\bacquire\(/.test(l) && !/file: BOARD_LOCK/.test(l));
+  assert.deepEqual(nestedTake, [],
+    `持板锁期间又去取别的锁（AB-BA 的形状就这样长回来）：\n  ${nestedTake.map((s) => s.trim()).join("\n  ")}`);
+  assert.match(body, /release\(\{ claimsDir, file: BOARD_LOCK/, "板锁必须在 finally 里放开，否则崩溃窗口全靠 TTL 兜");
+
+  // verifyHold / auditBoard 必须是纯读：不取锁、不写文件。
+  // 不用 new RegExp 拼函数名——从模板串造正则会把反斜杠吃掉一层（实测报
+  // "Invalid regular expression: Unterminated group"，红的是夹具自己而不是被测代码）。
+  function bodyOf(name) {
+    const start = src.indexOf(`export function ${name}(`);
+    assert.ok(start >= 0, `找不到 ${name}，这条不变式失去对象`);
+    const end = src.indexOf("\n}\n", start);
+    assert.ok(end > start, `${name} 的函数体没闭合到预期位置`);
+    return src.slice(start, end);
+  }
+  for (const fn of ["verifyHold", "auditBoard"]) {
+    const b = bodyOf(fn);
+    assert.ok(!/\bacquire\(/.test(b), `${fn} 里出现了 acquire——它不再是只读复验，锁序声明作废`);
+    assert.ok(!/writeFileSync|renameSync|unlinkSync/.test(b), `${fn} 里出现了写操作，只读承诺是假的`);
+  }
+  // 取锁点清点**按文件分开说**：把两个文件混进一条正则会测出假话——
+  // 文件锁是 cli.js 交给 `lockOp(acquire, …)` 取的（不是 `acquire(` 直调），
+  // 板锁只在 lock.js 的 writeBoard 里取。所以每个文件各有一条自己的上限。
+  const lockTakes = [...src.matchAll(/\bacquire\(\{[^)]*?file: ([A-Za-z_][\w.]*)/g)].map((m) => m[1]);
+  assert.deepEqual([...new Set(lockTakes)], ["BOARD_LOCK"],
+    `lock.js 里的取锁点应当只有板锁，实得 ${lockTakes.join(", ") || "（无）"}——
+     文件锁只能由调用方取，模块内多一个取锁点就多一条锁序`);
+  const cliSrc = fs.readFileSync(path.join(ROOT, "src", "cli.js"), "utf8");
+  const cliTakes = [...cliSrc.matchAll(/\blockOp\(acquire\b/g)].length;
+  assert.equal(cliTakes, 1,
+    `cli.js 里取文件锁的地方应当只有 claim 那一处，实得 ${cliTakes} 处；多一处就多一条锁序`);
+  assert.doesNotMatch(cliSrc, /\bBOARD_LOCK\b/,
+    "cli.js 不许绕过 writeBoard 直接碰板锁——那板锁的持有/放开就不在同一个函数里了");
+});
+
+test("seal 不看令牌是决定，不是遗漏：seal 的代码路径里不得出现板级读取", () => {
+  // 裁定理由（写进 README）：seal 的契约是"把我的声明封成密码学承诺"。
+  // 把"别人有没有把我的行写坏"塞进签名前的判断，等于把我的可交付性挂在另一个进程的守规矩上——
+  // 那会把可容忍的退化（板子被抹一行）升级成硬故障（我因别人而签不了）。
+  const cli = fs.readFileSync(path.join(ROOT, "src", "cli.js"), "utf8");
+  const seal = /\nif \(cmd === "seal"\) \{([\s\S]*?)\n\}\n/.exec(cli);
+  assert.ok(seal, "找不到 seal 分支，这条不变式会静默空跑");
+  assert.doesNotMatch(seal[1], /board|Board|auditBoard|verifyHold|PROGRESS/,
+    "seal 里出现了板级读取/令牌校验——越写者一旦能拦住签名，可交付性就挂在别人的守规矩上了");
+  // 反向护栏：seal 只该依赖 roster + 私钥 + 信封
+  assert.match(seal[1], /myKey\(/, "seal 分支被改写了？不变式的前提取不到");
 });

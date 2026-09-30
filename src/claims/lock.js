@@ -417,14 +417,29 @@ export function verifyHold({ claimsDir, file, who, at }) {
 }
 
 // ---- 板级锁 ----
+// 【锁序声明】全仓只有一条取锁顺序：**文件锁 → 板级锁**，且持有板级锁期间**不再取任何文件锁**。
+//   claim / release / locks ：只碰文件锁
+//   board                   ：verifyHold(文件锁，**只读**) → acquire(板锁) → verifyHold(只读) → release(板锁)
+//   audit                   ：只读，一把锁都不取
+// 所以"持板锁时再取文件锁"这个 AB-BA 形状在本仓不存在——它不需要两个写者对抢，
+// 一个 `audit` 加一个 `board` 就能碰出来，故由 test/claims.test.js 的文本不变式钉死，不靠注释。
+// "复验只读"这句也要写进不变式的注释：verifyHold 走 readLock/readFileSync，
+// 没有 wx、没有 rename、没有 acquire——否则下一个人会把复验改成重新 claim 一次。
+//
 // 为什么还要第二把锁：`board` 复验的是**自己那把文件锁**，可它落盘是"读整张板 → 改 → 写回整张板"。
 // 两个各自合法持锁的进程（不同文件、不同的人）可以同时复验通过，然后先后 rename 同一张板——
 // 后写的那一次把前一个人的行**整块抹掉**，而两个人都拿到退码 0。
 // 实测（tools/claims/board-race.mjs --inject=600，6 轮）：两行都在 0/6，
 // "都自称成功、板上只剩一行" 6/6。这就是本项目最初那个 5/5 丢失更新，被我原地复制了一份。
 // 所以：文件锁管"谁可以改这个文件"，板级锁管"谁此刻可以重写这张板"——两件事，两把锁。
+//
+// 【持板锁的进程死了怎么办】板锁和文件锁**同构**：它就是一个 claims/ 下的锁文件，
+// 走的是同一个 acquire，所以回收走的也是同一条过期路径——死掉持有者留下的板锁，
+// 在 BOARD_LOCK_TTL_S 之后由下一个写者以 "stolen" 取走。不需要额外的清理代码，
+// 但必须有用例证明它真能收回来（见 test/claims.test.js 的"崩溃持有者"那条），
+// 因为"同构"是设计意图，不是证据。
 export const BOARD_LOCK = "__board__";
-export const BOARD_LOCK_TTL_S = 10;
+export const BOARD_LOCK_TTL_S = 5;
 export const BOARD_WAIT_MS = 2000;
 const BOARD_POLL_MS = 20;
 

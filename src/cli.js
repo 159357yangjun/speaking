@@ -3,7 +3,9 @@ import { readFileSync, writeFileSync, existsSync, readdirSync, mkdirSync, rename
 import { join, resolve, sep } from "node:path";
 import { loadRoster, keyringOf } from "./proto/roster.js";
 import { seal, verifyEnvelope, msgFileName, newNonce } from "./proto/envelope.js";
-import { acquire, release, list, noteWait, verifyHold, writeBoard, auditBoard, EXIT } from "./claims/lock.js";
+// 故意不导入 verifyHold：归属复验只发生在 writeBoard 内部（锁序声明见 src/claims/lock.js）。
+// cli.js 自己拿一次复验，就多出一条"在板锁之外判断归属"的路径。
+import { acquire, release, list, noteWait, writeBoard, auditBoard, EXIT } from "./claims/lock.js";
 
 const args = process.argv.slice(2);
 const cmd = args[0];
