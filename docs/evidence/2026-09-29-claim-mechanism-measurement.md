@@ -1119,3 +1119,111 @@ for i in $(seq 1 24); do npm test > /tmp/t_$i.log 2>&1; done   # 逐次记 exit 
 另有 M57 摘掉 S2b 的 census ⇒ 红（`S2b 的每条断言都必须自带普查`），防"诊断写好了被人顺手删"。
 
 本轮数字：`npm test` **128/128** · `red-demo` **55/55 全部打红** · `selfcheck-harness` **5/5**。
+
+---
+
+## 廿三、clamp 从一个正确的防线变成一个藏身处（2026-09-30，HEAD `aa06f3c` 之后）
+
+### 23.0 本轮先记一句边界冲突，以及我怎么处置的
+
+下发的第①条要"把 `raw_mtime` 与 `used_mtime` 都印出来"，而 clamp 本体在
+`src/claims/lock.js` 的 `deadlineOf` 里；本轮边界又写着**不改 lock/配置**。两句直接撞。
+取读数侧：报告长在 `src/cli.js` 的 audit 现状段（重 `stat` 一次取原始 mtime，再按同一形状算采用值），
+**没有动 lock.js 一行**。代价说清楚：判据与报告分居两处，`lock.js` 一旦改夹法，
+报告里那句"采用="就成了假话，而且看起来完全正常。所以补了两道钉：
+
+| 钉 | 落点 |
+|---|---|
+| `lock.js` 里那句必须还是 `Math.min(safeMtime(p), Date.now())` | docs-drift `clamp 的报告与判据必须同源同形…` |
+| `cli.js` 里必须按 `Math.min(rawM, Date.now())` 算采用值、且消息里两个量都在场、来因必须写"未判定" | 同上那条用例 |
+
+要真把报告做进判据内部（一处算完直接返回），需要放开"不改 lock"，那句由他定，我不自作主张改判据文件。
+
+### 23.1 同步盘前提：今天重新实测（不写"我记得不在同步盘上"）
+
+```
+cwd      = C:\Users\yyyy\Documents\Qoder\2026-09-28\50171e16
+realpath = 同上                     realpath===cwd ? true
+逐段祖先（C:\Users → yyyy → Documents → Qoder → 2026-09-28 → <仓>）
+         六段全部 isSymbolicLink=false，fsutil reparsepoint query 全部不认（非 0 返回 = 不是 reparse）
+同步根候选 C:\Users\yyyy\OneDrive        存在｜仓库在它下面? false
+          C:\Users\yyyy\WPS Cloud        存在（非祖先）
+          C:\Users\yyyy\WPS Cloud Files  存在（非祖先）
+          C:\Users\yyyy\WPSDrive         存在（非祖先）
+          Dropbox / Google Drive / Nutstore / iCloudDrive  不存在
+```
+
+⇒ **结论分两半，不许合成一句"没风险"**：
+① "本仓当前跑在同步盘上" = **不成立**（有上面这份逐段读数）。
+② "同步盘永远不会参与" = **未验、且不可保证** —— 协议对频道目录的唯一要求只是"两个 agent 都能写"，
+而这台机器上 OneDrive / WPS 客户端都在，把 `--channel` 指过去是一个字节的动作。
+所以 `[MTIME_CLAMPED]` 的**来因字段写"未判定 + 候选"**，不写"同步盘重写"这种我们没观测到的结论。
+重跑命令：`node <临时>/synccheck.cjs`（逐段 `lstat` + `fsutil` + 云根枚举，一次性脚本，不进仓）。
+
+### 23.2 两面夹具与它们各自的变异
+
+```
+$ node --test --test-name-pattern "MTIME_CLAMPED" test/claims.test.js
+✖ clamp 发生过就必须看得见：mtime 在未来时 audit 打 [MTIME_CLAMPED] 并带上原始值与采用值   ← RED（当时一句没打）
+✔ clamp 没发生过就不许打：正常 mtime（在过去）的锁不得出现 [MTIME_CLAMPED]
+ℹ tests 2 / pass 1 / fail 1
+```
+实现之后两面同绿。实际打出来的那一行（植 `at=now, ttl=600, mtime=now+300s`，原样抄，不编数字；
+**上一版我在这儿写了一行手搓的示例读数，那是捏造，已换成真跑的输出**）：
+
+```
+  src_show.js                持有者=a  已占 0.1s  剩 599.9s / TTL 600s  未到期  pid=无 pid 后缀
+      时钟：头部时刻比本地文件系统早 300s：写方钟偏早。到期取的是 max(at, mtime)，没按 at 提前抢走它
+      [MTIME_CLAMPED] 原始=1790769047489 采用=1790768747556 抹掉=299933ms  来因=未判定（候选：写方钟超前 / 同步盘重写 / 手动改时间 / 时区错位）
+exit=0
+```
+
+**这两行互相打脸，而脸红的是上面那行。** 我植的现场是"mtime 在未来"，可 `holderOf` 的
+`clockNote` 却宣布"写方钟偏早"—— 因为它的判据是 `skew = at − mtime`，而 `-300s` 这个观测
+**同时**由两种原因产生：写方的钟真的早 300s，或者 mtime 被改到了未来。
+那句话把"不可判的来因"写成了结论，而且写在离新加的 `[MTIME_CLAMPED]` 只有 80 毫米的地方，
+读的人会以为已经查明了。
+
+处置取了"在读数侧降级"这一条（不动 `lock.js`，因此不越本轮边界）：clamp 发生过且 `clockNote` 在场时，
+`audit` 追一行
+
+```
+      ↑ 上一条时钟注释里的来因不是结论：同一个差值也可由 mtime 被改到未来产生（本机无法区分，见上 [MTIME_CLAMPED]）
+```
+
+这条也是先红后绿的（断言"必须有一句来因不是结论" ⇒ 实现前红），并由两面夹具的正例面守住；
+**M60** 把那句 `if (h.clockNote)` 改成 `if (false)` ⇒ 正例面红。
+仍然留下的、需要他定的那一半：`clockNote` **本身的措辞**还是结论式的（"写方钟偏早"），
+把它降成"`at` 比本地 mtime 早 300s（来因未判定）"要改 `lock.js`，本轮没改 ⇒
+**这是本轮新欠的头号语义债**：一个不可判的来因，目前在盘上仍以结论的形式出现，只是旁边多了一句否认。
+
+两条变异把"两面"钉成两面，而不是一条正例：
+
+| 变异 | 打什么 | 红在哪一面 |
+|---|---|---|
+| M58 `if (rawM !== usedM)` ⇒ `if (false)` | 夹照夹、但不说 | 正例（未来 mtime 那一面）红 |
+| M59 `if (rawM !== usedM)` ⇒ `if (true)` | 正常锁也打 | **反例**红 |
+
+只配 M58 是不够的：那样"任何锁都打这行"这种写法照样能过整个套件，而具名短码一旦恒真就回到 0 信息量。
+
+### 23.3 端口那条全机口径：本仓没有落点，但这句话现在有人钉
+
+`src/`、`tools/`、`test/` 内 `createServer` / `net.connect` / `.listen(` / `localhost` URL / `fetch(` **零命中**
+⇒ 同端口被 v4/v6 各绑一个进程、两个 `<title>` 相同那一族，在本仓没有可命中的面。
+README 写了那句"本仓探针不走 http"，并由 `本仓探针与 CLI 不走 http…` 那条用例守着：
+上面那批文件里一旦出现 http/端口入口，用例会红并要求先补"该端口 LISTEN 的 pid 集合恰为 1"，
+而不是让那句声明默默过期。**这是一句会变的声明**（今天成立靠的是"没有服务器"这个事实），
+所以才需要门。
+
+### 23.4 追账用的两个新读数
+
+- `renew-race` 在**当前 HEAD** `aa06f3c` 上重跑（此前那对在 `289538c` + 未提交改动）：
+  改前 `--revertcas` **3/3 轮双主**（续期成功 60 / 被拒 0，退 0）；
+  改后现行 CAS **0/3 双主**（每轮自称赢 1 家；续期成功 0 / 被拒 60，退 3）。
+  与上一对同参数不同分贝的地方：`renewOk` 这次是 **0**（上次 19）—— 抢占方 20 家都在续期方之前就到了，
+  续期分支一次都没被抢到；`precondition` 仍然满足（被拒 > 0 且抢占方赢过），所以这份数可用，
+  但"续期成功"那一列本轮没有自由度，**不能拿它当"续期路径变好了"的证据**。
+- 面 C（`RELAY-SUMMARY` 行数契约）：不在"未回"之列 —— 契约、两面夹具与用例
+  `计数行：读不到就抛…` 已在 `ff9ce6a`/`289538c` 落地，本轮 `selfcheck-harness` 5/5 里含面 C 与面 D。
+
+本轮数字：`npm test` **132/132** · `red-demo` **57/57 全部打红** · `selfcheck-harness` **5/5**。

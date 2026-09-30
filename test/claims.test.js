@@ -830,6 +830,51 @@ ${r.out}`);
 ${r2.out}${r2.err}`);
 });
 
+test("clamp 发生过就必须看得见：mtime 在未来时 audit 打 [MTIME_CLAMPED] 并带上原始值与采用值", async () => {
+  // 为什么要有这一条：`Math.min(safeMtime(p), Date.now())` 把"一个被同步盘/对端/手动改到未来的
+  // mtime"与"一个刚刚才写的正常文件"**夹成同一个读数**，于是两种完全不同的现场在报告里长得不一样都做不到。
+  // clamp 本身是对的（它挡的是"提前过期"那一侧），但它发生时必须留痕：
+  // 否则下一个入看到"剩 60s"会以为盘上时间可信，而实际是他自己的钟或别人的写在替他决定。
+  // 偏差留在可信带内（<SKEW_UNTRUSTED_S=900s），不然先被降级成脏锁，量的就不是这一条了。
+  const d = mkChannel();
+  const bd = path.join(d, "PROGRESS.md");
+  const now = Date.now();
+  plantLock(d, "src_show.js.lock", { who: "a", at: now, ttl: 600 }, now + 300 * 1000);
+  const a = await audit(d, ["--board=" + bd]);
+  assert.match(a.out, /\[MTIME_CLAMPED\]/,
+    `mtime 被夹住了却一句没打——报告里"被夹过的锁"与"正常的锁"完全同形：
+${a.out}${a.err}`);
+  // 两个量都要在场，且必须能看出谁大谁小（只打一个数等于没打）
+  const m = /原始=(\d+)\s+采用=(\d+)/.exec(a.out);
+  assert.ok(m, `[MTIME_CLAMPED] 里必须同时有 原始=<ms> 与 采用=<ms>：
+${a.out}`);
+  const raw = Number(m[1]), used = Number(m[2]);
+  assert.ok(raw > used, `原始(${raw}) 应当晚于采用(${used})：未来 mtime 被夹到此刻，差值就是被抹掉的量`);
+  assert.ok(raw - now > 240 * 1000 && raw - now < 360 * 1000,
+    `原始 mtime 应当是我植的那个未来时刻（离此刻 ${Math.round((raw - now) / 1000)}s）：拿到 ${raw}`);
+  // 来因不能假装知道：本仓从没在真同步盘上验过"远端会重写 mtime"，所以这句必须是候选因而不是结论
+  assert.match(a.out, /来因=.*未判定|未判定/,
+    `来因那一栏不许替用户下结论（本仓未验同步盘前提）：应当写"未判定 + 候选"`);
+  // 同一份输出里，上一行 `时钟：…写方钟偏早…` 是个**结论式**措辞，而 `at − mtime = −300s`
+  // 这一个观测同时由两种原因产生（写方钟真早 / mtime 被改到未来）。既然这一轮已经证明
+  // "clamp 发生过"是可判的，那句就不该再单独顶着"写方钟偏早"出场 —— 挨着它补一句来因未定。
+  assert.match(a.out, /时钟注释的来因不是结论|来因不是结论/,
+    `clamp 与"写方钟偏早"同时出现却没有一句"这只是候选解释"：读的人会以为已经查明是钟早了`);
+});
+
+test("clamp 没发生过就不许打：正常 mtime（在过去）的锁不得出现 [MTIME_CLAMPED]", async () => {
+  // 这是上一面的**反面**，缺了它上面那条就是逃生口：只要在任何情况下都印这行，
+  // "有 clamp 发生"这个信号就又回到 0 信息量了（同"门没有真实正例时印的是自己"那一族）。
+  const d = mkChannel();
+  const bd = path.join(d, "PROGRESS.md");
+  const t = Date.now() - 5000;
+  plantLock(d, "src_norm.js.lock", { who: "a", at: t, ttl: 600 }, t);   // at 与 mtime 都在过去
+  const a = await audit(d, ["--board=" + bd]);
+  assert.ok(!/MTIME_CLAMPED/.test(a.out),
+    `正常锁也打了 [MTIME_CLAMPED] ⇒ 这个具名短码从此不能用来分辨"发生过"：
+${a.out}${a.err}`);
+});
+
 test("未来的 mtime 不许把到期时刻推到未来：先夹到本地此刻再取 max", async () => {
   const d = mkChannel();
   const now = Date.now();

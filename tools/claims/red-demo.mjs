@@ -451,6 +451,31 @@ const MUT = [
     test: "S2b 的每条断言都必须自带普查",
     suite: "test/docs-drift.test.js",
   },
+  {
+    // clamp 的两面夹具各配一条变异：摘掉 ⇒ 正例不红（等于什么都没印）；无条件印 ⇒ 反例红
+    // （具名短码失去分辨力）。两条合起来才证明"两面"不是摆设 —— 只配前一条的话，
+    // "任何锁都打这行"这种写法照样能过整个套件。
+    name: "M58 摘掉 clamp 的可见性报告（被夹过的锁与正常锁又长成一个样子）",
+    file: CLI,
+    pairs: [["if (rawM !== usedM) {", "if (false) {   // 变异：夹还是照夹，只是不说了"]],
+    test: "clamp 发生过就必须看得见",
+    suite: "test/claims.test.js",
+  },
+  {
+    name: "M59 让那条报告无条件打印（具名短码失去分辨力 ⇒ 反例面就是空的）",
+    file: CLI,
+    pairs: [["if (rawM !== usedM) {", "if (true) {   // 变异：正常锁也打，『打过』不再有信息量"]],
+    test: "clamp 没发生过就不许打",
+    suite: "test/claims.test.js",
+  },
+  {
+    name: "M60 摘掉那句『来因不是结论』（clockNote 还写着结论式措辞，旁边却没人否认它了）",
+    file: CLI,
+    pairs: [["      if (h.clockNote) {\n        console.log(`      ↑ 上一条时钟注释里的来因不是结论",
+             "      if (false) {\n        console.log(`      ↑ 上一条时钟注释里的来因不是结论"]],
+    test: "clamp 发生过就必须看得见",
+    suite: "test/claims.test.js",
+  },
 ];
 
 // 计数行的正则与判读放在**同一处**定义：`node --test` 的报告格式一改，

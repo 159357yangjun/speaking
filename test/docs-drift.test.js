@@ -759,6 +759,53 @@ test("S2b 的每条断言都必须自带普查（红一次只报数字差，等�
     `S2b 有 ${asserts} 条断言、只有 ${withCensus} 条带普查：剩下那些一旦红，报出来的还是光秃秃的数字差`);
 });
 
+test("clamp 的报告与判据必须同源同形：两处都得用 min(mtime, 本地此刻)", () => {
+  // 本轮边界是"不改 lock/配置"，所以 `[MTIME_CLAMPED]` 的报告只能长在读数侧（src/cli.js），
+  // 而 clamp 本身留在判据侧（src/claims/lock.js 的 deadlineOf）。
+  // **分居两处是有代价的**：lock.js 一旦改夹法（比如换成 `Math.min(mtime, at+ttl)` 或干脆去掉夹），
+  // 报告里那句"采用="说的就不是真话了 —— 而它看起来完全正常。所以这里把两处的形状一起钉住。
+  const lock = readFileSync(new URL("../src/claims/lock.js", import.meta.url), "utf8");
+  const cli = readFileSync(new URL("../src/cli.js", import.meta.url), "utf8");
+  assert.match(lock, /Math\.min\(safeMtime\(p\), Date\.now\(\)\)/,
+    "lock.js 的 clamp 不再是那句 `Math.min(safeMtime(p), Date.now())`：报告侧需要同步改，先红在这里");
+  assert.match(cli, /Math\.min\(rawM, Date\.now\(\)\)/,
+    "cli.js 的报告侧不再按同一形状算『采用值』：它会报一个判据其实没用过的数");
+  assert.match(cli, /\[MTIME_CLAMPED\] 原始=\$\{rawM\} 采用=\$\{usedM\}/,
+    "报告里两个量必须同时在场：只打一个数就等于没打（分清不了『被夹过』与『正常』）");
+  // 来因必须是"未判定 + 候选"，不许写成结论：本仓从没在真同步盘上跑过（见 README 那句实测）
+  assert.match(cli, /来因=未判定/,
+    "来因被写成确定原因了：我们没有那个证据，写死就是替用户下结论");
+  // `clockNote`（在 lock.js 里）会说"写方钟偏早"这种结论式措辞，而 `at − mtime < 0`
+  // 这一个观测同时由"钟早"与"mtime 被改到未来"产生。本轮不改 lock.js，所以在读数侧当场降级。
+  assert.match(cli, /来因不是结论/,
+    "clamp 与那句结论式时钟注释同时出现时，必须补一句『来因不是结论』——否则两句挨着，前一句看起来像已查明");
+});
+
+// 全机口径（2026-09-30，隔壁仓实测）：同一端口可以被两个进程分别绑 127.0.0.1 与 ::1，
+// 两边 `<title>` 完全相同 ⇒ `--strictPort` 与"抓 title 断言"两条都拓不到，承重的只有
+// "该端口 LISTEN 的 pid 集合恰为 1"。本仓的处置是**声明没有这个面**，而这条断言就是那句声明的门：
+// 将来任何人加了 http 入口，这条会红，并要求他先补 pid 判据 —— 而不是让那句话默默过期。
+test("本仓探针与 CLI 不走 http：一旦有人起了服务器，必须先补『该端口 LISTEN 的 pid 恰为 1』这条判据", () => {
+  const files = ["src/cli.js", "src/claims/lock.js", "src/claims/summary.js",
+    "tools/claims/board-race.mjs", "tools/claims/renew-race.mjs", "tools/claims/window-measure.mjs",
+    "tools/claims/red-demo.mjs", "tools/claims/selfcheck-harness.mjs", "tools/relay-sim/sim.js"];
+  const hits = [];
+  for (const f of files) {
+    const s = readFileSync(new URL("../" + f, import.meta.url), "utf8");
+    for (const m of s.matchAll(/createServer|net\.connect|\.listen\(|https?:\/\/[^\s"']*localhost|fetch\(/g)) {
+      hits.push(`${f}:${m[0]}`);
+    }
+  }
+  const md = readFileSync(README, "utf8");
+  if (hits.length === 0) {
+    assert.match(md, /本仓探针不走 ?http/,
+      "盘上确实没有 http 入口，但 README 那句『本仓探针不走 http』没了 —— 这条声明也得有人钉着");
+    return;
+  }
+  assert.fail(`出现了 http/端口入口：${hits.join(" ")}。同端口可被 v4/v6 各绑一个进程且标题相同，` +
+    "所以『起了服务器就算验过』这类判据都不承重。先补『该端口 LISTEN 的 pid 集合恰为 1』，再把这条断言改成正面核对。");
+});
+
 // 分隔符本身可以出现在被解析的文本里（看板正文是 agent 写的，不是代码）。
 // 判读方若用" split 后取第 N 格"或"按行读汇总"，字面量里的分隔符就会把行切错位。
 test("被解析的文本里含分隔符：不许静默少读一行，也不许把两行读成一行", async () => {

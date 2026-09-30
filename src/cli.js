@@ -1,5 +1,5 @@
 #!/usr/bin/env node
-import { readFileSync, writeFileSync, existsSync, readdirSync, mkdirSync, renameSync } from "node:fs";
+import { readFileSync, writeFileSync, existsSync, readdirSync, mkdirSync, renameSync, statSync } from "node:fs";
 import { join, resolve, sep } from "node:path";
 import { loadRoster, keyringOf } from "./proto/roster.js";
 import { seal, verifyEnvelope, msgFileName, newNonce } from "./proto/envelope.js";
@@ -305,6 +305,15 @@ if (cmd === "board") {
 
 // 一条命令看出"这块板子上有没有越写者"：板上的行声称持锁，盘上却没有对应的活锁。
 // **只报不拒**——要拒就得把令牌纳入签名域，那是跳客户端的契约变更。
+// 读数侧的原始 mtime：与 src/claims/lock.js 里的 safeMtime 同语义（拿不到就 0，绝不抛）。
+// 判据在 lock.js 里夹、这里把"夹之前/夹之后"两个数都报出来 —— 分居两处是本轮边界
+// （不改 lock/配置）换来的代价：如果哪天 clamp 改了形，这里的 `采用` 就会说的不是真话。
+// 所以它由两条断言钉着：docs-drift 钉 lock.js 里那句 `Math.min(safeMtime(p), Date.now())` 还在，
+// claims 的两面夹具钉"发生过必有码、没发生过必无码"。
+function lockMtime(claimsDir, file) {
+  try { return statSync(join(claimsDir, file)).mtimeMs; } catch { return 0; }
+}
+
 if (cmd === "audit") {
   const CLAIMS = join(CH, "claims");
   const boardPath = needArg(opt.board, "board=<PROGRESS.md 路径>");
@@ -326,6 +335,25 @@ if (cmd === "audit") {
     console.log(`  ${h.lock}`.padEnd(28) + ` 持有者=${h.who}` +
       `  已占 ${h.ageS}s  剩 ${h.leftS}s / TTL ${h.ttl}s  ${h.expired ? "已到期可回收" : "未到期"}  ${pid}`);
     if (h.clockNote) console.log(`      时钟：${h.clockNote}`);
+    // 【clamp 必须发生得可见】`deadlineOf` 里那句 `Math.min(safeMtime(p), Date.now())` 会把
+    // "mtime 被改到未来"（同步盘重写 / 对端时钟 / 手动 utimes / 模拟器 GMT 错位）与
+    // "刚刚才写的正常文件"**夹成同一个读数**：判据是对的，但报告里两种现场完全同形、也不报错，
+    // 于是下一个入看到"剩 60s"会以为盘上时间可信 —— 其实是别人的钟在替他决定。
+    // 这里只重算并打印，**不动 clamp**；来因写"未判定"是刻意的：本仓从没在真同步盘上验过
+    // "远端会重写 mtime"这个前提（见 README 那句"未验"），没有证据就不许替用户下结论。
+    const rawM = lockMtime(CLAIMS, h.file);
+    const usedM = Math.min(rawM, Date.now());
+    if (rawM !== usedM) {
+      console.log(`      [MTIME_CLAMPED] 原始=${rawM} 采用=${usedM} 抹掉=${rawM - usedM}ms` +
+        `  来因=未判定（候选：写方钟超前 / 同步盘重写 / 手动改时间 / 时区错位）`);
+      // 上面那行与 `h.clockNote` 那句"写方钟偏早"是**同一个观测的两种说法**：`at − mtime` 是负的，
+      // 既可能是写方的钟真早，也可能是 mtime 被改到了未来 —— 本地信息分不出。
+      // clockNote 的措辞在 lock.js 里（本轮不改 lock），所以在读数侧当场把它降回"候选解释"，
+      // 否则两句挨着出现，前一句看起来像已经查明了。
+      if (h.clockNote) {
+        console.log(`      ↑ 上一条时钟注释里的来因不是结论：同一个差值也可由 mtime 被改到未来产生（本机无法区分，见上 [MTIME_CLAMPED]）`);
+      }
+    }
   }
   // 机读汇总行：退码只表达"有没有越写者(stale)"这一件事，
   // 无令牌行(untagged)、现状条数这些**同样要能被机器判**，所以它们进这一行而不是挤进退码。
