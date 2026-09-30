@@ -442,6 +442,15 @@ const MUT = [
     test: "测试计数",
     suite: "test/docs-drift.test.js",
   },
+  {
+    name: "M57 把 S2b 的一条普查拼进消息摘掉（间歇红又变回光秃秃的数字差）",
+    // 20 路并发那两条间歇红过两次，旧消息只有 `18 !== 19`：分不清"双主"与"静默消失"。
+    // 这条变异证明"诊断必须在消息里"这件事有人守着——删掉一处 census 就红。
+    file: join(ROOT, "test/sim.test.js"),
+    pairs: [["家。双主 = 锁失效｜${census(out.s2b)}", "家。双主 = 锁失效"]],
+    test: "S2b 的每条断言都必须自带普查",
+    suite: "test/docs-drift.test.js",
+  },
 ];
 
 // 计数行的正则与判读放在**同一处**定义：`node --test` 的报告格式一改，

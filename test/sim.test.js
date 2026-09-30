@@ -25,6 +25,18 @@ function runSim() {
 
 const { out, stdout } = runSim();
 
+// 抢占这一类偶发红过两次（`S2b` 与 claims 里那条 20 路），而旧断言只报一个数字差
+// （`18 !== 19`）——读的人分不清"有一家静默消失"与"有两家都自称赢"，那两种处置完全不同。
+// 生成器本来就把 20 家的退码存在 `codes` 里，只是断言没打。现在每条 S2b 断言都自带普查：
+// 分布 + 逐家退码（20 个数，一行装得下，不落盘、不产生新文件）。
+function census(o) {
+  const codes = Array.isArray(o.codes) ? o.codes : [];
+  const h = {};
+  for (const c of codes) h[c] = (h[c] || 0) + 1;
+  return `退码分布 ${JSON.stringify(h)}｜rounds=${o.rounds} winners=${o.winners} blocked=${o.blocked} ` +
+    `rows=${o.racerRows} holder=${o.finalHolder}｜逐家 [${codes.join(",")}]`;
+}
+
 test("S1 正常串行：后开工的一方能在板上留下唯一占用行", () => {
   assert.equal(out.s1.ok, true, stdout);
 });
@@ -45,12 +57,15 @@ test("S2b 过期锁的 20 路真并发抢占：恰好 1 家赢，且只有赢家
   // 这条盯的是**抢占路径**，和上面那条盯的"未过期并发"不是同一段代码。
   // 上一版抢占用"先删再建"，20 家里会有多家自称赢（实测 6/7/12 家），
   // 而在未过期场景里量不出来——只测后者就是一半覆盖冒充全覆盖。
+  // 每条断言都带普查（`census`）：本类偶发红过两次，而旧断言只报 `18 !== 19` 这种数字差，
+  // 分不清"有一家静默消失"与"有两家自称赢"——那两种的处置完全不同。
   assert.equal(out.s2b.winners, 1,
-    `${out.s2b.rounds} 家并发抢过期锁，自称赢 ${out.s2b.winners} 家。双主 = 锁失效`);
+    `${out.s2b.rounds} 家并发抢过期锁，自称赢 ${out.s2b.winners} 家。双主 = 锁失效｜${census(out.s2b)}`);
   assert.equal(out.s2b.racerRows, 1,
-    `写板的 racer 应有 1 行，实际 ${out.s2b.racerRows} 行——持锁的和写板的不是同一家`);
-  assert.equal(out.s2b.blocked, out.s2b.rounds - 1, "其余必须全部明确受阻，不许静默消失");
-  assert.match(out.s2b.finalHolder, /^racer-/, "最终持有者必须是 20 家抢占者之一");
+    `写板的 racer 应有 1 行，实际 ${out.s2b.racerRows} 行——持锁的和写板的不是同一家｜${census(out.s2b)}`);
+  assert.equal(out.s2b.blocked, out.s2b.rounds - 1,
+    `其余必须全部明确受阻，不许静默消失｜${census(out.s2b)}`);
+  assert.match(out.s2b.finalHolder, /^racer-/, `最终持有者必须是 20 家抢占者之一｜${census(out.s2b)}`);
 });
 
 test("S3a 拒绝无过期时间的锁（ttl=0 与非数字）", () => {

@@ -424,14 +424,34 @@ test("renew-race 也必须有执行边：真跑 1 轮，判据被走到、汇总
   // 上一批 board-race 坏了而套件全绿那件事之后，"探针只被读文本核对过"就不能再留成缺口。
   // 这一条不重复 22.6 那对统计数字（那是测量），它只验**这台仪器能开机**：
   // 判据没被走到时探针自己会退 4（precondition=1），那正是"跑了但什么都没量"的形状。
+  // 这一条只验**这台仪器能开机、且它对自己的状态说得对**，不验测量结论（结论在 22.6 那对数字里）。
+  //
+  // 第一版把它写错了：断言"退码 ∈ {0,3}"，24 次整套里红了 **1 次**，红在 `4`
+  // （那一轮 20 家抢占方一次都没赢 ⇒ 判据没被走到）。**那是探针自报得完全正确的一次**，
+  // 是我把"这次没量到"写成了失败：单轮 + 真并发本质是概率性的，烟雾用例不该赌它。
+  // 但也不能反过来写成"4 也算过"就完事 —— 那样 skipped 与 passed 又混成一类。
+  // 所以这里判的是**一致性**：三个合法出口各自必须满足自己那句话，且每次都印一行出来。
   const r = runProbe("tools/claims/renew-race.mjs", [rootDir, "1", "400", "--inject=2500"]);
   const out = (r.stdout || "") + (r.stderr || "");
-  assert.ok(r.status === 0 || r.status === 3,
-    `renew-race 实退 ${r.status}：0=抓到双主（缺陷回归）、3=单胜者；4=判据没被走到，9=用法/锚点——都不是"仪器正常"：\n${out.split(/\r?\n/).slice(-12).join("\n")}`);
   const s = parseSummary(r.stdout, "renew-race", ["rounds", "measured", "lost", "precondition", "code"]);
   assert.equal(s.measured, s.rounds, "安排的轮数必须都实测到");
-  assert.equal(s.precondition, 0, "precondition≠0：这一轮的续期/抢占分支没被执行到，退码再好看也不算量过");
   assert.equal(s.code, r.status, "汇总行里写的 code 必须就是进程真实退码（两份数不能各说各话）");
+  if (r.status === 0) {
+    assert.ok(s.lost > 0 && s.precondition === 0,
+      `退 0 该是"抓到双主"，却报 lost=${s.lost} precondition=${s.precondition}`);
+  } else if (r.status === 3) {
+    assert.ok(s.lost === 0 && s.precondition === 0,
+      `退 3 该是"单胜者且判据走过"，却报 lost=${s.lost} precondition=${s.precondition}`);
+  } else if (r.status === 4) {
+    assert.equal(s.precondition, 1,
+      `退 4（前提不成立）却报 precondition=${s.precondition}：它得说自己为什么没量到，空跑不能只是退个码`);
+    assert.equal(s.lost, 0, `退 4 时不许同时报丢行（${s.lost}）："没量到"与"抓到缺陷"不能同时成立`);
+  } else {
+    assert.fail(`renew-race 退了 ${r.status}，不在仪器正常出口 [0,3,4] 之内：\n${out.split(/\r?\n/).slice(-12).join("\n")}`);
+  }
+  // skipped 与 passed 必须**看得见**：每次跑都印一行，不让"这次没量到"沉到输出底下。
+  console.log(`   [renew-race 烟雾] 退 ${r.status}｜lost=${s.lost} precondition=${s.precondition}` +
+    (r.status === 4 ? "｜本次抢占方一家都没赢：仪器开过机，但判据没被走到（烟雾算过，测量不作数）" : ""));
 });
 
 test("window-measure 也必须有执行边：真跑 2 次，样本齐且窗口量为正", () => {
@@ -470,6 +490,17 @@ test("探针的读数只作即时判别：README 明写了'不落盘'与'引用�
   // 反过来也要钉住"确实没有 log 制品"：文档说有、盘上没有，比文档没写更坏。
   const stray = readdirSync(new URL("../tools/claims/", import.meta.url)).filter((f) => f.endsWith(".log"));
   assert.deepEqual(stray, [], `tools/claims 下出现了 ${stray.join(", ")}：README 那句"不落盘"就过期了，两处必须一起改`);
+  // "让下一次自己交代"这件事一旦开始落文件，就会变成第二个 `.verify/`：
+  // 隔壁仓的教训是拒收样本堆到上百个、把真信号埋掉、还没人删。所以这里给三条硬约束，
+  // 由断言核对而不是由我的注释担保：
+  //   ① dump 只走 stdout（仓库里不得出现 .log / .verify / .shots-rejected 这类目录或文件）
+  //   ② 有上限（每处 slice 到位：harness 10 行 ×170 字、烟雾 12 行、普查 20 个码一行）
+  //   ③ 只在失败时印（成功路径不产文件、也不堆输出）
+  const all = readdirSync(new URL("..", import.meta.url), { recursive: true, encoding: "utf-8" })
+    .filter((p) => !p.startsWith("node_modules") && !p.startsWith(".git"));
+  const dumps = all.filter((p) => /\.(log|tmp)$/i.test(p) || /(^|[/\\])(\.verify|\.shots-rejected|dumps)([/\\]|$)/.test(p));
+  assert.deepEqual(dumps, [],
+    `仓里出现了运行期产物 ${dumps.slice(0, 8).join(", ")}：诊断必须先有上限和清理，才能落盘（参见 README 那段"即时判别"第 3 条）`);
 });
 
 test("README 写的变异条数必须等于 red-demo 的条目数（两处数字不许各飘各的）", () => {
@@ -711,6 +742,21 @@ test("五面自证：harness 的五个面在 npm test 里真跑一次（任一�
     `只跑到 ${faces} 个面，预期 5 个（跑一半崩掉与某面没咬住是两件事，先看这份原文）：\n${out}\n[harness 真退码 ${r.status}]`);
   assert.ok(bad.length === 0, `有面没被抓到（这才是这条断言真正防的事）：\n${bad.join("\n")}\n--- 全文尾部 ---\n${lines.slice(-12).join("\n")}`);
   assert.equal(r.status, 0, `harness 没退 0（实退 ${r.status}）：\n${out}`);
+});
+
+test("S2b 的每条断言都必须自带普查（红一次只报数字差，等于下次还得重新猜）", () => {
+  // 20 路并发这类间歇红过两次，旧断言的消息只有 `18 !== 19` / `2 !== 1` 这种数字差：
+  // 读的人分不清"双主（锁失效）"与"有一家静默消失（归因丢失）"，而那两种的处置完全不同。
+  // 现在四条断言每条都拼 `census(out.s2b)`。这条用例不去测 census 的内容（那要真红一次），
+  // 只钉住"消息里必须带它"——摘掉任何一条就红，避免"诊断写好了但被人顺手删了"。
+  const sim = readFileSync(new URL("./sim.test.js", import.meta.url), "utf8");
+  const body = /test\("S2b[\s\S]*?\n\}\);/.exec(sim);
+  assert.ok(body, "找不到 S2b 那条用例：这条核对失去了对象");
+  const asserts = (body[0].match(/assert\.(equal|ok|match)\(/g) || []).length;
+  const withCensus = (body[0].match(/census\(out\.s2b\)/g) || []).length;
+  assert.ok(asserts >= 4, `S2b 只剩 ${asserts} 条断言（应至少 4 条：winners / rows / blocked / holder）`);
+  assert.equal(withCensus, asserts,
+    `S2b 有 ${asserts} 条断言、只有 ${withCensus} 条带普查：剩下那些一旦红，报出来的还是光秃秃的数字差`);
 });
 
 // 分隔符本身可以出现在被解析的文本里（看板正文是 agent 写的，不是代码）。
