@@ -2,7 +2,7 @@
 // 目的不是"检查文档写得好"，是让"改了代码忘了改文档"这件事变成非零退出。
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 import { digestOf } from "../src/proto/envelope.js";
 
 const SIGNING_DOC = new URL("../docs/specs/03-signing.md", import.meta.url);
@@ -200,8 +200,13 @@ test("README 必须写明 renewed 的承诺边界，并且 board 是那条边界
   assert.match(md, /只承诺一件事/, "README 没界定 renewed 到底承诺多久——不界定就会被当成保险");
   assert.match(md, /不承诺[\s\S]{0,40}到我下一次检查之前/, "必须明写'不承诺到下一次检查前'，否则读者以为拿到 0 就可以慢慢写");
   assert.match(md, /cli\.js board/, "README 讲了边界却没给出落地手段：board 那条命令必须在表里");
-  // 窗口必须带数，不能只写"很小"
-  assert.match(md, /\*\*2\.12ms\*\*/, "复验到落盘的残余窗口要写实测数，不写形容词");
+  // 窗口必须带数，不能只写形容词；而且这个数必须能重跑——
+  // 上一版这条钉的是字面量 "2.12ms"，那个数是会话里手工插桩量的，脚本没进仓，
+  // 于是断言只保证"文档里印着这串字符"，不保证这串字符还能被生产出来。
+  assert.match(md, /\*\*复验通过 → 落盘完成\*\*[\s\S]{0,120}?\d+\.\d+ms/, "复验到落盘的残余窗口要写实测数，不写形容词");
+  assert.match(md, /window-measure\.mjs/, "窗口数字必须给出重跑命令，否则它就是一次性的叙述");
+  assert.ok(existsSync(new URL("../tools/claims/window-measure.mjs", import.meta.url)),
+    "README 引用了 tools/claims/window-measure.mjs，可它不在仓里——按本项目的规矩等于不存在");
 });
 
 test("写板 CAS 在代码里真的是'先复验后落盘'，而且复验跑两次", () => {
@@ -234,4 +239,88 @@ test("测试专用延时闸口只能由环境变量打开（生产路径上这�
     "函数第一句就必须按环境变量返回：只看磁盘等于给任何能写该目录的进程一条 25s 的拒绝服务通道");
   const first = fn[0].split("\n").slice(0, 3).join("\n");
   assert.doesNotMatch(first, /existsSync\(f\)/, "在 gateEnabled 判定之前不允许出现任何磁盘探测");
+});
+
+// ============ README 引用的"现场证据源"：文件在、参数在、退码在 ============
+// 本轮唯一的现场证据是那两个并发探针加一个夹具。它们只在提交信息里存在过一次的账，
+// 这次一起清：README 按文件名引用，就得能按文件名跑到，且引用的参数/退码与脚本自己一致。
+test("README 引用的探针与夹具必须真实存在，且写明的参数、退码与脚本一致", () => {
+  const md = readFileSync(README, "utf8");
+  const PROBE_ROWS = [
+    ["tools/claims/board-race.mjs", [0, 3, 9]],
+    ["tools/claims/renew-race.mjs", [0, 3, 4, 9]],
+    ["tools/claims/window-measure.mjs", [0, 8, 9]],
+  ];
+  for (const [rel, codes] of PROBE_ROWS) {
+    const url = new URL("../" + rel, import.meta.url);
+    assert.ok(existsSync(url), `README 按文件名引用了 ${rel}，可它不在仓里——那等于不存在`);
+    const src = readFileSync(url, "utf8");
+    // 退码要从 process.exit(<表达式>) 里取**所有数字**：探针的收尾是 `process.exit(lost.length > 0 ? 0 : 3)`，
+    // 只匹配 \d+ 的那种写法会把 0 和 3 整个漏掉，于是"实际退码集合"看起来比文档少两个——假红。
+    const found = new Set();
+    for (const m of src.matchAll(/process\.exit\(([^)]*)\)/g)) {
+      for (const d of m[1].matchAll(/\d+/g)) found.add(Number(d[0]));
+    }
+    const inCode = [...found].sort((a, b) => a - b);
+    assert.deepEqual(inCode, codes,
+      `${rel} 实际会退的码是 ${inCode.join(", ")}，README 那行按 ${codes.join(", ")} 解释的——对不上就是文档过期`);
+    const row = md.split(/\r?\n/).find((l) => l.startsWith(`| \`${rel}\``));
+    assert.ok(row, `README 必须有一行以 | \`${rel}\` 开头：探针不能只在提交信息里存在`);
+    for (const c of codes) assert.ok(row.includes(`**${c} =`), `README 那行没解释退码 ${c} 的含义`);
+    // README 教人用的每个 --flag，脚本里必须真有这个锚点（写了却不认，是静默空跑的开端）
+    for (const f of new Set([...row.matchAll(/--([a-z-]+)/g)].map((m) => m[1]))) {
+      assert.ok(src.includes(`--${f}`), `README 教人用 --${f}，但 ${rel} 里找不到这个锚点`);
+    }
+  }
+  // --unlocked 是本轮补的账：README 那对 0/6 ↔ 6/6 的"改前"一列之前不可重跑
+  const br = readFileSync(new URL("../tools/claims/board-race.mjs", import.meta.url), "utf8");
+  assert.match(br, /--unlocked/, "board-race 不再支持 --unlocked，README 的对照列就只有一列能重跑");
+  assert.match(br, /--unlocked 必须配 --inject/, "对照列不注入会产出'改前也干净'这种假绿灯，脚本必须拦住");
+  assert.match(md, /0\/6/, "README 要写明'改前'那一列的数字");
+  assert.match(md, /6\/6/, "README 要写明'加板级锁后'那一列的数字");
+
+  const fxUrl = new URL("../test/fixtures/hold-board-lock-and-die.mjs", import.meta.url);
+  assert.ok(existsSync(fxUrl), "README 引用的崩溃夹具不在仓里");
+  const fx = readFileSync(fxUrl, "utf8");
+  assert.match(fx, /process\.exit\(0\)/, "夹具必须真的直接退出——它不 exit，测的就不是崩溃");
+  assert.doesNotMatch(fx, /\brelease\s*\(/, "夹具里出现了 release：那测的是正常收尾，不是死者留下的现场");
+  assert.match(fx, /fs\.writeSync\(1,/, "夹具打印后立刻 exit：console.log 走管道会被截断，证据源自己静默失效");
+
+  // README 里引用的三条用例名必须真的存在（标题逐字对得上）
+  const claims = readFileSync(new URL("./claims.test.js", import.meta.url), "utf8");
+  for (const name of [
+    "持板锁的进程崩溃后，板锁必须被过期回收（不许永远 BOARD_BUSY）",
+    "锁序不变式：全仓不存在「持板锁时再取文件锁」的形状（AB-BA）",
+    "seal 不看令牌是决定，不是遗漏：seal 的代码路径里不得出现板级读取",
+  ]) {
+    assert.ok(claims.includes(`test("${name}"`), `README 引用的用例名在 test/claims.test.js 里不存在：${name}`);
+    assert.ok(md.includes(name.slice(0, 12)), `README 没把这条用例名写出来：${name}`);
+  }
+});
+
+test("README 写的板锁 TTL 与代码常量一致（数字抄错=文档说谎）", () => {
+  const md = readFileSync(README, "utf8");
+  const src = readFileSync(new URL("../src/claims/lock.js", import.meta.url), "utf8");
+  const n = /export const BOARD_LOCK_TTL_S = (\d+);/.exec(src)?.[1];
+  assert.ok(n, "代码里没有 BOARD_LOCK_TTL_S 常量，README 那句'5s'没有真源");
+  assert.ok(md.includes(`BOARD_LOCK_TTL_S = ${n}`),
+    `代码里板锁 TTL 是 ${n}s，README 写的不是这个数——回收窗口对外承诺就错了`);
+});
+
+test("README 的测试计数必须等于各套件 test( 的行数之和", () => {
+  // 手抄的总数会飘：本轮加了 3 条用例，README 还停在 89。
+  // 断言结果不能当断言证据，所以数字从代码里数出来，不写在测试里。
+  const md = readFileSync(README, "utf8");
+  const files = ["protocol", "claims", "cli-keys", "docs-drift", "docs-coverage", "sim"];
+  const per = files.map((f) => [f, (readFileSync(new URL(`./${f}.test.js`, import.meta.url), "utf8").match(/^test\(/gm) || []).length]);
+  const total = per.reduce((s, [, n]) => s + n, 0);
+  const docLine = /测试总数 \*\*(\d+)\*\*（([^）]*)）/.exec(md);
+  assert.ok(docLine, "README 里找不到'测试总数 **N**（…）'那行");
+  assert.equal(Number(docLine[1]), total, `README 写 ${docLine[1]}，各套件实际 ${total}`);
+  for (const [f, n] of per) {
+    assert.ok(docLine[2].includes(`${f} ${n}`), `README 的分项数少了 ${f}（实际 ${n} 条）：${docLine[2]}`);
+  }
+  // 发布约束表里那一格抄的是同一个数，两处会各自飘——一起钉住。
+  assert.ok(md.includes(`✅ ${total}/${total}`),
+    `README 判据 1 那格写的通过数不是 ${total}/${total}，和上一行的总数自相矛盾`);
 });

@@ -165,6 +165,58 @@ const MUT = [
              "void liveKeys; void whoCol; void fileCol;"]],
     test: "伪造一行",
   },
+  // ---- 本轮新增代码面：锁序、seal 隔离、崩溃回收 ----
+  {
+    name: "M23 持板锁时再去取文件锁（AB-BA 死锁的形状长回来）",
+    file: LOCK,
+    pairs: [["  try {\n    const held = verifyHold({ claimsDir, file, who, at });",
+             "  try {\n    acquire({ claimsDir, file, who, ttl: 60 });   // 变异：把复验改成重新 claim 一次\n    const held = verifyHold({ claimsDir, file, who, at });"]],
+    test: "锁序不变式",
+  },
+  {
+    name: "M24 在 seal 里加一次板级读取（我的可交付性挂在别人的守规矩上）",
+    file: CLI,
+    pairs: [['  const dir = join(CH, "agents", me);',
+             '  auditBoard({ claimsDir: join(CH, "claims"), boardPath: join(CH, "PROGRESS.md") });   // 变异：签名前先看别人有没有写坏板\n  const dir = join(CH, "agents", me);']],
+    test: "seal 不看令牌是决定",
+  },
+  {
+    name: "M25 板锁 TTL 拉长到一小时（崩溃的持有者把这张板卡死一小时）",
+    file: LOCK,
+    // 不写 Infinity：那不是"回收不生效"，是 acquire 的 ttl 校验直接把板锁变成拿不到（退 6），
+    // 测试会红在错误的判据上——红的方向比红本身更要紧。
+    pairs: [["export const BOARD_LOCK_TTL_S = 5;", "export const BOARD_LOCK_TTL_S = 3600;"]],
+    test: "崩溃后",
+  },
+  {
+    name: "M26 写板成功却不放开板锁（下次写者白等，回收变成一次性）",
+    file: LOCK,
+    pairs: [["    release({ claimsDir, file: BOARD_LOCK, who: boardWho });",
+             "    void boardWho;   // 变异：finally 里忘了 release"]],
+    test: "崩溃后",
+  },
+  // ---- 文档层的新门：三条都要能红 ----
+  {
+    name: "M27 README 的测试总数与分项对不上代码",
+    file: README,
+    suite: "test/docs-drift.test.js",
+    pairs: [["测试总数 **95**（protocol 20 · claims 40", "测试总数 **92**（protocol 20 · claims 40"]],
+    test: "测试计数",
+  },
+  {
+    name: "M28 代码把板锁 TTL 改成 9s，README 还写着 5s",
+    file: LOCK,
+    suite: "test/docs-drift.test.js",
+    pairs: [["export const BOARD_LOCK_TTL_S = 5;", "export const BOARD_LOCK_TTL_S = 9;"]],
+    test: "板锁 TTL",
+  },
+  {
+    name: "M29 README 的探针行少解释一个退码（4）",
+    file: README,
+    suite: "test/docs-drift.test.js",
+    pairs: [["**4 = 前提不成立**", "**（原文已删）**"]],
+    test: "探针与夹具",
+  },
 ];
 
 function runTest(pattern, suite) {
@@ -180,13 +232,14 @@ function runTest(pattern, suite) {
     // 把断言消息原文抓出来：只报"红了"不够，要看得见红在哪条判据上
     msg: (out.match(/AssertionError[^\n]*/) || [])[0] || (out.match(/^\s*AssertionError[^\n]*/m) || [])[0] || "",
     raw: out,
-    detail: (out.match(/(并发抢占出现[^\n]*|自称赢[^\n]*|TTL 必须是[^\n]*|被拒的 release[^\n]*|被挡住必须留痕[^\n]*|退码表与代码不符[^\n]*|这些退码在[^\n]*|那一行没[^\n]*|第\d+次：脏锁[^\n]*|躺了 \d+s 的脏锁[^\n]*|locks 自己崩了[^\n]*|应判脏锁[^\n]*|实退 \d+[^\n]*|就该收手[^\n]*|一复查就该收手[^\n]*)/) || [])[1] || "",
+    detail: (out.match(/(并发出现[^\n]*|自称赢[^\n]*|TTL 必须是[^\n]*|被拒的 release[^\n]*|被挡住必须留痕[^\n]*|退码表与代码不符[^\n]*|这些退码在[^\n]*|那一行没[^\n]*|第\d+次：脏锁[^\n]*|躺了 \d+s 的脏锁[^\n]*|locks 自己崩了[^\n]*|应判脏锁[^\n]*|实退 \d+[^\n]*|就该收手[^\n]*|一复查就该收手[^\n]*|持板锁期间又去取[^\n]*|不许绕过 writeBoard[^\n]*|板锁仍未被回收[^\n]*|回收写完还留着[^\n]*|seal 里出现了板级读取[^\n]*|那不是过期回收[^\n]*)/) || [])[1] || "",
   };
 }
 
-// 锚点必须对行尾符免疫：src/claims/lock.js 全文 CRLF，README.md 是 LF，
-// 而多行锚点用 \n 写的——不处理的话 M9/M11 会"锚点没命中"，
-// 那比报红更危险：报的是"我测不到"，很容易被读成"我测过没测到"。
+// 锚点必须对行尾符免疫。今天这四个文件在工作区里都是 LF（实测 CRLF 计数=0），
+// 但仓里 core.autocrlf=true 且没有 .gitattributes：换一次检出就可能全是 CRLF。
+// 多行锚点一旦撞上 CRLF 就"锚点没命中"——那比报红更危险：
+// 报的是"我测不到"，很容易被读成"我测过没测到"。
 function pairOf(src, from, to) {
   for (const nl of ["\n", "\r\n"]) {
     const f = from.split("\n").join(nl);
@@ -246,5 +299,7 @@ for (const m of TODO) {
   if (!res.red || empty) allRed = false;
   if (readFileSync(m.file, "utf8") !== src) { console.log("!! 还原失败，停下"); process.exit(9); }
 }
-console.log(allRed ? `=== ${MUT.length} 处变异全部把测试打红 ===` : "=== 有变异没打红、空跑或没命中，结论不成立 ===");
+// RELAY_ONLY 时不能报"26 处全部红"——那是把 4 处的结果说成全部的结果。
+const scope = ONLY.length ? `按 RELAY_ONLY 只跑了 ${TODO.length}/${MUT.length} 处：` : "";
+console.log(allRed ? `=== ${scope}${TODO.length} 处变异全部把测试打红 ===` : "=== 有变异没打红、空跑或没命中，结论不成立 ===");
 process.exit(allRed ? 0 : 8);
