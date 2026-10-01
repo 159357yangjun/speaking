@@ -557,9 +557,18 @@ const MUT = [
     suite: "test/docs-drift.test.js",
   },
   {
-    // M70/M71 打的是 2026-10-01 给 renew-race / window-measure 补的参数纪律。
+    // M72 打的是"把牙装回去"这一步：摘掉退码里的 mismatch 分支之后，注入照样打印那两行 !!、
+    // 表格照样出、退码却与"一切正常"同号 —— 夹具必须因此变红，否则那条断言只是在读文本。
+    name: "M72 两把尺子不同向只打印不拦（回到本笔之前的半坏自检）",
+    file: BR,
+    pairs: [["const code = mismatch > 0 ? EXIT_CODES.harness : decision;", "const code = decision;"]],
+    test: "mismatch 这条腿必须独自拦得下来",
+    suite: "test/docs-drift.test.js",
+  },
     // 摘掉护栏后坏命令并不是不响——它会换一处响（cpSync 的 ENOENT）或干脆静默跑下去，
     // 所以这两条靶子证的正是"归因是否还在该响的那一处"，与 M51 同一族。
+  {
+    // M70/M71 打的是 2026-10-01 给 renew-race / window-measure 补的参数纪律。
     name: "M70 renew-race 不再核对 ROOT 像不像仓库（写反顺序时改由 cpSync 炸 ENOENT）",
     file: RENEW,
     pairs: [['if (!fs.existsSync(path.join(ROOT, "src", "claims", "lock.js"))) {', "if (false) {"]],

@@ -45,6 +45,8 @@ const ROOT = argv[0];
 const ROUNDS = parseInt(argv[1] ?? "20", 10);
 const INJECT = parseInt((argv.find((a) => a.startsWith("--inject=")) ?? "").split("=")[1], 10);
 const UNLOCKED = argv.includes("--unlocked");
+// 故障注入开关（默认关）：给"第二把尺子"造一个**只有它能看见**的状态，见下面 c1 处与 mismatch 那一档。
+const SKEWCLAIM = argv.includes("--skew-claim");
 // 参数必须逐个认得。上一版我把注入写成裸数字（`… 6 600 --unlocked`），
 // 探针一声不吭地按"不注入"跑了 12 轮 —— 那是最容易读成"改前也干净"的一种错法：
 // 命令看起来跑了、跑完了还退了非 0、只是量的根本不是同一件事。
@@ -53,7 +55,7 @@ const UNLOCKED = argv.includes("--unlocked");
 // 曾经写成 `|| /^\d+$/.test(a)`，理由是"轮数也是数字"——但轮数在位置 1，位置 2 之后的数字
 // 只可能是"忘了写 --inject= 的那个注入值"，放它过去等于把本条注释描述的错法原样放行
 // （实测：`… 2 600` 退 3 报"干净"，注入根本没生效）。裸数字现在必撞 stray。
-const known = (a) => a.startsWith("--inject=") || a === "--unlocked" || a === "--detector-selftest-only";
+const known = (a) => a.startsWith("--inject=") || a === "--unlocked" || a === "--skew-claim" || a === "--detector-selftest-only";
 const stray = argv.slice(2).filter((a) => !known(a));
 if (stray.length) {
   console.error(`!! 不认识的参数：${stray.join(" ")}（注入必须写成 --inject=<毫秒>）`);
@@ -210,7 +212,13 @@ for (let r = 1; r <= ROUNDS; r++) {
   const n2 = countRow(board, "src/two.js", "workbuddy");
   const has1 = n1 === 1, has2 = n2 === 1;
   // 两把尺子必须同向；不同向就是测具在骗人，不是缺陷"没撞上"
-  const c1 = claimOf(r1.out), c2 = claimOf(r2.out);
+  const c1r = claimOf(r1.out), c2r = claimOf(r2.out);
+  // `--skew-claim`：把 qoder 自称落笔的那行换成"语法合法但板上没有"的一行。
+  // 造的正是穷举出来的那一格（n1=n2=1 ⇒ 格子尺说两行都在、raw=0、lost=0，而 claim 尺说不在）：
+  // 它模拟的是 cli.js 那句「落的那一行」的措辞/格式被改掉之后，两家各说各话的状态。
+  // 只有第二把尺子看得见它；raw/lost/crossCheck 在这种轮里全都说"没问题"。
+  const c1 = SKEWCLAIM ? "| src/one.js | qoder | 注入：CLI 报的行与板上的行不是同一行 |" : c1r;
+  const c2 = c2r;
   const applicable = r1.code === 0 && r2.code === 0;   // 两家都自称写成功，第二把尺子才有话说
   // "第二把尺子读不出 claim 行" 绝不能和 "板上没有那一行" 长成一样。
   // 上一版这里是静默的：claimOf 失配返 null ⇒ rowPresent 返 false ⇒ 尺子说"不在"，
@@ -268,13 +276,18 @@ const applicable = rows.filter((x) => x.applicable).length;
 // 上一轮我就差点把 renew-race 的一次空跑当成"没有双主"，这次是同一个坑的另一半：
 // 实测 `--inject=3000`（超过板级锁排队预算 BOARD_WAIT_MS）时第二家一律退 12，
 // 板子上自然只有一行——旧判据把这份"没跑成"报成 lost=6/6 并退 0，等于**凭空指控了一次缺陷**。
-const code = applicable === 0 ? EXIT_CODES.precondition : (raw > 0 ? EXIT_CODES.foundLoss : EXIT_CODES.clean);
+const decision = applicable === 0 ? EXIT_CODES.precondition : (raw > 0 ? EXIT_CODES.foundLoss : EXIT_CODES.clean);
+// **两把尺子不同向必须进退码**（2026-10-01 实测补的牙）：上一版这里只打印两行 `!!` 就往下走到
+// `process.exit(code)`，而 code 完全不含 mismatch ⇒ 它嘴上说"停下不出表"，退码却和"一切正常"同一个数。
+// 半坏的自检比没有自检更坏：读的人以为有一道闸，其实那道闸没有电。
+const code = mismatch > 0 ? EXIT_CODES.harness : decision;
 const summary = {
   kind: "board-race", rounds: ROUNDS, measured: rows.length,
   lost: lost.length,
   bothZero: bothZero.length,
   refused: refused.length, applicable,
   inject: Number.isInteger(INJECT) ? INJECT : 0, unlocked: UNLOCKED ? 1 : 0,
+  skew: SKEWCLAIM ? 1 : 0,   // 读数必须带上输入状态：同一张表，注入开没开是两件事
   rulerMismatch: mismatch, rulerApplicable: applicable,
   code, codes: [...new Set(Object.values(EXIT_CODES))],
 };

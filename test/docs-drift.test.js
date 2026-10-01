@@ -1141,6 +1141,34 @@ test("被解析的文本里含分隔符：不许静默少读一行，也不许�
   assert.equal(r.status, 11, "有越写者就该退 11");
 });
 
+// mismatch（第二把尺子不同向）这条腿此前**从没单独开火过**：套件里只有 `rulerMismatch === 0` 那种绿侧断言。
+// 穷举判定空间后发现它确实有独立证人（n1=n2=1 而 claim 尺说不在 ⇒ raw=0、lost=0、只有看得见），
+// 而当时的代码只打印两行 `!!` 就 `process.exit(code)`，code 完全不含 mismatch ⇒ 那道闸没有电。
+// 所以两面都要：注入开 ⇒ 必须真拦（退 9 + 归因原文）；注入关 ⇒ 不得凭空变红（否则这条腿是永红夹具）。
+test("mismatch 这条腿必须独自拦得下来：注入开退 9、注入关不得变红，读数带 skew 状态", () => {
+  const fields = ["rounds", "measured", "applicable", "lost", "rulerMismatch", "skew", "code"];
+  const off = runProbe("tools/claims/board-race.mjs", [rootDir, "2"]);
+  const offOut = (off.stdout || "") + (off.stderr || "");
+  const s0 = parseSummary(offOut, "board-race", fields);
+  assert.equal(s0.skew, 0, `默认跑法必须标 skew=0：读数不带输入状态就分不清两次运行（${offOut.slice(-300)}）`);
+  assert.equal(s0.rulerMismatch, 0, `注入关着却有 mismatch=${s0.rulerMismatch}：这条腿在没有靶子时也报红，是假护栏`);
+  assert.notEqual(s0.code, 9, `注入关着却判成测具不可信：\n${offOut.slice(-400)}`);
+  assert.equal(s0.code, off.status, "汇总行 code 必须就是真实退码");
+
+  const on = runProbe("tools/claims/board-race.mjs", [rootDir, "2", "--skew-claim"]);
+  const onOut = (on.stdout || "") + (on.stderr || "");
+  const s1 = parseSummary(onOut, "board-race", fields);
+  assert.equal(s1.skew, 1, "注入开了却没在汇总行标出来：这份表与那条命令对不上");
+  assert.equal(s1.applicable, 2, `注入把竞争轮打空了（applicable=${s1.applicable}）⇒ 靶子没摆对，这次不算开火`);
+  assert.equal(s1.lost, 0, `注入本不该动格子尺（lost=${s1.lost}）：那说明 skew 改的是被测实现而不是第二把尺子`);
+  assert.ok(s1.rulerMismatch >= 1, `注入开了却没有不同向的尺子（rulerMismatch=${s1.rulerMismatch}）⇒ 靶子失效`);
+  // 这一条就是本笔补的牙：只有第二把尺子能看见的那种轮，必须拦得下来，不能只打印两行话。
+  assert.equal(s1.code, 9, `mismatch=${s1.rulerMismatch} 而 code=${s1.code}：嘴上说"停下不出表"、退码却照常 ⇒ 半坏的自检`);
+  assert.equal(on.status, 9, `真实退码 ${on.status} 与汇总行 ${s1.code} 不一致`);
+  assert.match(onOut, /两把尺子不同向[\s\S]*停下不出表/, `退了 9 却没打印自己的归因：\n${onOut.slice(-400)}`);
+  console.log(`[mismatch 这条腿] 关：skew=${s0.skew} rulerMismatch=${s0.rulerMismatch} 退 ${off.status}｜` +
+    `开：skew=${s1.skew} rulerMismatch=${s1.rulerMismatch} lost=${s1.lost} 退 ${on.status}（含"停下不出表"原文）`);
+});
 // ============ 行尾普查：工作树在盘上必须是 LF ============
 // 2026-10-01 的脏重启事故里，`git checkout HEAD -- .` 按本机 core.autocrlf=true 把 5 个文件重新物化成 CRLF。
 // 后果是三条吃 `\n}\n` 这种 LF 形状的源码扫描断言集体红（"找不到 writeBoard"那一族），看着像锁被人改了。
