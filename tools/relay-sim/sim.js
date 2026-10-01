@@ -305,6 +305,29 @@ for (let gi = 0; gi < GATED_ROUNDS; gi++) {
   const gRows = boardRows().filter((r) => /←racer-/.test(r)).length;
   // 双主必须连板面一起交出来：只给"赢家 2 家"分不出两家都落了笔（协议失效）还是一家自称赢却没写板（计数与状态不互印）。
   const gBoard = boardRows().filter((r) => /←racer-/.test(r)).join(" ⏎ ");
+  // 每轮都清点仲裁残留，**不只异常轮**：MC-1-A 说的是"归属证据被静默摘走"，
+  // 它可以发生在 `winners==1` 的轮里（被摘走的那家恰好没落笔），所以只抄异常轮会系统性漏掉它。
+  // 这里只交**原始读数**：`at`/`ttl`/`liveMs` 三个字段照抄，判定只住在 gate-census 一处
+  // （两处各判一次 = 两份谓词会飘，见"多桶分类要单点 classify"那条）。
+  // liveMs 必须在现场算、贴着读文件那一刻：事后拿 JSON 里的 at 补算，会把已经老化的残骸读成活锁。
+  const gStrays = [];
+  try {
+    for (const n of fs.readdirSync(CLAIMS)) {
+      if (!n.includes(".lock.arbiter-")) continue;
+      let rec = {};
+      try { rec = JSON.parse(fs.readFileSync(path.join(CLAIMS, n), "utf8")); } catch { rec = {}; }
+      const at = Number(rec.at);
+      const ttl = Number(rec.ttl);
+      const finite = Number.isFinite(at) && Number.isFinite(ttl);
+      gStrays.push({
+        name: n,
+        who: typeof rec.who === "string" ? rec.who : null,
+        at: finite ? at : null,
+        ttl: finite ? ttl : null,
+        liveMs: finite ? (at + ttl * 1000) - Date.now() : null,
+      });
+    }
+  } catch (e) { gStrays.push({ name: "〈claims 目录读不出〉", who: null, at: null, ttl: null, liveMs: null, readError: String(e.code || e.message) }); }
   // 异常那轮把 claims 目录整份抄下来留现场。为什么必须抄：上一版我只"留住根目录"，
   // 而同一个根目录后面被 S3/S4 的 resetRun 清过——留住的是别人的板面，不是异常那轮的。
   let gScene = null;
@@ -332,9 +355,9 @@ for (let gi = 0; gi < GATED_ROUNDS; gi++) {
       }
     } catch (e) { gScene = `抄现场失败:${e.code || e.message}`; }
   }
-  gPer.push({ winners: gWin, blocked: gBlocked, arrivals: gArrivals, spreadMs: gSpread, holder: gHolder, racerRows: gRows, boardRacerLines: gBoard, scene: gScene, sceneListing: gSceneListing, whys: gWhys, codes: gCodes });
+  gPer.push({ winners: gWin, blocked: gBlocked, arrivals: gArrivals, spreadMs: gSpread, holder: gHolder, racerRows: gRows, boardRacerLines: gBoard, scene: gScene, sceneListing: gSceneListing, whys: gWhys, strays: gStrays, codes: gCodes });
   fs.rmSync(bdir, { recursive: true, force: true });
-  log(`  第${gi + 1}次：到齐 ${gArrivals}/${ROUNDS} 放行跨度 ${gSpread}ms 赢家=${gHolder} 分布 0×${gWin} 3×${gBlocked} racer行=${gRows}${gScene ? ` 现场=${gScene}${gSceneListing ? ` [${gSceneListing.join(" ｜ ")}]` : ""}` : ""}`);
+  log(`  第${gi + 1}次：到齐 ${gArrivals}/${ROUNDS} 放行跨度 ${gSpread}ms 赢家=${gHolder} 分布 0×${gWin} 3×${gBlocked} racer行=${gRows} 仲裁残留=${gStrays.length}${gScene ? ` 现场=${gScene}${gSceneListing ? ` [${gSceneListing.join(" ｜ ")}]` : ""}` : ""}`);
 }
 R.s2bGated = {
   rounds: GATED_ROUNDS, needed: ROUNDS, per: gPer,

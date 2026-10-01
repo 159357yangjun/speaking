@@ -1,0 +1,32 @@
+# 行尾普查这条新门的三面演示（stdout/stderr 原文，未编辑）
+# 时间: 2026-10-01T03:27:12-04:00
+# 面1 期望=绿（盘上全 LF）
+#   复算: node --test --test-name-pattern='跟踪文件在盘上必须是 LF' test/docs-drift.test.js
+[行尾普查] 分母=跟踪文件 53｜LF 53｜CRLF 0｜裸 CR 0｜读不到 0｜恒等式 53===53 → 成立
+ℹ tests 1
+ℹ pass 1
+ℹ fail 0
+# 面2 注入：把 tools/claims/gate-census.mjs 的行尾换成 CRLF（脚本只加行尾 CR，不动内容）
+toCrlf tools/claims/gate-census.mjs CR=148 bytes=9764 hashMatch=no gitStatusEmpty=no
+--- 注入后 node --check 仍过（说明这不是语法损坏）---
+node --check OK
+--- 注入后这条门 ---
+[行尾普查] 分母=跟踪文件 53｜LF 52｜CRLF 1｜裸 CR 0｜读不到 0｜恒等式 53===53 → 成立
+✖ 跟踪文件在盘上必须是 LF：三条源码扫描断言的前提不许靠运气 (29.4467ms)
+ℹ tests 1
+ℹ pass 0
+ℹ fail 1
+✖ failing tests:
+✖ 跟踪文件在盘上必须是 LF：三条源码扫描断言的前提不许靠运气 (29.4467ms)
+  AssertionError [ERR_ASSERTION]: 1/53 个跟踪文件在盘上不是 LF：tools/claims/gate-census.mjs。
+  通常成因是 git 的 smudge（本机 core.autocrlf=true）重新物化：它写回 CRLF。这时内容哈希对账看不出任何异常（clean 过滤又把 CRLF 折回 LF ⇒ 与 blob 同哈希），红的是那三条吃 LF 的源码扫描断言，报出来像『writeBoard 被摘了』，会被误读成锁被人改了。
+  修法：把这几个文件行尾换回 LF（只删行尾 CR；换完字节数应等于 git cat-file -s HEAD:<file>）；或给仓加一行 text=auto eol=lf 让 LF 成为规范形态 —— 后者改的是全机 checkout 行为，须主控批。
+# 面3 换回 LF ⇒ 必须自己变绿
+toLf tools/claims/gate-census.mjs CR=0 bytes=9616 hashMatch=no gitStatusEmpty=no
+[行尾普查] 分母=跟踪文件 53｜LF 53｜CRLF 0｜裸 CR 0｜读不到 0｜恒等式 53===53 → 成立
+ℹ tests 1
+ℹ pass 1
+ℹ fail 0
+# 注：面2/面3 里 toggle 打的 hashMatch 对 gate-census.mjs 无意义——这一轮它本来就被我改过（未提交），
+#     与 HEAD 不同哈希是预期的。它只在【未改动文件】上才是「git 的内容对账看不见行尾」的证人
+#     （那里 clean 过滤把 CRLF 折回 LF ⇒ 哈希与 blob 相等，而盘上字节不同、三条源码扫描断言红）。

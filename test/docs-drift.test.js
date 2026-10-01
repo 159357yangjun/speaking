@@ -458,25 +458,43 @@ test("renew-race 也必须有执行边：真跑 1 轮，判据被走到、汇总
     (r.status === 4 ? "｜本次抢占方一家都没赢：仪器开过机，但判据没被走到（烟雾算过，测量不作数）" : ""));
 });
 
-test("gate-census 必须真跑一次：抓到的双主只登记、不接退码，这条定档由它自己钉住", () => {
+test("gate-census 必须真跑一次：工具抓到事件就退 1，而套件这一侧仍只登记（允许 0/1/2/9）", () => {
   const t0 = Date.now();
   const r = runProbe("tools/claims/gate-census.mjs", [rootDir, "--batches=1", "--gated=1"]);
   const out = (r.stdout || "") + (r.stderr || "");
-  const s = parseSummary(out, "gate-census", ["planned", "rounds", "anomalies", "notFull", "unreadable", "strict", "fastPath", "code"]);
+  const s = parseSummary(out, "gate-census",
+    ["planned", "rounds", "events", "dbl", "mc1a", "silent", "notFull", "unreadable",
+      "strayExpired", "strayUnreadable", "fastPath", "collapsed", "code"]);
   // 快路径必须自己声明：--only=s2bg 不跑其它场景，所以"完整推演器还能动"这句话只能由
   // sim.test.js 顶部那次整套真跑来说。两个分母各印各的，谁也不许冒充谁。
   assert.equal(s.fastPath, 1,
     `普查没走 --only=s2bg 快路径（fastPath=${s.fastPath}）⇒ 一条执行边又要付整支推演器的钱，` +
     "而且这个数会被读成『完整推演器也跑过了』");
-  assert.equal(s.unreadable, 0,
-    `有一批读不到 RESULT_JSON ⇒ 这份"抓到 ${s.anomalies} 次"不作数（到不了 ≠ 没有）：\n${out.split(/\r?\n/).slice(-10).join("\n")}`);
   assert.equal(s.rounds, s.planned, `计划 ${s.planned} 轮、真跑到 ${s.rounds} 轮：分母塌了，退码必须是 2 而不是 0`);
-  assert.equal(s.code, r.status, "汇总行写的 code 必须就是进程真实退码");
+  // 没等齐 = 窗口没开 = 这一轮量的还是派发顺序。这里不加"必须等齐"的断言（那会把已知间歇挤进套件），
+  // 只要求它**被如实标成分母塌**：塌了却还退 0/1，就是拿一个没量到的样本冒充量到了。
+  if (s.notFull > 0 || s.collapsed === 1) {
+    assert.equal(r.status, 2,
+      `有 ${s.notFull} 轮没等齐 / collapsed=${s.collapsed} ⇒ 这不是并发放行，是又一次顺序派发；` +
+      `分母必须塌（退 2），不许退 ${r.status} 冒充量到了`);
+  }
+  assert.equal(s.unreadable, 0, `有批读不出 RESULT_JSON ⇒ 这份"抓到 ${s.events} 次"不作数（到不了 ≠ 没有）`);
+  // 三张脸必须互印：事件数 = 双主 + 静默，且 MC-1-A 不许被加成第四类
+  assert.equal(s.events, s.dbl + s.silent,
+    `恒等式不成立：事件 ${s.events} ≠ 双主 ${s.dbl} + 静默 ${s.silent} ⇒ 有一类事件既不算通过也不算失败`);
+  assert.ok(s.mc1a <= s.events, `MC-1-A ${s.mc1a} 比事件总数 ${s.events} 还多 ⇒ 同轮共现被当成多起`);
+  assert.equal(s.code, r.status, "汇总行写的 code 必须就是进程真实退码（两份数不能各说各话）");
   assert.ok([0, 1, 2, 9].includes(r.status),
-    `实退 ${r.status}（0=登记完 · 1=--strict 且抓到 · 2=分母塌 · 9=测具档，两条成因共用：用法错 / 读数与状态不互印，` +
-    `各印自己的 !! 原文）：\n${out.split(/\r?\n/).slice(-8).join("\n")}`);
-  console.log(`[gate-census 烟雾] 1 轮：抓到双主 ${s.anomalies}，未到齐 ${s.notFull}，退 ${r.status}` +
-    `｜本条耗时 ${Date.now() - t0}ms（默认不带 --strict ⇒ 抓到也只登记，不改退码）`);
+    `实退 ${r.status}（0=这轮没事件 · 1=抓到事件 · 2=分母塌 · 9=测具档：用法错 / 读数与状态不互印，各印自己的 !! 原文）：\n` +
+    `${out.split(/\r?\n/).slice(-8).join("\n")}`);
+  // 这一条是"定档"的正面：工具退 1 是真缺陷现形，但 npm test 不因此变红——
+  // 摘掉这条容忍，整套会按合并率 ~14% 概率红，一周内就会被人静音（见 README 闸口那节）。
+  if (r.status === 1) {
+    assert.ok(s.events > 0, `退 1 却报 events=${s.events}：状态说抓到了、计数说没有`);
+  }
+  console.log(`[gate-census 烟雾] 1 轮：事件 ${s.events}（双主 ${s.dbl}｜MC-1-A ${s.mc1a}｜静默 ${s.silent}）` +
+    `｜到期残骸 ${s.strayExpired} 把｜读不出的残留 ${s.strayUnreadable} 把｜退 ${r.status}` +
+    `｜本条耗时 ${Date.now() - t0}ms（工具抓到就退 1；套件允许 1，所以这条不因真缺陷红）`);
 });
 
 test("window-measure 也必须有执行边：真跑 2 次，样本齐且窗口量为正", () => {
@@ -968,6 +986,48 @@ test("被解析的文本里含分隔符：不许静默少读一行，也不许�
   assert.equal(sum.rows, 2, `含竖线的那行被漏掉了（rows=${sum.rows}）：\n${r.stdout}`);
   assert.equal(sum.stale, 2, "两行都对不上活锁，必须都点名");
   assert.equal(r.status, 11, "有越写者就该退 11");
+});
+
+// ============ 行尾普查：工作树在盘上必须是 LF ============
+// 2026-10-01 的脏重启事故里，`git checkout HEAD -- .` 按本机 core.autocrlf=true 把 5 个文件重新物化成 CRLF。
+// 后果是三条吃 `\n}\n` 这种 LF 形状的源码扫描断言集体红（"找不到 writeBoard"那一族），看着像锁被人改了。
+// 为什么必须单独一条门：那两条平时用来对账的尺子在这个事故里都靠不住——
+//   · 内容哈希对账看不见它（clean 过滤把 CRLF 折回 LF ⇒ 与 blob 同哈希，字节却不同）；
+//   · git status 到这事上一边在 README 被整份清零时仍报"干净"（stat 缓存命中，压根没重算），
+//     一边在我把行尾换回 LF 后把 5 个文件列成 M（autocrlf 认为 CRLF 才是规范形态）。
+// 所以承重的判据只有一条：**盘上字节里有没有 CR**。"盘上是 LF"是那三条断言的前提，不许靠运气。
+test("跟踪文件在盘上必须是 LF：三条源码扫描断言的前提不许靠运气", () => {
+  const g = spawnSync("git", ["-C", rootDir, "ls-files", "-z"], { encoding: "utf8" });
+  if (g.status !== 0 || !g.stdout) {
+    console.log(`[行尾普查] skipped-because=git ls-files 实退 ${g.status}（拿不到跟踪名单）⇒ 这条没判，不等于通过`);
+    return;
+  }
+  const files = g.stdout.split("\0").filter(Boolean);
+  // 单点分桶：LF / CRLF / 裸 CR / 读不到 —— 四类必须凑成分母，缺一类就有既不算过也不算失败的桶
+  const classify = (f) => {
+    let s;
+    try { s = readFileSync(path.join(rootDir, f), "latin1"); } catch { return "missing"; }
+    if (/\r\n/.test(s)) return "crlf";
+    if (/\r/.test(s)) return "barecr";
+    return "lf";
+  };
+  const cat = { lf: 0, crlf: [], barecr: [], missing: [] };
+  for (const f of files) {
+    const k = classify(f);
+    if (k === "lf") cat.lf++; else cat[k].push(f);
+  }
+  const bad = [...cat.crlf, ...cat.barecr, ...cat.missing];
+  const sum = cat.lf + cat.crlf.length + cat.barecr.length + cat.missing.length;
+  console.log(`[行尾普查] 分母=跟踪文件 ${files.length}｜LF ${cat.lf}｜CRLF ${cat.crlf.length}｜裸 CR ${cat.barecr.length}` +
+    `｜读不到 ${cat.missing.length}｜恒等式 ${sum}===${files.length} → ${sum === files.length ? "成立" : "不成立"}`);
+  assert.equal(sum, files.length, "分桶没凑齐分母：有一类文件既没算进通过也没算进违规");
+  assert.deepEqual(bad, [],
+    `${bad.length}/${files.length} 个跟踪文件在盘上不是 LF：${bad.join(", ")}。\n` +
+    "通常成因是 git 的 smudge（本机 core.autocrlf=true）重新物化：它写回 CRLF。这时内容哈希对账看不出任何异常" +
+    "（clean 过滤又把 CRLF 折回 LF ⇒ 与 blob 同哈希），红的是那三条吃 LF 的源码扫描断言，" +
+    "报出来像『writeBoard 被摘了』，会被误读成锁被人改了。\n" +
+    "修法：把这几个文件行尾换回 LF（只删行尾 CR；换完字节数应等于 git cat-file -s HEAD:<file>）；" +
+    "或给仓加一行 text=auto eol=lf 让 LF 成为规范形态 —— 后者改的是全机 checkout 行为，须主控批。");
 });
 
 // ============ 全机位口径：文档引用的每个可执行探针，套件里必须真 spawn 过它 ============
