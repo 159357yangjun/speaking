@@ -17,6 +17,7 @@ const README = join(ROOT, "README.md");
 const SUM = join(ROOT, "src/claims/summary.js");
 const BR = join(ROOT, "tools/claims/board-race.mjs");
 const DEMO = join(ROOT, "tools/claims/red-demo.mjs");
+const CENSUS = join(ROOT, "tools/claims/dirty-census.mjs");
 
 // M27 的锚点是**从 README 当场读出来的**，不是手抄的。
 // 上一版手抄了"121"，本轮 121→122→123 连炸两次"锚点没命中"——那是测具自己的固定故障，
@@ -493,6 +494,33 @@ const MUT = [
     pairs: [["  let clampedFrom = rawMtime > m ? rawMtime : null;", "  let clampedFrom = rawMtime;   // 变异：恒真"]],
     test: "没夹过就不许带",
     suite: "test/claims.test.js",
+  },
+  {
+    // 下面三条打的是本轮新加的**扫描器与它的两面夹具**（tools/claims/dirty-census.mjs）。
+    // "两面夹具能把 --scan-root 拓出来的红抦住"这句话此前只是我的声明：没有变异证明过，
+    // 它就必须标成"不占功"。这三条把它变成证据。
+    name: "M63 吞掉 --scan-root= 的值（夹具指向哪都一样，永远扫仓根）",
+    file: CENSUS,
+    pairs: [['if (a.startsWith("--scan-root=")) out.root = path.resolve(a.slice("--scan-root=".length));',
+             'if (a.startsWith("--scan-root=")) out.root = out.root;   // 变异：入参被吞']],
+    test: "两面夹具",
+    suite: "test/docs-drift.test.js",
+  },
+  {
+    name: "M64 摘掉未跟踪兜底层（名单之外的任何名字从此隐身）",
+    file: CENSUS,
+    pairs: [['const untracked = g && g.status === 0 ? (g.stdout || "").trim().split(/\\r?\\n/).filter(Boolean) : [];',
+             'const untracked = [];   // 变异：兜底层不产出任何数']],
+    test: "两面夹具",
+    suite: "test/docs-drift.test.js",
+  },
+  {
+    name: "M65 摘掉分隔符归一（Windows 上反斜杠路径与 git 的正斜杠去比，覆盖恒为漏扫）",
+    file: CENSUS,
+    pairs: [['const slashed = new Set(kept.map((p) => p.split("\\\\").join("/")));',
+             'const slashed = new Set(kept.map((p) => p));   // 变异：不归一']],
+    test: "探针的读数只作即时判别",
+    suite: "test/docs-drift.test.js",
   },
 ];
 
