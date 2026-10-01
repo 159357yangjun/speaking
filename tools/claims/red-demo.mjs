@@ -22,6 +22,7 @@ const RENEW = join(ROOT, "tools/claims/renew-race.mjs");
 const HARNESS = join(ROOT, "tools/claims/selfcheck-harness.mjs");
 const SIM = join(ROOT, "tools/relay-sim/sim.js");
 const WINDOW = join(ROOT, "tools/claims/window-measure.mjs");
+const GCENSUS = join(ROOT, "tools/claims/gate-census.mjs");
 
 // M27 的锚点是**从 README 当场读出来的**，不是手抄的。
 // 上一版手抄了"121"，本轮 121→122→123 连炸两次"锚点没命中"——那是测具自己的固定故障，
@@ -554,6 +555,16 @@ const MUT = [
     file: SIM,
     pairs: [["\nconst OUT =", "\r\nconst OUT ="]],
     test: "跟踪文件在盘上必须是 LF",
+    suite: "test/docs-drift.test.js",
+  },
+  {
+    // M73 打的是"读不出"那一格的**计数**：把它加零之后，盘上依然摆着两把读不出的残留，
+    // 汇总行也会照样打 `strayUnreadable`（值变成 0）⇒ 只有注入夹具那一面会发现"证人被注销了"。
+    // 这正是"桶还在、计数被悄悄吞掉"的形状：不报错、只是少一档读数。
+    name: "M73 普查把『读不出的残留』加零（桶还在，证人被注销）",
+    file: GCENSUS,
+    pairs: [["    strayUnreadable += c.unreadable.length;", "    strayUnreadable += 0;   // 变异：不数这一格"]],
+    test: "注入证人三面",
     suite: "test/docs-drift.test.js",
   },
   {

@@ -69,6 +69,10 @@ for (let i = 1; i <= BATCHES; i++) {
   if (!line) {
     unreadable++;
     console.log(`  批${i}: 读不到 RESULT_JSON（sim 实退 ${r.status}）⇒ 这一批整批作废，不许算"没抓到"`);
+    // 作废的那一批必须自带死因：只报"实退 8/9"而不把子进程的原话摊出来，读的人会以为是分母问题，
+    // 而真实原因（比如 `--seed-stray` 的值不认）就埋在退码 2 这句"到不了"底下 —— 归因丢了。
+    const tail = `${r.stdout || ""}${r.stderr || ""}`.split(/\r?\n/).filter((l) => l.trim()).slice(-6);
+    for (const l of tail) console.log(`      sim 原文｜${l.slice(0, 200)}`);
     continue;
   }
   const parsed = JSON.parse(line.slice("RESULT_JSON ".length));

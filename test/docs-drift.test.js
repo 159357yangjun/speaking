@@ -1169,6 +1169,46 @@ test("mismatch 这条腿必须独自拦得下来：注入开退 9、注入关不
   console.log(`[mismatch 这条腿] 关：skew=${s0.skew} rulerMismatch=${s0.rulerMismatch} 退 ${off.status}｜` +
     `开：skew=${s1.skew} rulerMismatch=${s1.rulerMismatch} lost=${s1.lost} 退 ${on.status}（含"停下不出表"原文）`);
 });
+// 「静默」与「读不出」这两格在 200 轮自然跑里各 0 个证人；没有靶子就永远无法证明判据数得出它们。
+// `SIM_SEED_STRAY=live|garbage` 由 sim 往 claims/ 摆一把**确定性**残留（默认 off ⇒ 什么都不摆）。
+// 这三面各管一件事：live ⇒ 板面正常也要拦（MC-1-A 不是双主的别名）；garbage ⇒ 读不出单列、
+// 既不冒充缺陷也不冒充"没有"；off ⇒ 没摆靶子时不许凭空长出证人。
+// 已知的抖动预算写在这儿：off 面若撞上自然事件（合并率 ~6%/轮 × 2 轮 ≈ 少数情况）会假红一次，
+// 那时该改的是这一面的期望（把自然事件与注入分开计）而不是放宽判据。
+test("注入证人三面：静默拦得下、读不出不冒充缺陷、关着不许多出证人", () => {
+  const seedFields = ["rounds", "events", "dbl", "mc1a", "silent", "strayUnreadable", "collapsed", "code"];
+  const go = (seed) => {
+    const r = runProbe("tools/claims/gate-census.mjs", [rootDir, "--batches=2", "--gated=1"],
+      { env: { ...process.env, SIM_SEED_STRAY: seed } });
+    const out = (r.stdout || "") + (r.stderr || "");
+    return { r, s: parseSummary(out, "gate-census", seedFields), out };
+  };
+  const live = go("live");
+  assert.equal(live.s.collapsed, 0, `注入面分母塌了，这次没量到：\n${live.out.slice(-400)}`);
+  assert.ok(live.s.silent >= 2, `摆了两把活着的他人残留，静默却只有 ${live.s.silent} ⇒ 判数不清得出这一格`);
+  assert.equal(live.s.events, live.s.dbl + live.s.silent, `恒等式在注入面上就不成立：${JSON.stringify(live.s)}`);
+  assert.equal(live.s.code, 1, `只有静默、没有双主的轮，普查 code=${live.s.code}（应当 1）⇒ 静默这条腿仍然没有电`);
+  assert.equal(live.r.status, 1, `真实退码 ${live.r.status} 与汇总行 ${live.s.code} 不一致`);
+  const garbage = go("garbage");
+  assert.equal(garbage.s.strayUnreadable, 2, `摆了两把读不出的残留，却数到 ${garbage.s.strayUnreadable} ⇒ 这一格是空的`);
+  assert.equal(garbage.s.mc1a, 0, "读不出的残留被算成 MC-1-A：那是把'量具到不了'冒充成'抓到了'");
+  assert.equal(garbage.s.events, 0, `读不出不该成为事件（events=${garbage.s.events}）：它只许被单列点名`);
+  assert.equal(garbage.r.status, 0, `注入 garbage 面应当退 0，实退 ${garbage.r.status}`);
+  const off = go("off");
+  assert.equal(off.s.strayUnreadable, 0, `注入关着却有 ${off.s.strayUnreadable} 把读不出 ⇒ 这条腿自己会造证人`);
+  assert.equal(off.s.collapsed, 0);
+  assert.equal(off.s.code, off.r.status, "汇总行 code 必须就是真实退码");
+  // 不认的取值：sim 当场退 9 拒绝，普查那一批因此读不到 RESULT_JSON ⇒ 整体退 2（"到不了"）。
+  // 两件事都要成立：既不降级成"照跑"，也不把死因埋在"分母塌"这句话底下（本笔刚补的 sim 原文回显）。
+  const bogus = runProbe("tools/claims/gate-census.mjs", [rootDir, "--batches=1", "--gated=1"],
+    { env: { ...process.env, SIM_SEED_STRAY: "everything" } });
+  const bOut = (bogus.stdout || "") + (bogus.stderr || "");
+  assert.notEqual(bogus.status, 0, "不认的注入值被静默放行（退 0）：那等于按默认跑完还报干净");
+  assert.match(bOut, /--seed-stray 只认/, `退了 ${bogus.status} 却没带 sim 的拒绝原文 ⇒ 归因埋在"分母塌"里：\n${bOut.slice(-500)}`);
+  console.log(`[注入证人] live: silent=${live.s.silent} events=${live.s.events} 退 ${live.r.status}｜` +
+    `garbage: unreadable=${garbage.s.strayUnreadable} mc1a=${garbage.s.mc1a} 退 ${garbage.r.status}｜` +
+    `off: unreadable=${off.s.strayUnreadable} 退 ${off.r.status}｜bogus 退 ${bogus.status}`);
+});
 // ============ 行尾普查：工作树在盘上必须是 LF ============
 // 2026-10-01 的脏重启事故里，`git checkout HEAD -- .` 按本机 core.autocrlf=true 把 5 个文件重新物化成 CRLF。
 // 后果是三条吃 `\n}\n` 这种 LF 形状的源码扫描断言集体红（"找不到 writeBoard"那一族），看着像锁被人改了。
