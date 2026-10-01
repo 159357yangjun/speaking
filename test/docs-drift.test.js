@@ -462,7 +462,12 @@ test("gate-census 必须真跑一次：抓到的双主只登记、不接退码�
   const t0 = Date.now();
   const r = runProbe("tools/claims/gate-census.mjs", [rootDir, "--batches=1", "--gated=1"]);
   const out = (r.stdout || "") + (r.stderr || "");
-  const s = parseSummary(out, "gate-census", ["planned", "rounds", "anomalies", "notFull", "unreadable", "code"]);
+  const s = parseSummary(out, "gate-census", ["planned", "rounds", "anomalies", "notFull", "unreadable", "strict", "fastPath", "code"]);
+  // 快路径必须自己声明：--only=s2bg 不跑其它场景，所以"完整推演器还能动"这句话只能由
+  // sim.test.js 顶部那次整套真跑来说。两个分母各印各的，谁也不许冒充谁。
+  assert.equal(s.fastPath, 1,
+    `普查没走 --only=s2bg 快路径（fastPath=${s.fastPath}）⇒ 一条执行边又要付整支推演器的钱，` +
+    "而且这个数会被读成『完整推演器也跑过了』");
   assert.equal(s.unreadable, 0,
     `有一批读不到 RESULT_JSON ⇒ 这份"抓到 ${s.anomalies} 次"不作数（到不了 ≠ 没有）：\n${out.split(/\r?\n/).slice(-10).join("\n")}`);
   assert.equal(s.rounds, s.planned, `计划 ${s.planned} 轮、真跑到 ${s.rounds} 轮：分母塌了，退码必须是 2 而不是 0`);

@@ -18,6 +18,13 @@ const ROOT = process.argv[2];
 const AS_JSON = process.argv.includes("--json");
 // S2b-G 闸口放行跑几次。写成参数而不是写死：一次放行 ≈ 1.4s 等过期 + 20 个进程，成本必须能自己调，
 // 而且要按"写了却不认就是静默空跑"那条口径校验——非法值当场退非 0，不静默取默认。
+const ONLY_ARG = process.argv.find((a) => a.startsWith("--only="));
+const ONLY = ONLY_ARG ? ONLY_ARG.split("=")[1] : null;
+if (ONLY_ARG && ONLY !== "s2bg") {
+  // 不认的值不许静默降级成"全跑"：那正是"未知选项只让样本变少、不让它报错"那一族
+  console.error(`!! --only 目前只认 s2bg，收到 ${ONLY_ARG}：拒绝，不降级`);
+  process.exit(9);
+}
 const GATED_ARG = process.argv.find((a) => a.startsWith("--gated="));
 if (GATED_ARG !== undefined && !/^\-\-gated=([1-9]\d{0,2}|0)$/.test(GATED_ARG)) {
   console.error(`!! --gated 必须是 0..999 的整数（0=不跑闸口），收到 ${GATED_ARG}`);
@@ -25,6 +32,9 @@ if (GATED_ARG !== undefined && !/^\-\-gated=([1-9]\d{0,2}|0)$/.test(GATED_ARG)) 
 }
 // 默认 0：整套 `npm test` 里**不跑**闸口（红只登记不拦是这条案的定档）；要跑就 --gated=N，由 gate-census.mjs 负责。
 const GATED_ROUNDS = GATED_ARG ? Number(GATED_ARG.split("=")[1]) : 0;
+// 声明在这里而不是 S2 段里：`--only=s2bg` 要在其它场景之前就能跑闸口段，
+// 放后面会让 gatedScenario 撞上 TDZ（实测 ReferenceError: Cannot access 'ROUNDS' before initialization）。
+const ROUNDS = parseInt(process.env.RELAY_SIM_ROUNDS || "20", 10);
 const BOARD = path.join(ROOT, "board.md");
 const CLAIMS = path.join(ROOT, "claims");
 const OUT = path.join(ROOT, "out");
@@ -193,6 +203,18 @@ if (mode) process.exit(2); // 未知子模式
 
 fs.mkdirSync(ROOT, { recursive: true });
 const R = {};
+if (ONLY === "s2bg" && GATED_ROUNDS < 1) {
+  console.error("!! --only=s2bg 必须配 --gated=N（N≥1）：说只跑闸口却不跑闸口，那是空跑");
+  process.exit(9);
+}
+if (ONLY === "s2bg") {
+  // 快路径必须在其它场景之前：为一条执行边付整支推演器的钱不合理（整套 23.2s→43.4s，证据 30.3）。
+  // 代价写在读数里：走 --only 时 RESULT_JSON 只有 s2bGated，S1/S2/S2b/S3..S6 一个都没跑；
+  // 完整推演器由 sim.test.js 顶部那次整套真跑负责——两个分母各自印，不许互相冒充。
+  await gatedScenario(R);
+  console.log("RESULT_JSON " + JSON.stringify({ only: "s2bg", gatedRoundsRun: R.s2bGated.rounds, s2bGated: R.s2bGated }));
+  process.exit(0);
+}
 
 head("S1 · 正常串行（A 干完收工，B 再开工）");
 resetRun();
@@ -205,7 +227,6 @@ log(`  板上占用行：${boardRows().join(" , ")} → 串行场景两种机制
 
 head("S2 · 并发抢同一文件：谎报成功数 = 自称领到人数 − 实际持有者数");
 // N=20 而不是 5：5 次排不掉"偶尔没撞上"，会让人误以为旧机制只是不稳而不是根本不安全。
-const ROUNDS = parseInt(process.env.RELAY_SIM_ROUNDS || "20", 10);
 log(`  两个进程同时抢 ${FILE}，各跑 ${ROUNDS} 轮。\n`);
 
 let lieOld = 0;
@@ -260,6 +281,7 @@ log(`    对照：把仲裁换成「先删再建」，同场景 20 家里 12 家
 
 // S2b-G：闸口放行版。低载下这条夹具 95% 的轮次量的是派发顺序（证据廿八），这里让 20 家到齐再一起放行，
 // 并把"放行跨度"量出来——它是窗口宽度的直接读数，不是"我猜这次撞上了"。
+async function gatedScenario(R) {
 if (GATED_ROUNDS > 0) head(`S2b-G · 闸口放行下的 ${ROUNDS} 路并发抢占 × ${GATED_ROUNDS} 次`);
 const gPer = [];
 for (let gi = 0; gi < GATED_ROUNDS; gi++) {
@@ -325,6 +347,18 @@ if (GATED_ROUNDS > 0) log(`  → ${GATED_ROUNDS} 次放行的赢家：${R.s2bGat
   `放行跨度最大 ${R.s2bGated.maxSpreadMs}ms`);
 if (GATED_ROUNDS > 0) log(`    对照：低载那臂 57/60 轮赢家都是第一家（到达顺序真换人的只有 3/60）⇒` +
   `不加闸口时，"恰 1 家赢"多数时候量的是派发顺序；闸口到齐才让它们真挤进同一个临界区（证据廿八/廿九）。`);
+
+}
+
+await gatedScenario(R);
+
+if (ONLY === "s2bg") {
+  // 快路径：为一条执行边付整支推演器的钱不合理（整套 23.2s→43.4s，证据 30.3）。
+  // 代价写在这儿：走 --only 时 RESULT_JSON 里只有 s2bGated，别的场景一个都没跑；
+  // 完整推演器由 sim.test.js 顶部那次整套真跑负责——两个分母各自印，不许互相冒充。
+  console.log("RESULT_JSON " + JSON.stringify({ only: "s2bg", gatedRoundsRun: R.s2bGated.rounds, s2bGated: R.s2bGated }));
+  process.exit(0);
+}
 
 head("S3 · 脏声明：领了锁就崩，不收尾");
 resetRun();

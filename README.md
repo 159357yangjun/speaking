@@ -298,7 +298,7 @@ OneDrive / WPS 客户端是活的 ⇒ "把 `--channel` 挪进同步范围"对下
 
 | `tools/claims/dirty-census.mjs` | `node tools/claims/dirty-census.mjs`（默认扫本仓根）· `node tools/claims/dirty-census.mjs --scan-root=<目录>`（两面夹具用它扫 `%TEMP%` 里的脏树，所以门不必红自己的仓） | 不要，纯只读 | 两层：`SCRATCH` 命名清单四条（每条带理由）+ `git ls-files --others --exclude-standard` 兜底；一行里同时印**分母**（本次扫到的路径数）、**覆盖**（git 跟踪集是否全在扫描里）、**逐类计数与恒等式**。分隔符必须归一：Windows 上 readdir 给反斜杠而 `git ls-files` 给正斜杠 | **0 = 干净且有分母** · **1 = 抓到脏件**（名单命中或未跟踪 > 0）· **2 = 没有分母**（跟踪集为空或不是 git 树 ⇒ 那份"0 命中"**不作数**，不许读成干净）· **9 = 用法错**（不认的参数、`--scan-root` 缺值、扫描根不存在） |
 
-| `tools/claims/gate-census.mjs` | `node tools/claims/gate-census.mjs <仓库绝对路径> --gated=12 --batches=4`（加 `--strict` 才把抓到变成非零） | 不要，只读 | S2b 闸口普查：跑 `sim.js --gated=N` 若干批，把每轮 `winners/racerRows/holder/残留 .arbiter-*/活锁时间差/各家 why 原文` **登记**成表 | **0 = 跑齐了（哪怕抓到双主也只登记，不改退码）** · **1 = 仅 `--strict` 下抓到** · **2 = 分母塌**（有批读不出或轮数不齐 ⇒ 这份"抓到 0 次"不作数）· **9 = 测具这一档**（用法错 / 读数与状态不互印 —— 两条成因共用一个号，但各印自己的 `!!` 原文，读输出能分开）；定档：按合并率 3.9%/轮、每套 4 轮 ≈ 14% 会红的门不接 `npm test`，见证据第廿九节 |
+| `tools/claims/gate-census.mjs` | `node tools/claims/gate-census.mjs <仓库绝对路径> --gated=12 --batches=4`（加 `--strict` 才把抓到变成非零）· 单批只 2.5s：内部走 `sim.js --only=s2bg` 快路径 | 不要，只读 | S2b 闸口普查：跑 `sim.js --gated=N` 若干批，把每轮 `winners/racerRows/holder/残留 .arbiter-*/活锁时间差/各家 why 原文` **登记**成表 | **0 = 跑齐了（哪怕抓到双主也只登记，不改退码）** · **1 = 仅 `--strict` 下抓到** · **2 = 分母塌**（有批读不出或轮数不齐 ⇒ 这份"抓到 0 次"不作数）· **9 = 测具这一档**（用法错 / 读数与状态不互印 —— 两条成因共用一个号，但各印自己的 `!!` 原文，读输出能分开）；定档：按合并率 3.9%/轮、每套 4 轮 ≈ 14% 会红的门不接 `npm test`，见证据第廿九节 |
 
 **方向要读对：这两个探针 0 是坏消息，3 才是好消息。** 而"跑不动"和"跑干净"分得很开，
 靠的就是 `renew-race` 那条 `exit 4`——上一轮我差点把一次"续期分支根本没跑到"的空跑读成"没有双主"。

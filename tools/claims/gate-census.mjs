@@ -42,11 +42,15 @@ if (GATED < 1 || BATCHES < 1) {
 }
 
 let rounds = 0, anomalies = 0, unreadable = 0, notFull = 0;
+let onlyTag = null;   // 记的是 sim 回来的 only 标记：没有它，读者分不清这数是全量跑还是快路径
 const rows = [];
 console.log(`[闸口普查] 计划 ${BATCHES} 次 × 每次 ${GATED} 轮 = ${BATCHES * GATED} 轮，root=${path.resolve(ROOT)}`);
 for (let i = 1; i <= BATCHES; i++) {
   const dir = mkdtempSync(path.join(tmpdir(), "relay-gate-census-"));
-  const r = spawnSync(process.execPath, [path.join(ROOT, "tools/relay-sim/sim.js"), dir, "--json", `--gated=${GATED}`],
+  // 走 sim 的 --only=s2bg 快路径：一批约 4s，而不是把整支推演器跑一遍（16s）。
+  // 代价写在读数里：快路径不跑 S1/S2/S2b/S3..S6，完整推演器由 sim.test.js 顶部那次整套真跑负责。
+  const r = spawnSync(process.execPath,
+    [path.join(ROOT, "tools/relay-sim/sim.js"), dir, "--json", "--only=s2bg", `--gated=${GATED}`],
     { encoding: "utf8", timeout: 900000 });
   rmSync(dir, { recursive: true, force: true });
   const line = (r.stdout || "").split(/\r?\n/).find((l) => l.startsWith("RESULT_JSON "));
@@ -55,7 +59,9 @@ for (let i = 1; i <= BATCHES; i++) {
     console.log(`  批${i}: 读不到 RESULT_JSON（sim 实退 ${r.status}）⇒ 这一批整批作废，不许算"没抓到"`);
     continue;
   }
-  const g = JSON.parse(line.slice("RESULT_JSON ".length)).s2bGated;
+  const parsed = JSON.parse(line.slice("RESULT_JSON ".length));
+  if (parsed.only) onlyTag = parsed.only;
+  const g = parsed.s2bGated;
   if (!g || !Array.isArray(g.per)) { console.log(`  批${i}: JSON 里没有 s2bGated.per ⇒ 夹具没跑到那一步`); unreadable++; continue; }
   g.per.forEach((p, idx) => {
     rounds++;
@@ -84,6 +90,9 @@ console.log(`\n[闸口普查] 分母=真跑到 ${rounds} 轮（计划 ${BATCHES 
 const code = (unreadable > 0 || rounds < BATCHES * GATED) ? EXIT_CODES.noMeasurement
   : anomalies > 0 && argv.includes("--strict") ? EXIT_CODES.found
   : EXIT_CODES.clean;
+// 两个分母各自印，不许互相冒充（--only 快路径不跑 S1/S2/S2b/S3..S6）
+console.log(`[闸口普查] 分母 A（本工具，--only=s2bg 快路径）=闸口轮 ${rounds}；` +
+  `分母 B（完整推演器）=另由 sim.test.js 顶部那次整套真跑负责，本工具没跑过它`);
 const untrust = crossCheck(code, {
   reported: anomalies, raw: rows.length, expect: BATCHES * GATED, measured: rounds,
 });
@@ -93,7 +102,7 @@ if (code === EXIT_CODES.noMeasurement) {
 }
 printSummary({
   kind: "gate-census", planned: BATCHES * GATED, rounds, anomalies, notFull, unreadable,
-  strict: argv.includes("--strict") ? 1 : 0, code,
+  strict: argv.includes("--strict") ? 1 : 0, fastPath: onlyTag === "s2bg" ? 1 : 0, code,
   codes: [...new Set(Object.values(EXIT_CODES))],
 });
 process.exit(untrust ? EXIT_CODES.harness : code);
