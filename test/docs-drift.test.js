@@ -497,10 +497,40 @@ test("探针的读数只作即时判别：README 明写了'不落盘'与'引用�
   //   ② 有上限（每处 slice 到位：harness 10 行 ×170 字、烟雾 12 行、普查 20 个码一行）
   //   ③ 只在失败时印（成功路径不产文件、也不堆输出）
   const all = readdirSync(new URL("..", import.meta.url), { recursive: true, encoding: "utf-8" })
-    .filter((p) => !p.startsWith("node_modules") && !p.startsWith(".git"));
-  const dumps = all.filter((p) => /\.(log|tmp)$/i.test(p) || /(^|[/\\])(\.verify|\.shots-rejected|dumps)([/\\]|$)/.test(p));
-  assert.deepEqual(dumps, [],
-    `仓里出现了运行期产物 ${dumps.slice(0, 8).join(", ")}：诊断必须先有上限和清理，才能落盘（参见 README 那段"即时判别"第 3 条）`);
+    .filter((p) => !p.startsWith("node_modules") && !/^\.git([\\/]|$)/.test(p));
+  // 【运行期脏件的门：命名清单 + 未跟踪兜底，两层】
+  // 旧版只扫 `.log`/`.tmp` 两种后缀，于是**本轮我自己写的 `.tmp-readme-fix.cjs`（用来改 README 的一次性脚本）
+  // 它一个都不认**——"名字里带 tmp、后缀是源码"恰恰是最常见的"用完就忘"形状。这条盲区是我上一轮自己报的，
+  // 现在补上。两层缺一不可：清单管"已经跟踪上的脏名字"（有人把 .log 提交进来），未跟踪兜底管"任何名字的临时件"。
+  const SCRATCH = [
+    [/\.(log|tmp|bak[-\w]*|orig|rej|save|swp|swo)$/i,
+      "跑出来的日志 / 备份 / 合并残留（red-demo 的 .bak-red 若崩在半路也在这儿）"],
+    [/(^|[/\\])\.?tmp[-_]/,
+      "以 tmp- / .tmp- 起头的一次性脚本：本轮那两个改 README 的 .cjs 就是这个形状"],
+    [/(^|[/\\])(scratch[-_]\S*|dumps?|\.verify|\.shots-rejected)([/\\]|$)/i,
+      "dump 与输出目录：隔壁仓的 .verify/ 与 .shots-rejected/ 各堆到上百个，把真信号埋掉、没人删"],
+    [/[-_ ](?:copy|副本|final|new|old|v\d+|test\d*)\.(?:c|m)?js$/i,
+      "手工复制出来的第二份源码：会被人当成现行那份读（过期副本冒充源码那一族）"],
+  ];
+  const hits = [];
+  for (const p of all) {
+    for (const [re, why] of SCRATCH) if (re.test(p)) { hits.push(`${p} ← ${why}`); break; }
+  }
+  // 第二层：git 眼里"未跟踪且没被 .gitignore 认可"的文件就是脏件（不管叫什么）。
+  // 没有 .git 的树（如 `git archive` 导出的对照树）必须**明写 skipped-because**——
+  // 静默跳过 = 这一面从没验过却算通过，正是本轮 crossCheck 那条修向针对的形状。
+  const isRepo = existsSync(path.join(rootDir, ".git"));
+  const g = isRepo ? spawnSync("git", ["ls-files", "--others", "--exclude-standard"], { cwd: rootDir, encoding: "utf8" }) : null;
+  const untracked = g && g.status === 0 ? (g.stdout || "").trim().split(/\r?\n/).filter(Boolean) : [];
+  const fallback = !isRepo ? `skipped-because=不是 git 工作树` : (g.status === 0 ? `已核（未跟踪 ${untracked.length} 个）` : `skipped-because=git 调用失败 status=${g.status}`);
+  // 每次跑都留一行可核对的读数（跑法要求重定向到文件，见 README 那条"跑法"）
+  console.log(`[脏件普查] 名单命中=${hits.length} 未跟踪=${untracked.length} 兜底=${fallback}`
+    + (hits.length ? ` → ${hits.slice(0, 6).join(" | ")}` : "")
+    + (untracked.length ? ` → ${untracked.slice(0, 6).join(" | ")}` : ""));
+  assert.deepEqual([...hits, ...untracked.map((p) => `未跟踪:${p}`)], [],
+    "仓里有运行期脏件（清单命中或未被跟踪）。临时脚本用完必须删；确要留就 `git add` 进仓并由 README 说清它是什么。" +
+    `\n处置上限：诊断只走 stdout、有上限、只在失败时印（README"即时判别"第 3 条）。`);
+  assert.ok(hits.length === 0 || typeof SCRATCH[0][1] === "string", "清单每条必须带理由，不然下个人只会放宽它");
 });
 
 test("README 写的变异条数必须等于 red-demo 的条目数（两处数字不许各飘各的）", () => {
