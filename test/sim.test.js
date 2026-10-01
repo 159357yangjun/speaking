@@ -68,6 +68,24 @@ test("S2b 过期锁的 20 路真并发抢占：恰好 1 家赢，且只有赢家
   assert.match(out.s2b.finalHolder, /^racer-/, `最终持有者必须是 20 家抢占者之一｜${census(out.s2b)}`);
 });
 
+test("S2b-G 闸口放行：先证明窗口开过（20 家到齐），再证明开过之后仍只许 1 家赢、1 行落板", () => {
+  // 这条是证据廿八的直接后果：低载下 57/60 轮赢家都是第一家 ⇒ `winners==1` 有 95% 在量派发顺序。
+  // 顺序不能反：先断"到齐 20/20"，否则"放行后还是 1 家赢"可能只是又一次顺序派发。
+  const g = out.s2bGated;
+  assert.ok(g && Array.isArray(g.per) && g.per.length > 0,
+    "RESULT_JSON 里没有 s2bGated.per：闸口臂从没跑过，这条断言没有对象");
+  const notFull = g.per.map((p, i) => [i + 1, p.arrivals]).filter(([, a]) => a !== g.needed);
+  assert.deepEqual(notFull, [],
+    `${g.rounds} 轮里有 ${notFull.length} 轮没等齐 ${g.needed} 家（轮次.实到：${notFull.map(([n, a]) => `${n}.${a}`).join(", ")}）` +
+    `⇒ 那不是并发放行，是又一次顺序派发，下面的判据随之失去对象`);
+  const detailOf = (p) => `winners=${p.winners} racerRows=${p.racerRows} blocked=${p.blocked} holder=${p.holder} ` +
+    `板面=[${p.boardRacerLines}] claims=${p.sceneListing ? `[${p.sceneListing.join(" ｜ ")}]` : "〈未抄，因为那轮没异常〉"} codes=${JSON.stringify(p.codes)}`;
+  const bad = g.per.filter((p) => p.winners !== 1 || p.racerRows !== 1);
+  assert.deepEqual(bad.map(detailOf), [],
+    `闸口放行后仍有 ${bad.length}/${g.rounds} 轮不是"恰 1 家赢、1 行落板"（双主 = 抢占的 rename 仲裁失效）｜` +
+    `放行跨度最大 ${g.maxSpreadMs}ms，赢家序列 ${g.holders.join(",")}｜逐轮现场：\n${bad.map(detailOf).join("\n")}`);
+});
+
 test("S3a 拒绝无过期时间的锁（ttl=0 与非数字）", () => {
   assert.equal(out.s3a.refusedZeroTtl, true, "ttl=0 必须被拒绝，否则脏声明会永久阻塞");
 });

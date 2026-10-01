@@ -543,6 +543,21 @@ const MUT = [
     test: "五面自证",
     suite: "test/docs-drift.test.js",
   },
+  {
+    // M68 打的是刚建起来的闸口臂（S2b-G）。要把**两道**仲裁一起拆掉才出得了双主：
+    // 只拆 rename 是不够的——实测拆完 winners 仍是 1（`wx` 独占创建是第二道闸，19 家照样撞死在 EEXIST 上）。
+    // 这条靶子因此同时是一句结论：抢占的安全性由两道冗余仲裁撑着，单道坏掉不会红，只有两道一起坏才露出来。
+    name: "M68 两道仲裁一起拆（rename 输了也当前往前面走 + 独占创建退化成普通写）",
+    file: LOCK,
+    pairs: [
+      ['    if (e.code === "ENOENT") return null;   // 别人先搬走了',
+       '    if (e.code === "ENOENT") return p + ".arbiter-ghost";   // 变异：搬输了也当搬到了'],
+      ['fs.writeFileSync(p, JSON.stringify({ who, at: incarnation, ttl: t.value }), { flag: "wx" });',
+       'fs.writeFileSync(p, JSON.stringify({ who, at: incarnation, ttl: t.value }));'],
+    ],
+    test: "S2b-G",
+    suite: "test/sim.test.js",
+  },
 ];
 
 // 计数行的正则与判读放在**同一处**定义：`node --test` 的报告格式一改，
