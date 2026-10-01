@@ -568,6 +568,43 @@ test("脏件普查的两面夹具：同一支工具，脏树退 1、清树退 0�
   } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
+test("临时树前缀两两不同且都带 relay-：这条约定不许只活在'代码恰好遵守'里", () => {
+  // 来源：退 10 那条间歇的一个假设是"两条路在同一前缀的临时树上互删"。我用静态普查把它推掉了
+  // （那一刻 16 个前缀互不相同）。但**普查是读数，不是门**：按本仓口径，只存在于"当前代码恰好遵守"
+  // 的约定必须加断言——否则下一个人复用同一个前缀时，这条推论会静默失效，而没人会红。
+  // 两面：M66 把 renew-race 的 `relay-race-src-` 改成 board-race 正在用的 `relay-board-src-` ⇒ 这条必须红。
+  // Windows 上 readdir(recursive) 用反斜杠连路径，这里必须归一（否则"嵌套目录一个都扫不到"
+  // 会被读成"仓里只有 16 处调用"——正是本轮 26.1c 那条分隔符教训的同一个坑，我自己差点再踩一次）
+  const tree = readdirSync(new URL("..", import.meta.url), { recursive: true, encoding: "utf-8" })
+    .map((p) => p.split("\\").join("/"))
+    .filter((p) => /\.(?:m)?js$/.test(p) && !p.startsWith("node_modules/") && !p.startsWith(".git/"));
+  const rows = [];
+  for (const rel of tree) {
+    const src = readFileSync(new URL(`../${rel}`, import.meta.url), "utf8");
+    const calls = (src.match(/mkdtempSync\(/g) || []).length;
+    if (!calls) continue;
+    const got = [...src.matchAll(/mkdtempSync\([^,]+,\s*"(relay-[^"]*)\s*"/g)].map((m) => m[1]);
+    // 调用数与解出的前缀数必须相等：不等就是**判据瞎了**（写法一变就少读），不是"没有临时树"
+    assert.equal(got.length, calls,
+      `${rel} 里有 ${calls} 处 mkdtempSync，却只解出 ${got.length} 个 relay- 前缀：正则读不出≠不存在，这条门失去对象`);
+    for (const p of got) rows.push({ file: rel, prefix: p });
+  }
+  // 同一文件里两处共用一个前缀是良性的（mkdtemp 还会加随机后缀，那是同一条路的两种现场）；
+  // 要紧的是**两个不同的路**（不同文件）抢同一个前缀 ⇒ 那才是互删对方还在用的树。
+  const byPrefix = new Map();
+  for (const r of rows) {
+    if (!byPrefix.has(r.prefix)) byPrefix.set(r.prefix, new Set());
+    byPrefix.get(r.prefix).add(r.file);
+  }
+  const dups = [...byPrefix.entries()].filter(([, files]) => files.size > 1)
+    .map(([p, files]) => `${p} 被 ${files.size} 个文件共用：${[...files].join(", ")}`);
+  console.log(`[临时树普查] 前缀数=${byPrefix.size} 调用处=${rows.length} 跨文件重复=${dups.length} `
+    + `清单=${[...byPrefix.keys()].sort().join(",")}`);
+  assert.ok(rows.length >= 10, `只数到 ${rows.length} 处临时树调用，少得可疑——多半是扫描根或正则坏了，这份"没有重复"不作数`);
+  assert.deepEqual(dups, [],
+    "两个及以上的文件复用同一个临时树前缀：并发跑起来就是互删对方还在用的树（退 10 那一族的候选成因，别留给运气）");
+});
+
 test("README 写的变异条数必须等于 red-demo 的条目数（两处数字不许各飘各的）", () => {
   // 上一段刚把 46 改成 52，而 README 那句"锁这组 46 处变异"是手抄的：
   // 测试计数有断言钉，变异条数没有——同一族漂移只是还没被抓到而已。

@@ -230,6 +230,15 @@ for (let r = 1; r <= ROUNDS; r++) {
   console.log(`  第${String(r).padStart(2)}轮：退码 qoder=${r1.code} workbuddy=${r2.code}  one行数=${n1} two行数=${n2}  claim尺=(${p1 ? "在" : "不在"},${p2 ? "在" : "不在"})  ` +
     (applicable ? (has1 && has2 ? "两行都在" : "★ 有一行整块丢了") : `○ 有一家没退 0（${r1.code === 0 ? "workbuddy" : "qoder"} 被拒），本轮没跑成竞争`) +
     (agree === false ? "  ✗两把尺子不同向" : ""));
+  // 没退 0 的那家必须把**它自己的原话**摊出来：CLI 那句 `文件系统拒绝 <syscall>（<errno>：<path>）`
+  // 本来就在子进程输出里，而上一版只报"哪家被拒"就把它丢了 ⇒ 退 10 出现过好几次，
+  // 没人知道那是 EPERM（改名撞上占用）、ENOENT（目录被删）还是 EMFILE（句柄耗尽）——三者修法完全不同。
+  if (!applicable) {
+    const loser = r1.code === 0 ? r2 : r1;
+    const who = r1.code === 0 ? "workbuddy" : "qoder";
+    const lines = String(loser.out).split(/\r?\n/).filter((l) => l.trim()).slice(0, 4);
+    console.log(`    ↳ 被拒那家（${who}，退 ${loser.code}）的原文：` + lines.map((l) => l.slice(0, 150)).join(" ⏎ "));
+  }
   fs.rmSync(dir, { recursive: true, force: true });
 }
 

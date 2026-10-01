@@ -18,6 +18,7 @@ const SUM = join(ROOT, "src/claims/summary.js");
 const BR = join(ROOT, "tools/claims/board-race.mjs");
 const DEMO = join(ROOT, "tools/claims/red-demo.mjs");
 const CENSUS = join(ROOT, "tools/claims/dirty-census.mjs");
+const RENEW = join(ROOT, "tools/claims/renew-race.mjs");
 
 // M27 的锚点是**从 README 当场读出来的**，不是手抄的。
 // 上一版手抄了"121"，本轮 121→122→123 连炸两次"锚点没命中"——那是测具自己的固定故障，
@@ -520,6 +521,15 @@ const MUT = [
     pairs: [['const slashed = new Set(kept.map((p) => p.split("\\\\").join("/")));',
              'const slashed = new Set(kept.map((p) => p));   // 变异：不归一']],
     test: "探针的读数只作即时判别",
+    suite: "test/docs-drift.test.js",
+  },
+  {
+    // M66 打的是"临时树前缀不许跨文件复用"这条新门。它挑得很刁：两个前缀同名**不会改变任何行为**
+    // （mkdtemp 还带随机后缀），所以除了这条门，没有任何一条用例会红——这正是"只活在注释里的约定"该有的靶子。
+    name: "M66 让 renew-race 复用 board-race 的临时树前缀（两条路开始互删对方的树）",
+    file: RENEW,
+    pairs: [['"relay-race-src-"', '"relay-board-src-"']],
+    test: "临时树前缀两两不同",
     suite: "test/docs-drift.test.js",
   },
 ];

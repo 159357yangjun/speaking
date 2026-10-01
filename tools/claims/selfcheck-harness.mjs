@@ -26,6 +26,25 @@ import os from "node:os";
 import path from "node:path";
 import { printSummary, parseSummary, crossCheck, HARNESS_EXIT } from "../../src/claims/summary.js";
 
+// 退 10 那一族的现场取证：失败那一刻 %TEMP% 下有多少棵 relay-* 临时树、都是谁的。
+// 上限 6 条 + 按前缀计数（打印必须有上限，否则诊断自己变成第二个 .verify/）。
+function relayTempCensus() {
+  const t = os.tmpdir();
+  let names = [];
+  try { names = fs.readdirSync(t).filter((n) => n.startsWith("relay-")); }
+  catch (e) { return [`读不到 %TEMP%（${e.code || e.message}）`]; }
+  const byPrefix = {};
+  const now = Date.now();
+  const aged = names.map((n) => {
+    const head = n.replace(/-?[A-Za-z0-9]{6}$/, "-*");
+    byPrefix[head] = (byPrefix[head] || 0) + 1;
+    let age = -1;
+    try { age = Math.round((now - fs.statSync(path.join(t, n)).mtimeMs) / 1000); } catch { }
+    return `${n}${age >= 0 ? `(${age}s)` : ""}`;
+  });
+  return [`总=${names.length}`, ...Object.entries(byPrefix).map(([k, v]) => `${k}×${v}`), ...aged.slice(0, 6)];
+}
+
 // 退码声明表（见 board-race.mjs 同名表的注释）
 const EXIT_CODES = { bothCaught: 0, notCaught: 8, badUsage: 9, harness: HARNESS_EXIT };
 
@@ -167,6 +186,17 @@ for (const c of CASES) {
     // 偶发的"某面没咬住"只留上面那三行是分不出原因的：分不清是被检工具真没翻脸，
     // 还是它压根没跑到那一步（ENOENT、锚点没落地、临时副本装不全都会长得一样）。
     // 所以没咬住时把那一次运行的原文尾部摊出来；成功时不摊，免得把 5 面输出泡在水里。
+    // 尾部 10 行还不够：退 10（文件系统失败）那句 `文件系统拒绝 rename（EPERM：…）` 会出现在
+    // **任意位置**，而收尾那几行永远是判据与汇总——所以先按 errno 扫全文，再摊尾部兜底。
+    const errnoLines = out.split(/\r?\n/).filter((l) =>
+      /文件系统拒绝|EPERM|ENOENT|EBUSY|ENOTEMPTY|EMFILE|EACCES|被拒那家/.test(l));
+    if (errnoLines.length) {
+      console.log("   errno 扫描（全文，不是尾部窗口）：");
+      for (const l of errnoLines.slice(0, 6)) console.log("     " + l.slice(0, 190));
+    } else {
+      console.log("   errno 扫描：没匹配到任何 errno 行（那这次的退 10/退 4 就不是文件系统层的事）");
+    }
+    console.log(`   现场：%TEMP% 此刻 relay-* = ${relayTempCensus().join(", ")}`);
     console.log("   那一次运行的原文尾部：");
     for (const l of out.split(/\r?\n/).slice(-10)) console.log("     " + l.slice(0, 170));
   }
