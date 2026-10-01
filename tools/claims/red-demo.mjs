@@ -21,6 +21,7 @@ const CENSUS = join(ROOT, "tools/claims/dirty-census.mjs");
 const RENEW = join(ROOT, "tools/claims/renew-race.mjs");
 const HARNESS = join(ROOT, "tools/claims/selfcheck-harness.mjs");
 const SIM = join(ROOT, "tools/relay-sim/sim.js");
+const WINDOW = join(ROOT, "tools/claims/window-measure.mjs");
 
 // M27 的锚点是**从 README 当场读出来的**，不是手抄的。
 // 上一版手抄了"121"，本轮 121→122→123 连炸两次"锚点没命中"——那是测具自己的固定故障，
@@ -553,6 +554,23 @@ const MUT = [
     file: SIM,
     pairs: [["\nconst OUT =", "\r\nconst OUT ="]],
     test: "跟踪文件在盘上必须是 LF",
+    suite: "test/docs-drift.test.js",
+  },
+  {
+    // M70/M71 打的是 2026-10-01 给 renew-race / window-measure 补的参数纪律。
+    // 摘掉护栏后坏命令并不是不响——它会换一处响（cpSync 的 ENOENT）或干脆静默跑下去，
+    // 所以这两条靶子证的正是"归因是否还在该响的那一处"，与 M51 同一族。
+    name: "M70 renew-race 不再核对 ROOT 像不像仓库（写反顺序时改由 cpSync 炸 ENOENT）",
+    file: RENEW,
+    pairs: [['if (!fs.existsSync(path.join(ROOT, "src", "claims", "lock.js"))) {', "if (false) {"]],
+    test: "renew-race 与 window-measure 的入参契约",
+    suite: "test/docs-drift.test.js",
+  },
+  {
+    name: "M71 window-measure 的次数退回宽容解析（\"2x\" 被 parseInt 读成 2，命令与现场对不上）",
+    file: WINDOW,
+    pairs: [['if (process.argv[3] !== undefined && !/^\\d+$/.test(process.argv[3])) {', "if (false) {"]],
+    test: "renew-race 与 window-measure 的入参契约",
     suite: "test/docs-drift.test.js",
   },
   // M68 已撤回，ID 不复用。理由留在这儿：它打的靶子是 `sim.test.js` 里的 `S2b-G` 断言，

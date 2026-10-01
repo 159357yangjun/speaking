@@ -41,8 +41,32 @@ const REF = flag("lockref");
 const REVERTCAS = process.argv.includes("--revertcas");
 const DEBUG = process.argv.includes("--debug");
 const TRACE = process.argv.includes("--trace-putback");
+// 参数纪律与 board-race 同形（那条是 M48–M57 一族换来的，这两个探针一直没过这道关）：
+// 只判 `!ROOT` 是不够的——写反顺序会在 cpSync 里炸一串看不懂的 ENOENT，
+// 而**位置参数多写一个**会被静默忽略：那正是"命令看起来跑了、跑的不是我以为的那件事"。
 if (!ROOT) {
-  console.error("用法：node tools/claims/renew-race.mjs <仓库绝对路径> [轮数] [LEAD_MS] [--inject=MS] [--lockref=REV] [--debug] [--label=文本]");
+  console.error("用法：node tools/claims/renew-race.mjs <仓库绝对路径> [轮数] [LEAD_MS] [--inject=MS] [--lockref=REV] [--debug] [--label=文本] [--revertcas] [--trace-putback]");
+  process.exit(EXIT_CODES.badUsage);
+}
+if (!fs.existsSync(path.join(ROOT, "src", "claims", "lock.js"))) {
+  console.error(`!! ROOT 不像仓库：找不到 ${path.join(ROOT, "src", "claims", "lock.js")}`);
+  console.error("   参数顺序是 <仓库绝对路径> [轮数] [LEAD_MS]，别把轮数写在第一位。");
+  process.exit(EXIT_CODES.badUsage);
+}
+for (const [i, name] of [[3, "轮数"], [4, "LEAD_MS"]] ) {
+  const raw = process.argv[i];
+  if (raw !== undefined && !/^\d+$/.test(raw)) {
+    console.error(`!! ${name} 必须是非负整数（或整段不写走默认），收到 ${JSON.stringify(raw)}`);
+    console.error(`   停下：parseInt 会把 "6a" 读成 6、把开关读成 NaN，而 NaN 会让下游的样本自洽校验整条跳过。`);
+    process.exit(EXIT_CODES.badUsage);
+  }
+}
+const KNOWN_FLAGS = (a) => a.startsWith("--inject=") || a.startsWith("--lockref=") || a.startsWith("--label=")
+  || a === "--debug" || a === "--revertcas" || a === "--trace-putback";
+const stray = process.argv.slice(5).filter((a) => !KNOWN_FLAGS(a));
+if (stray.length) {
+  console.error(`!! 不认识的参数：${stray.join(" ")}（注入必须写成 --inject=<毫秒>，LEAD 只在第 4 个位置认）`);
+  console.error("   停下：被静默忽略的参数会让『跑过了』与『跑的是我以为的那件事』分不开。");
   process.exit(EXIT_CODES.badUsage);
 }
 

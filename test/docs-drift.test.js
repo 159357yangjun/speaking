@@ -614,6 +614,35 @@ test("gate-census 的 2 与 9 三面必须真被走到：分母塌不许读成'�
   console.log("[gate-census 用法档] --strict 与 --gated=0 都退 9，各印自己的 !! 原文");
 });
 
+// renew-race / window-measure 的参数纪律此前只有 `if (!ROOT)` 一道：写反顺序会在 cpSync 里炸看不懂的
+// ENOENT，而**多写一个位置参数**会被静默忽略（board-race 为这两种错付过 M48–M57 十条变异）。
+// 两面都要：坏命令必须响在该响的那一处；好命令必须照旧跑得起来（否则这条门只是"永远红"的假护栏）。
+test("renew-race 与 window-measure 的入参契约：写反/裸数字/多写位置参数各退 9，好参数照旧跑通", () => {
+  const wrong = [
+    ["tools/claims/renew-race.mjs", ["3", rootDir], "顺序写反（轮数占了仓库路径）", /不像仓库/],
+    ["tools/claims/renew-race.mjs", [rootDir, "abc"], "轮数不是整数", /轮数 必须是|轮数 必须/],
+    ["tools/claims/renew-race.mjs", [rootDir, "3", "70", "600"], "注入值漏写 --inject= 前缀（裸数字）", /不认识的参数/],
+    ["tools/claims/renew-race.mjs", [rootDir, "3", "70", "--oops=1"], "多出不认识的开关", /不认识的参数/],
+    ["tools/claims/window-measure.mjs", ["20", rootDir], "顺序写反（次数占了仓库路径）", /不像仓库/],
+    ["tools/claims/window-measure.mjs", [rootDir, "2x"], "次数不是整数", /次数必须是非负整数/],
+    ["tools/claims/window-measure.mjs", [rootDir, "2", "--inject=600"], "把别的探针的开关搬过来（本探针不认）", /不认识的参数/],
+  ];
+  for (const [rel, args, why, msg] of wrong) {
+    const r = runProbe(rel, args);
+    const out = (r.stdout || "") + (r.stderr || "");
+    assert.equal(r.status, 9, `${rel} ${why}：期望退 9（用法错），实退 ${r.status}\n${out.slice(0, 400)}`);
+    assert.match(out, msg, `${rel} ${why}：退了 9，但那句话不是这一类的归因（读的人会去查错的地方）：\n${out.slice(0, 400)}`);
+  }
+  // 好参数那一面：必须还在跑真实测量，不能被守卫拒掉（这里只要求"不是用法错"，
+  // 真实测量本身可以退 0/3/4，那是协议结论不是入参问题）。
+  const goodRenew = runProbe("tools/claims/renew-race.mjs", [rootDir, "1", "400", "--inject=2500"]);
+  assert.ok([0, 3, 4].includes(goodRenew.status),
+    `好命令被入参守卫拒了（实退 ${goodRenew.status}）：\n${(goodRenew.stdout || "") + (goodRenew.stderr || "")}`);
+  const goodWm = runProbe("tools/claims/window-measure.mjs", [rootDir, "2"]);
+  assert.equal(goodWm.status, 0, `好命令被入参守卫拒了（实退 ${goodWm.status}）`);
+  console.log(`[参数纪律] 两面各核过：坏命令 ${(wrong.length)} 类各退 9 且各说各的话；好命令照旧跑通（renew 退 ${goodRenew.status}、window 退 ${goodWm.status}）`);
+});
+
 test("window-measure 也必须有执行边：真跑 2 次，样本齐且窗口量为正", () => {
   const r = runProbe("tools/claims/window-measure.mjs", [rootDir, "2"]);
   const out = (r.stdout || "") + (r.stderr || "");

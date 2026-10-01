@@ -20,6 +20,23 @@ const EXIT_CODES = { measured: 0, boardFailed: 8, badUsage: 9, harness: HARNESS_
 const ROOT = process.argv[2];
 const N = parseInt(process.argv[3] ?? "20", 10);
 if (!ROOT) { console.error("用法：node tools/claims/window-measure.mjs <仓库绝对路径> [次数=20]"); process.exit(EXIT_CODES.badUsage); }
+// 参数纪律与 board-race 同形（M48–M57 那一族换来的，本探针此前只判了 !ROOT）：
+// 写反顺序会炸一串看不懂的 ENOENT；次数写坏会被 parseInt 静默降级成 NaN 或小得没意义的数。
+if (!fs.existsSync(path.join(ROOT, "src", "claims", "lock.js"))) {
+  console.error(`!! ROOT 不像仓库：找不到 ${path.join(ROOT, "src", "claims", "lock.js")}`);
+  console.error("   参数顺序是 <仓库绝对路径> [次数]，别把次数写在第一位。");
+  process.exit(EXIT_CODES.badUsage);
+}
+if (process.argv[3] !== undefined && !/^\d+$/.test(process.argv[3])) {
+  console.error(`!! 次数必须是非负整数（或整段不写走默认 20），收到 ${JSON.stringify(process.argv[3])}`);
+  process.exit(EXIT_CODES.badUsage);
+}
+const strayWM = process.argv.slice(4).filter((a) => !/^--(json|quiet)$/.test(a));
+if (strayWM.length) {
+  console.error(`!! 不认识的参数：${strayWM.join(" ")}（本探针只吃 <仓库绝对路径> [次数]）`);
+  console.error("   停下：被静默忽略的参数会让『跑过了』与『跑的是我以为的那件事』分不开。");
+  process.exit(EXIT_CODES.badUsage);
+}
 
 const tmp = fs.mkdtempSync(path.join(os.tmpdir(), "relay-window-"));
 fs.cpSync(path.join(ROOT, "src"), path.join(tmp, "src"), { recursive: true });
