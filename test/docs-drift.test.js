@@ -512,21 +512,50 @@ test("探针的读数只作即时判别：README 明写了'不落盘'与'引用�
     [/[-_ ](?:copy|副本|final|new|old|v\d+|test\d*)\.(?:c|m)?js$/i,
       "手工复制出来的第二份源码：会被人当成现行那份读（过期副本冒充源码那一族）"],
   ];
+  // 分桶必须单点：由一个 classify 决定"这条路径算哪一类"，再把**恒等式印出来**。
+  // 不这么做的话，某类既不算命中也不算漏，而"名单命中=0"到底是扫了 900 个还是 0 个，读者分不出来。
+  const classify = (p) => SCRATCH.findIndex(([re]) => re.test(p));
+  const byCat = SCRATCH.map(() => 0);
   const hits = [];
   for (const p of all) {
-    for (const [re, why] of SCRATCH) if (re.test(p)) { hits.push(`${p} ← ${why}`); break; }
+    const i = classify(p);
+    if (i < 0) continue;
+    byCat[i]++;
+    hits.push(`${p} ← ${SCRATCH[i][1]}`);
   }
+  const catSum = byCat.reduce((a, b) => a + b, 0);
   // 第二层：git 眼里"未跟踪且没被 .gitignore 认可"的文件就是脏件（不管叫什么）。
   // 没有 .git 的树（如 `git archive` 导出的对照树）必须**明写 skipped-because**——
   // 静默跳过 = 这一面从没验过却算通过，正是本轮 crossCheck 那条修向针对的形状。
   const isRepo = existsSync(path.join(rootDir, ".git"));
   const g = isRepo ? spawnSync("git", ["ls-files", "--others", "--exclude-standard"], { cwd: rootDir, encoding: "utf8" }) : null;
   const untracked = g && g.status === 0 ? (g.stdout || "").trim().split(/\r?\n/).filter(Boolean) : [];
-  const fallback = !isRepo ? `skipped-because=不是 git 工作树` : (g.status === 0 ? `已核（未跟踪 ${untracked.length} 个）` : `skipped-because=git 调用失败 status=${g.status}`);
-  // 每次跑都留一行可核对的读数（跑法要求重定向到文件，见 README 那条"跑法"）
-  console.log(`[脏件普查] 名单命中=${hits.length} 未跟踪=${untracked.length} 兜底=${fallback}`
+  // 兜底层自己的分母：git 认得的跟踪文件数。它要是 0，说明 git 瞎了，那"未跟踪=0"就不是"干净"。
+  const t = isRepo ? spawnSync("git", ["ls-files"], { cwd: rootDir, encoding: "utf8" }) : null;
+  const trackedList = t && t.status === 0 ? (t.stdout || "").trim().split(/\r?\n/).filter(Boolean) : [];
+  const tracked = trackedList.length;
+  // 【范围下限不许多 invent 一个魔数】"至少扫到 100 个"对一个 51 文件的仓是凭空定的，它只会把干净树判红。
+  // 真正的下限得来自**另一个独立来源**：git 认得的每一个跟踪文件，都必须在这次扫描里出现。
+  // 这里必须显式统一分隔符：readdir(recursive) 在 Windows 上给 `src\claims\lock.js`，
+  // 而 `git ls-files` 给 `src/claims/lock.js`——直接比会"一个都没覆盖"，那是量具瞎，不是仓干净。
+  const slashed = new Set(all.map((p) => p.split("\\").join("/")));
+  const missing = trackedList.filter((p) => !slashed.has(p));
+  const fallback = !isRepo ? `skipped-because=不是 git 工作树` : (g.status === 0 ? `已核` : `skipped-because=git 调用失败 status=${g.status}`);
+  // 【扫描的三个数：分母、逐类、恒等式】每次跑都印在同一行，可事后核对（跑法：重定向到文件再 grep）
+  console.log(`[脏件普查] 分母=扫到 ${all.length} 个路径(已排除 node_modules/.git，含 ${slashed.size} 个不同名) 覆盖=跟踪 ${tracked - missing.length}/${tracked} `
+    + `名单命中=${hits.length} 每类=[${byCat.join(",")}] 恒等式 ${hits.length}==${catSum} `
+    + `未跟踪=${untracked.length} 兜底=${fallback}`
+    + (missing.length ? `｜漏扫=${missing.slice(0, 5).join(",")}` : "")
     + (hits.length ? ` → ${hits.slice(0, 6).join(" | ")}` : "")
     + (untracked.length ? ` → ${untracked.slice(0, 6).join(" | ")}` : ""));
+  // 范围下限：git 的跟踪集就是分母。少一个就是"没扫到"而不是"扫了没找到"，这份 0 命中不作数。
+  assert.ok(!isRepo || tracked >= 1,
+    `git 认得的跟踪文件数是 ${tracked}：兜底层没有分母，"未跟踪=0"是 git 瞎了不是仓干净`);
+  assert.deepEqual(missing.slice(0, 8), [],
+    `扫描没覆盖到 ${missing.length} 个已跟踪文件（列前 8 个：${missing.slice(0, 8).join(", ")}）` +
+    `\n—— 那是扫描根/排除正则/分隔符归一坏了，"名单命中=0"随之不作数`);
+  assert.equal(hits.length, catSum,
+    `恒等式不成立：名单命中=${hits.length} 但逐类之和=${catSum}（分桶不止一处在做判断，某类既没算命中也没算漏）`);
   assert.deepEqual([...hits, ...untracked.map((p) => `未跟踪:${p}`)], [],
     "仓里有运行期脏件（清单命中或未被跟踪）。临时脚本用完必须删；确要留就 `git add` 进仓并由 README 说清它是什么。" +
     `\n处置上限：诊断只走 stdout、有上限、只在失败时印（README"即时判别"第 3 条）。`);
