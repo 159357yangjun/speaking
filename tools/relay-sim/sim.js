@@ -35,6 +35,13 @@ const GATED_ROUNDS = GATED_ARG ? Number(GATED_ARG.split("=")[1]) : 0;
 // 声明在这里而不是 S2 段里：`--only=s2bg` 要在其它场景之前就能跑闸口段，
 // 放后面会让 gatedScenario 撞上 TDZ（实测 ReferenceError: Cannot access 'ROUNDS' before initialization）。
 const ROUNDS = parseInt(process.env.RELAY_SIM_ROUNDS || "20", 10);
+const SEED_ARG = process.argv.find((a) => a.startsWith("--seed-stray="))
+  || (process.env.SIM_SEED_STRAY !== undefined ? `--seed-stray=${process.env.SIM_SEED_STRAY}` : undefined);
+const SEED_STRAY = SEED_ARG ? SEED_ARG.split("=")[1] : "off";
+if (SEED_ARG && !["off", "live", "garbage"].includes(SEED_STRAY)) {
+  console.error(`!! --seed-stray 只认 off|live|garbage，收到 ${SEED_ARG}：不认的值降到"不注入"这条安全侧之前，先拒绝`);
+  process.exit(9);
+}
 const BOARD = path.join(ROOT, "board.md");
 const CLAIMS = path.join(ROOT, "claims");
 const OUT = path.join(ROOT, "out");
@@ -296,6 +303,7 @@ log(`    对照：把仲裁换成「先删再建」，同场景 20 家里 12 家
 async function gatedScenario(R) {
 if (GATED_ROUNDS > 0) head(`S2b-G · 闸口放行下的 ${ROUNDS} 路并发抢占 × ${GATED_ROUNDS} 次`);
 const gPer = [];
+let seeded = 0;   // 注入落地了几把：只在"真摆上了"时非 0，用来证明靶子不是改了个寂寞
 for (let gi = 0; gi < GATED_ROUNDS; gi++) {
   resetRun();
   child(["--claimrmw", "stale-holder", "1"]);
@@ -322,6 +330,16 @@ for (let gi = 0; gi < GATED_ROUNDS; gi++) {
   // 这里只交**原始读数**：`at`/`ttl`/`liveMs` 三个字段照抄，判定只住在 gate-census 一处
   // （两处各判一次 = 两份谓词会飘，见"多桶分类要单点 classify"那条）。
   // liveMs 必须在现场算、贴着读文件那一刻：事后拿 JSON 里的 at 补算，会把已经老化的残骸读成活锁。
+  // 注入证人（默认 off）：手工摆一把确定性的仲裁残留，让"静默"与"读不出"这两格有能被数到的样本。
+  // 摆在两家跑完之后、清点之前 ⇒ 不改赢家数、不改板面，只改"普查能看见什么"。
+  if (SEED_STRAY === "live") {
+    fs.writeFileSync(path.join(CLAIMS, "src_seed.js.lock.arbiter-99998-seed"),
+      JSON.stringify({ who: "seeded-ghost", at: Date.now(), ttl: 60 }));
+    seeded++;
+  } else if (SEED_STRAY === "garbage") {
+    fs.writeFileSync(path.join(CLAIMS, "src_seed.js.lock.arbiter-99997-seed"), "这串不是 JSON");
+    seeded++;
+  }
   const gStrays = [];
   try {
     for (const n of fs.readdirSync(CLAIMS)) {

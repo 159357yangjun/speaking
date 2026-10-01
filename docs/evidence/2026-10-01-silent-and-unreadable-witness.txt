@@ -1,0 +1,32 @@
+# 给『静默』与『读不出』这两格配证人（注入式，默认 off）
+# 时间 2026-10-01T05:32:01-04:00｜复算：SIM_SEED_STRAY=<live|garbage|off> node tools/claims/gate-census.mjs . --batches=2 --gated=2
+# 注意：这是**手工靶子**，不是自然现形；自然跑仍 0/200（见 mc1a-after-gate-200.txt）。它证明的是判据数得出这两格，不是它们发生了。
+
+### SIM_SEED_STRAY=off
+[闸口普查] 分母=真跑到 4 轮（计划 4）｜事件 0 次（双主 0｜MC-1-A 0｜其中板面正常的"静默" 0）｜残留分桶：活的他人 0 起 / 活的本人 0 / 到期 0 / 读不出 0｜未到齐 0 轮｜读不出 0 批
+[闸口普查] 空桶登记：静默、读不出的残留、活的本人＝本轮没有证人 ⇒ 只说明没被抓到，不说明结构上不可能
+[闸口普查] 恒等式：事件 0 = 双主 0 + 静默(只有 MC-1-A、板面正常) 0 ⇒ 0+0=0｜成立｜MC-1-A 0 与双主 0 是交叉关系（可同轮共现），不许加成事件数
+RELAY-SUMMARY {"kind":"gate-census","planned":4,"rounds":4,"events":0,"dbl":0,"mc1a":0,"silent":0,"strayExpired":0,"strayUnreadable":0,"strayOwn":0,"notFull":0,"unreadable":0,"fastPath":1,"collapsed":0,"code":0,"codes":[0,1,2,9]}
+### exit=
+
+### SIM_SEED_STRAY=live
+  ★ 批1 第1轮 winners=1 racerRows=1 blocked=19 holder=racer-10 跨度=15ms 判据=MC-1-A×1
+  ★ 批1 第2轮 winners=1 racerRows=1 blocked=19 holder=racer-12 跨度=48ms 判据=MC-1-A×1
+  ★ 批2 第1轮 winners=1 racerRows=1 blocked=18 holder=racer-13 跨度=21ms 判据=MC-1-A×1
+  ★ 批2 第2轮 winners=1 racerRows=1 blocked=19 holder=racer-14 跨度=21ms 判据=MC-1-A×1
+[闸口普查] 分母=真跑到 4 轮（计划 4）｜事件 4 次（双主 0｜MC-1-A 4｜其中板面正常的"静默" 4）｜残留分桶：活的他人 4 起 / 活的本人 0 / 到期 0 / 读不出 0｜未到齐 0 轮｜读不出 0 批
+[闸口普查] 空桶登记：读不出的残留、活的本人＝本轮没有证人 ⇒ 只说明没被抓到，不说明结构上不可能
+[闸口普查] 恒等式：事件 4 = 双主 0 + 静默(只有 MC-1-A、板面正常) 4 ⇒ 0+4=4｜成立｜MC-1-A 4 与双主 0 是交叉关系（可同轮共现），不许加成事件数
+RELAY-SUMMARY {"kind":"gate-census","planned":4,"rounds":4,"events":4,"dbl":0,"mc1a":4,"silent":4,"strayExpired":0,"strayUnreadable":0,"strayOwn":0,"notFull":0,"unreadable":0,"fastPath":1,"collapsed":0,"code":1,"codes":[0,1,2,9]}
+### exit=
+
+### SIM_SEED_STRAY=garbage
+[闸口普查] 分母=真跑到 4 轮（计划 4）｜事件 0 次（双主 0｜MC-1-A 0｜其中板面正常的"静默" 0）｜残留分桶：活的他人 0 起 / 活的本人 0 / 到期 0 / 读不出 4｜未到齐 0 轮｜读不出 0 批
+[闸口普查] 空桶登记：静默、活的本人＝本轮没有证人 ⇒ 只说明没被抓到，不说明结构上不可能
+[闸口普查] 恒等式：事件 0 = 双主 0 + 静默(只有 MC-1-A、板面正常) 0 ⇒ 0+0=0｜成立｜MC-1-A 0 与双主 0 是交叉关系（可同轮共现），不许加成事件数
+RELAY-SUMMARY {"kind":"gate-census","planned":4,"rounds":4,"events":0,"dbl":0,"mc1a":0,"silent":0,"strayExpired":0,"strayUnreadable":4,"strayOwn":0,"notFull":0,"unreadable":0,"fastPath":1,"collapsed":0,"code":0,"codes":[0,1,2,9]}
+### exit=
+# 每面的真实退码（补：上面那行 exit= 是我写的废命令，不作数）
+SIM_SEED_STRAY=off ⇒ exit=0
+SIM_SEED_STRAY=live ⇒ exit=1
+SIM_SEED_STRAY=garbage ⇒ exit=0
