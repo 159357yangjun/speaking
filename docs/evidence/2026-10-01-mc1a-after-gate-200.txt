@@ -1,0 +1,23 @@
+# MC-1-A 验收：改完 lock.js（仲裁闸）之后必须 0/200
+# 生成时间: 2026-10-01T04:27:28-04:00
+# 复算命令: node tools/claims/gate-census.mjs . --batches=10 --gated=20
+# 判据：事件 0（双主 0 且 MC-1-A 0）⇒ 退 0；闸的实现见 src/claims/lock.js 的 arbiterTokenTake/tokenState
+# --------------------------------------------------------------------------------
+[闸口普查] 计划 10 次 × 每次 20 轮 = 200 轮，root=C:\Users\yyyy\Documents\Qoder\2026-09-28\50171e16
+  批1: 20 轮，跨度最大 41ms，全到齐=true，赢家 racer-8,racer-0,racer-7,racer-13,racer-3,racer-9,racer-11,racer-19,racer-19,racer-19,racer-3,racer-2,racer-9,racer-18,racer-10,racer-2,racer-3,racer-5,racer-7,racer-9
+  批2: 20 轮，跨度最大 32ms，全到齐=true，赢家 racer-3,racer-8,racer-1,racer-4,racer-2,racer-12,racer-17,racer-19,racer-2,racer-16,racer-0,racer-6,racer-15,racer-11,racer-15,racer-0,racer-1,racer-18,racer-5,racer-0
+  批3: 20 轮，跨度最大 32ms，全到齐=true，赢家 racer-4,racer-15,racer-4,racer-16,racer-17,racer-15,racer-14,racer-12,racer-9,racer-17,racer-4,racer-18,racer-17,racer-3,racer-19,racer-14,racer-18,racer-4,racer-0,racer-4
+  批4: 20 轮，跨度最大 44ms，全到齐=true，赢家 racer-2,racer-18,racer-12,racer-1,racer-10,racer-12,racer-12,racer-18,racer-8,racer-14,racer-19,racer-5,racer-19,racer-5,racer-14,racer-16,racer-3,racer-0,racer-19,racer-10
+  批5: 20 轮，跨度最大 32ms，全到齐=true，赢家 racer-3,racer-16,racer-19,racer-13,racer-8,racer-16,racer-15,racer-8,racer-16,racer-15,racer-5,racer-13,racer-15,racer-7,racer-0,racer-11,racer-4,racer-4,racer-13,racer-2
+  批6: 20 轮，跨度最大 40ms，全到齐=true，赢家 racer-19,racer-19,racer-2,racer-8,racer-10,racer-12,racer-5,racer-4,racer-9,racer-17,racer-5,racer-11,racer-2,racer-17,racer-17,racer-8,racer-17,racer-11,racer-10,racer-19
+  批7: 20 轮，跨度最大 32ms，全到齐=true，赢家 racer-6,racer-3,racer-19,racer-0,racer-0,racer-7,racer-3,racer-8,racer-3,racer-19,racer-19,racer-8,racer-3,racer-7,racer-16,racer-14,racer-6,racer-2,racer-15,racer-3
+  批8: 20 轮，跨度最大 33ms，全到齐=true，赢家 racer-10,racer-19,racer-11,racer-19,racer-6,racer-12,racer-5,racer-17,racer-11,racer-18,racer-3,racer-12,racer-7,racer-14,racer-5,racer-4,racer-19,racer-10,racer-8,racer-5
+  批9: 20 轮，跨度最大 35ms，全到齐=true，赢家 racer-16,racer-19,racer-3,racer-6,racer-8,racer-1,racer-10,racer-19,racer-12,racer-11,racer-8,racer-16,racer-1,racer-3,racer-10,racer-10,racer-8,racer-17,racer-18,racer-19
+  批10: 20 轮，跨度最大 31ms，全到齐=true，赢家 racer-8,racer-18,racer-13,racer-17,racer-9,racer-15,racer-6,racer-0,racer-16,racer-19,racer-11,racer-5,racer-19,racer-15,racer-19,racer-5,racer-12,racer-3,racer-18,racer-15
+
+[闸口普查] 分母=真跑到 200 轮（计划 200）｜事件 0 次（双主 0｜MC-1-A 0｜其中板面正常的"静默" 0）｜残留分桶：活的他人 0 起 / 活的本人 0 / 到期 0 / 读不出 0｜未到齐 0 轮｜读不出 0 批
+[闸口普查] 空桶登记：静默、读不出的残留、活的本人＝本轮没有证人 ⇒ 只说明没被抓到，不说明结构上不可能
+[闸口普查] 恒等式：事件 0 = 双主 0 + 静默(只有 MC-1-A、板面正常) 0 ⇒ 0+0=0｜成立｜MC-1-A 0 与双主 0 是交叉关系（可同轮共现），不许加成事件数
+[闸口普查] 分母 A（本工具，--only=s2bg 快路径）=闸口轮 200；分母 B（完整推演器）=另由 sim.test.js 顶部那次整套真跑负责，本工具没跑过它
+RELAY-SUMMARY {"kind":"gate-census","planned":200,"rounds":200,"events":0,"dbl":0,"mc1a":0,"silent":0,"strayExpired":0,"strayUnreadable":0,"strayOwn":0,"notFull":0,"unreadable":0,"fastPath":1,"collapsed":0,"code":0,"codes":[0,1,2,9]}
+# EXIT=0

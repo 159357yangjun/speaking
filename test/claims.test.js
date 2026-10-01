@@ -7,7 +7,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { lockFileName, markerOf, BOARD_LOCK_TTL_S } from "../src/claims/lock.js";
+import { lockFileName, markerOf, BOARD_LOCK_TTL_S, ARBITER_TOKEN_TTL_S } from "../src/claims/lock.js";
 
 const ROOT = path.resolve(path.dirname(fileURLToPath(import.meta.url)), "..");
 const CLI = path.join(ROOT, "src", "cli.js");
@@ -1077,4 +1077,84 @@ test("没夹过就不许带：正常 mtime 时三个出口的 clampedFrom 必须
     "正常锁也报 clampedFrom ⇒ 这个字段一旦恒真就回到 0 信息量");
   assert.equal(list({ claimsDir }).locks.find((x) => x.lock === "src_norm2.js.lock").clampedFrom, null);
   assert.equal(verifyHold({ claimsDir, file: "src/norm2.js", who: "a", at: t }).clampedFrom, null);
+});
+
+// ============ 仲裁闸（MC-1-A / 候选 B，2026-10-01）============
+// 现场（证据册 30.x、31.2/31.5 的两格基线）：A 判某把锁过期→搬走它，同一毫秒 B 已把**新锁**建在
+// 同一个位置并落了板；A 复查后认输，但放回时发现位置被占就放弃 ⇒ B 的活锁永久躺在 `.arbiter-*` 里。
+// 修法是"动 `p` 之前必须先独占拿到 `<p>.arbitrating`"。每条都演两面：有闸必须挡住、无闸必须照旧通过，
+// 否则"挡下"可能是别的东西造成的（而 MC-1-A 要求的是**搬之前**就被挡，不是事后清理）。
+const tokenOf = (dir, file) => `${lockOf(dir, file)}.arbitrating`;
+
+test("仲裁闸在位时不许新建锁；闸不在时同一句必须照旧成功", async () => {
+  const d = mkChannel();
+  fs.mkdirSync(path.join(d, "claims"), { recursive: true });
+  fs.writeFileSync(tokenOf(d, "src/gate1.js"), JSON.stringify({ at: Date.now(), pid: 999999 }));
+  const r = await claim(d, ["--file=src/gate1.js", "--who=me", "--ttl=60"]);
+  assert.equal(r.code, 3, `有闸却拿到锁（退 ${r.code}）：\n${r.out}${r.err}`);
+  assert.match(r.out, /仲裁进行中/, `退 3 却没说出是被闸挡的：\n${r.out}`);
+  assert.ok(!fs.existsSync(lockOf(d, "src/gate1.js")), "被闸挡住却还是把锁建出来了");
+  assert.ok(fs.existsSync(tokenOf(d, "src/gate1.js")), "别人的闸被我替它放了——互斥等于藏起来");
+  // 另一面：同一个目录、只把闸撤掉，同一句必须成功（证明上面那次挡下是闸造成的）
+  fs.rmSync(tokenOf(d, "src/gate1.js"));
+  const ok = await claim(d, ["--file=src/gate1.js", "--who=me", "--ttl=60"]);
+  assert.equal(ok.code, 0, `没有闸却被挡（退 ${ok.code}）⇒ 两面夹具没成立：\n${ok.out}${ok.err}`);
+  assert.ok(fs.existsSync(lockOf(d, "src/gate1.js")));
+});
+
+test("仲裁闸在位时不许搬动别人的锁：过期锁一字未动、不留 .arbiter-*", async () => {
+  const d = mkChannel();
+  fs.mkdirSync(path.join(d, "claims"), { recursive: true });
+  const lk = lockOf(d, "src/gate2.js");
+  const body = JSON.stringify({ who: "victim", at: Date.now() - 700000, ttl: 1 });
+  fs.writeFileSync(lk, body);
+  const old = new Date(Date.now() - 700000);
+  fs.utimesSync(lk, old, old);   // at 与 mtime 都老：这才是"真的过期"（只老 at 会被 clamp 判成没过期）
+  fs.writeFileSync(`${lk}.arbitrating`, JSON.stringify({ at: Date.now(), pid: 999999 }));
+  const r = await claim(d, ["--file=src/gate2.js", "--who=me", "--ttl=60"]);
+  assert.equal(r.code, 3, `有闸在位、过期锁也不许被搬（退 ${r.code}）：\n${r.out}${r.err}`);
+  assert.equal(fs.readFileSync(lk, "utf8"), body, "闸在位却还是把别人的锁搬走/改写了");
+  assert.equal(fs.statSync(lk).mtimeMs, old.getTime(), "mtime 变了 ⇒ 有人动过这把锁");
+  const moved = fs.readdirSync(path.join(d, "claims")).filter((n) => n.includes(".arbiter-"));
+  assert.deepEqual(moved, [], `残留了仲裁临时文件（这就是 MC-1-A 的形状）：${moved.join(", ")}`);
+  // 另一面：撤掉闸，同一份过期锁必须能被正常回收（否则上面那次挡下只是"锁本来就不能抢"）
+  fs.rmSync(`${lk}.arbitrating`);
+  const ok = await claim(d, ["--file=src/gate2.js", "--who=me", "--ttl=60"]);
+  assert.equal(ok.code, 0, `无闸时过期锁抢不动（退 ${ok.code}）⇒ 回收出口被闸堵死：\n${ok.out}${ok.err}`);
+  assert.equal(readLockRaw(d, "src/gate2.js").who, "me",
+    "退 0 却没把过期锁回收过来（判据看盘上事实，不看措辞）");
+});
+
+test("读不懂的仲裁闸降到安全侧（当有人在用），不许当成「没有闸」", async () => {
+  const d = mkChannel();
+  fs.mkdirSync(path.join(d, "claims"), { recursive: true });
+  fs.writeFileSync(tokenOf(d, "src/gate3.js"), "not-json-at-all");
+  const r = await claim(d, ["--file=src/gate3.js", "--who=me", "--ttl=60"]);
+  assert.equal(r.code, 3, `闸内容坏掉却放行（退 ${r.code}）：\n${r.out}${r.err}`);
+  assert.match(r.out, /仲裁进行中/);
+  fs.writeFileSync(tokenOf(d, "src/gate3.js"), JSON.stringify({ at: Date.now() }));  // 有 at 没 pid
+  assert.equal((await claim(d, ["--file=src/gate3.js", "--who=me", "--ttl=60"])).code, 3,
+    "字段残缺的闸也算「读不出」：不认识的取值一律按有人持有");
+});
+
+test("僵尸仲裁闸有 mtime 上界：过界后由后来者回收，不退化成永久阻塞", async () => {
+  const d = mkChannel();
+  fs.mkdirSync(path.join(d, "claims"), { recursive: true });
+  const tk = tokenOf(d, "src/gate4.js");
+  fs.writeFileSync(tk, JSON.stringify({ at: Date.now(), pid: 999999 }));
+  const past = new Date(Date.now() - (ARBITER_TOKEN_TTL_S + 5) * 1000);
+  fs.utimesSync(tk, past, past);
+  const r = await claim(d, ["--file=src/gate4.js", "--who=me", "--ttl=60"]);
+  assert.equal(r.code, 0, `闸过了上界还拦着（退 ${r.code}）⇒ 防双主变成了永久卡死：\n${r.out}${r.err}`);
+  assert.ok(fs.existsSync(lockOf(d, "src/gate4.js")), "拿到锁却没建出来");
+  assert.ok(!fs.existsSync(tk), "回收后的闸没被释放，下一个人还要再等一个上界");
+  assert.deepEqual(fs.readdirSync(path.join(d, "claims")).filter((n) => n.includes(".reaped-")), [],
+    "回收僵尸闸时留下的 .reaped- 副本没被清掉（它会变成第二种暗垃圾）");
+});
+
+test("仲裁闸的寿命上界必须写在退码表与 README 里（不许只活在常量里）", () => {
+  const md = fs.readFileSync(path.join(ROOT, "README.md"), "utf8");
+  assert.ok(md.includes(String(ARBITER_TOKEN_TTL_S)),
+    `README 没有仲裁闸上界 ${ARBITER_TOKEN_TTL_S}s 这个数字：读者没法判断"被挡多久算不正常"`);
+  assert.match(md, /arbitrating/, "README 没说出闸的文件名，运维时按名字找不到它");
 });

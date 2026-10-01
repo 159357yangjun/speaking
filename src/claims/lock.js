@@ -23,6 +23,8 @@ export const EXIT = {
   LOCK_IO: 10,      // 文件系统层面的失败：频道目录被删/只读/不可写。不是协议结论，是环境问题
   STALE_BOARD_ROW: 11,  // audit：板上有行声称持锁、盘上已无对应活锁。**只报不拒**
   BOARD_BUSY: 12,       // board：这张板正被另一个进程重写，等满上界仍未轮到（可重试）
+  ARBITRATION_RESIDUE: 13,  // audit：`claims/` 里躺着**按自己 at+ttl 还活着**的仲裁残留（或未被回收的仲裁闸）
+                            // = MC-1-A 的现场。原来只有 `locks` 打一行、不参与任何判定（2026-10-01 升成硬信号）
 };
 
 // 不可解析锁的回收上界（秒）。这类锁没有 TTL 可读，只能拿文件 mtime 当钟。
@@ -128,7 +130,14 @@ function validateTtl(ttl) {
 // 抢占必须重新走一次独占创建。直接覆盖写会造出双主：B 与 C 同时读到过期锁、
 // 同时 write()、同时返回 stolen——和我们用锁要消灭的那个 bug 是同一个。
 // 所以规则是：谁 wx 成功谁是主，抢不到就老实报 blocked。
-// 空文件窗口也一并消掉：内容随独占创建一次写定，读者不会看到半截锁。
+// **这条曾经写错过（2026-10-01 实测驳回）**：原本这里写"空文件窗口也一并消掉：内容随独占创建一次写定，
+// 读者不会看到半截锁"。它不成立——`writeFileSync(p, body, {flag:"wx"})` 是"先建、再写"，
+// 另一个进程在这两步之间读到的就是 0 字节。实验（400 次创建，并发读者看到 18 次 0 字节）与复算命令：
+//   node tools/claims/wx-empty-window.mjs 400
+// 后果链是真实的：0 字节 ⇒ `readLock` 判"空文件"脏锁 ⇒ `dirty-blocked`(8) ⇒ 处理不周的一方把它当成拿到了。
+// 本轮**没有**顺手改这个窗口（改它要动新建路径的形状，与 MC-1-A 的闸是两件事，混做会让两处都不可归因）；
+// 已修的只是那个"不认识的状态一律按没拿到"的量具缺陷（tools/relay-sim/sim.js 的 --claimrmw）。
+// 新建独占创建仍然保证"只有一个写入者成功"——那是它真正提供的东西。
 
 // 「先 rm 再 wx」有 TOCTOU：A 搬走过期锁并建好新锁之后，慢半步的 B 仍可能执行它的 rm，
 // 把 A 的新鲜锁删掉再建一把——两个 stolen。rename 要求源存在，且并发下只有一个进程能成功，
@@ -165,8 +174,100 @@ function arbiterPutBack(tmp, p) {
     return true;
   } catch (e) {
     if (e.code === "ENOENT" || e.code === "EEXIST") return false;
+    throw e;  }
+}
+
+// ---- 仲裁令牌（MC-1-A / 候选 B，2026-10-01）----
+// 现场长什么样（证据册 30.x 与 31.2 的两格基线）：A 读到的是一把**已过期**的旧持者锁，于是去搬；
+// 同一毫秒里 B 已经把新锁建在同一个位置并落了板；A 搬走的其实是 B 的**活锁**，复查后认输，
+// 但 `arbiterPutBack` 一看位置被占就放弃放回 ⇒ B 的活锁永久躺在 `.arbiter-*` 这个名字里。
+// 两步各自合法（搬与不重试都是设计），合起来把别人的归属证据摘走了。
+//
+// 所以修法不在谓词上，在**"什么时候可以动 `p`"**上：动之前必须先独占拿到 `<p>.arbitrating`。
+// 拿不到就一律 `blocked`（不是"试试再说"），因为令牌存在就意味着有人正在这条临界路上。
+// 新建锁那条路同样要看令牌：不看的后果正是上面那个"第三方在搬走后又建上"的空位。
+export const ARBITER_TOKEN_TTL_S = 30;
+// 令牌自己的上界必须有（它也会成僵尸）：持有者崩掉 ⇒ 后来者按 mtime 过界就回收，
+// 不能把"防双主"变成"永久阻塞"——那与 S3a 拒绝无过期时间的锁是同一条理由。
+const TOKEN_SUFFIX = ".arbitrating";
+
+function tokenPathOf(p) { return `${p}${TOKEN_SUFFIX}`; }
+
+// 令牌状态读法。**mtime 夹到此刻**再算闲置：写方钟偏晚/文件时间在未来，
+// 不许把回收时刻推到未来（与 deadlineOf 同一套纪律）。
+export function tokenState(p) {
+  const t = tokenPathOf(p);
+  let st;
+  try {
+    st = fs.statSync(t);
+  } catch (e) {
+    if (e.code === "ENOENT") return { kind: "none", path: t, idleMs: 0, pid: null };
+    // 目录本身不可读之类：不知道有没有令牌 ⇒ 安全侧当"有人持有"
+    return { kind: "unreadable", path: t, idleMs: null, pid: null, why: `stat ${e.code}` };
+  }
+  const idleMs = Date.now() - Math.min(st.mtimeMs, Date.now());
+  const stale = idleMs > ARBITER_TOKEN_TTL_S * 1000;
+  let pid = null;
+  let at = null;
+  try {
+    const o = JSON.parse(fs.readFileSync(t, "utf8"));
+    pid = Number.isInteger(o.pid) ? o.pid : null;
+    at = Number.isFinite(Number(o.at)) ? Number(o.at) : null;
+  } catch { /* 解析不出来就走下面的 unreadable */ }
+  if (stale) return { kind: "stale", path: t, idleMs, pid, at };
+  // 不认识的取值一律降到安全侧：pid/at 缺一个就当"正被人持有"，但受上面那条 mtime 上界约束
+  if (pid === null || at === null) {
+    return { kind: "unreadable", path: t, idleMs, pid, at, why: "令牌内容缺 pid 或 at（当成持有中，等它过 mtime 上界再回收）" };
+  }
+  return { kind: "held", path: t, idleMs, pid, at };
+}
+
+// 取令牌。返回 { ok, acquired }：
+//   acquired=false 且 ok=true ⇒ 令牌本来就属于我（外层已持有，内层不许替它释放）
+export function arbiterTokenTake(p) {
+  const t = tokenPathOf(p);
+  const st = tokenState(p);
+  if (st.kind === "held") {
+    if (st.pid === process.pid) return { ok: true, acquired: false, state: st };
+    return { ok: false, state: st };
+  }
+  if (st.kind === "unreadable") return { ok: false, state: st };
+  if (st.kind === "stale") {
+    // 回收僵尸令牌本身也要仲裁：谁把它 rename 走，谁才有权重建。
+    // 两个等待者同时回收 ⇒ 只有一个 rename 成功，另一个 ENOENT ⇒ 它改判"有人正持有"。
+    const reaped = `${t}.reaped-${process.pid}-${Math.random().toString(36).slice(2)}`;
+    try {
+      fs.renameSync(t, reaped);
+    } catch (e) {
+      if (e.code === "ENOENT" || e.code === "EEXIST") {
+        return { ok: false, state: { ...tokenState(p), why: `僵尸令牌被别人先回收了（${e.code}）` } };
+      }
+      throw e;
+    }
+    try { fs.unlinkSync(reaped); } catch { /* 删不掉不影响归属，留给 locks 看见 */ }
+  }
+  try {
+    fs.writeFileSync(t, JSON.stringify({ at: Date.now(), pid: process.pid }), { flag: "wx" });
+  } catch (e) {
+    if (e.code === "EEXIST") return { ok: false, state: tokenState(p) };   // 有人同时抢到了令牌
     throw e;
   }
+  return { ok: true, acquired: true, state: tokenState(p) };
+}
+
+// 只放自己那把：pid 对不上就不动——替别人解令牌等于把互斥藏起来。
+export function arbiterTokenRelease(p) {
+  const st = tokenState(p);
+  if (st.kind !== "held" && st.kind !== "unreadable") return st.kind;
+  if (st.pid !== null && st.pid !== process.pid) return "not-mine";
+  try { fs.unlinkSync(tokenPathOf(p)); } catch (e) { if (e.code !== "ENOENT") throw e; }
+  return "released";
+}
+
+// 令牌是不是我的（新建那条路要用：我持着令牌时当然可以继续动这个位置）
+function tokenIsMine(p) {
+  const st = tokenState(p);
+  return st.kind === "held" && st.pid === process.pid;
 }
 
 // ---- 续期标记：只增不改的 CAS ----
@@ -322,14 +423,25 @@ export function acquire({ claimsDir, file, who, ttl }) {
   // 复查永远可以被一次更晚的抢占超过，这是 lock fencing 的老问题，不是实现瑕疵。
   // 能关的地方只有写入点：调用方把令牌带回来（release/提交），过期的那一律退 5。
   let incarnation = null;
+  // 最近一次被令牌挡下的原因。它必须跟着返回值走，不许只长在打印层（全仓那条"可见性"的规矩）。
+  let tokenBlock = null;
   const create = () => {
-    incarnation = Date.now();
+    // **空位新建也要过令牌这一关**。MC-1-A 现场里那把被搬走的活锁，正是"第三方在别人搬走的
+    // 半路上把新锁建到同一个位置上"造出来的；只给抢占加令牌、不给新建加，窗口照旧开着。
+    const tok = arbiterTokenTake(p);
+    if (!tok.ok) { tokenBlock = tok.state; return false; }
+    tokenBlock = null;   // 令牌这一关过了：之前那次挡下的理由不许留着冒充本次的失败原因
     try {
-      fs.writeFileSync(p, JSON.stringify({ who, at: incarnation, ttl: t.value }), { flag: "wx" });
-      return true;
-    } catch (e) {
-      if (e.code === "EEXIST") return false;
-      throw e;
+      incarnation = Date.now();
+      try {
+        fs.writeFileSync(p, JSON.stringify({ who, at: incarnation, ttl: t.value }), { flag: "wx" });
+        return true;
+      } catch (e) {
+        if (e.code === "EEXIST") return false;
+        throw e;
+      }
+    } finally {
+      if (tok.acquired) arbiterTokenRelease(p);   // 外层已持有（steal）时不许替它放
     }
   };
   const ageOf = (c) => (c && c.at ? (Date.now() - c.at) / 1000 : 0);
@@ -339,10 +451,22 @@ export function acquire({ claimsDir, file, who, ttl }) {
     ageS: idleOf(cur), ttl: CORRUPT_GRACE_S,
     reason: `锁文件内容解析不出来（${cur.why}），已躺 ${idleOf(cur).toFixed(0)}s；超过上界 ${CORRUPT_GRACE_S}s 才允许回收`,
   });
-  const blocked = (cur) => (!cur
-    ? { status: "blocked", code: EXIT.BLOCKED, file, path: p, holder: "?", ageS: 0, ttl: undefined }
-    : cur.corrupt ? dirtyBlocked(cur)
-    : { status: "blocked", code: EXIT.BLOCKED, file, path: p, holder: cur.who ?? "?", ageS: ageOf(cur), ttl: cur.ttl });
+  const blocked = (cur) => {
+    const base = !cur
+      ? { status: "blocked", code: EXIT.BLOCKED, file, path: p, holder: "?", ageS: 0, ttl: undefined }
+      : cur.corrupt ? dirtyBlocked(cur)
+      : { status: "blocked", code: EXIT.BLOCKED, file, path: p, holder: cur.who ?? "?", ageS: ageOf(cur), ttl: cur.ttl };
+    if (!tokenBlock) return base;
+    // 被令牌挡下与被人挡下是两件事：理由必须写清楚是谁的令牌、闲置多久、上界多少，
+    // 否则调用方只看到一个 3，分不清是撞车还是正有人在临界路上（也就没法判断该等多久）。
+    const tb = tokenBlock;
+    return {
+      ...base,
+      arbiter: tb,
+      reason: `仲裁进行中：令牌在 pid ${tb.pid ?? "(读不出)"} 手上，已闲置 ${Math.round(tb.idleMs ?? 0)}ms`
+        + `（过 ${ARBITER_TOKEN_TTL_S}s 才允许回收）${tb.why ? `｜${tb.why}` : ""}`,
+    };
+  };
 
   const acquired = () => ({ status: "acquired", code: EXIT.OK, file, path: p, holder: who, ttl: t.value, at: incarnation });
   // 续期失败的专用退码：它和"别人正持着"(3)、"我不是持有者所以不能放"(5) 都不一样——
@@ -358,23 +482,37 @@ export function acquire({ claimsDir, file, who, ttl }) {
   // A 把**别人的活锁**搬走删掉。rename 才是仲裁点：搬走之后那把才算数，
   // 一判它没过期就原样放回、自己认输。
   const steal = (why) => {
-    const tmp = arbiterMove(p);
-    if (!tmp) return null;                                  // 仲裁输了
-    const got = readLock(tmp);
-    const canTake = !got || (got.corrupt
-      ? idleOf(got) > CORRUPT_GRACE_S
-      : Date.now() > deadlineOf(p, got).ms);                   // 标记还在盘上，判过期要一起算
-    if (!canTake) {
-      // 搬错人了。放回；空位若已被第三方合法占住，就不放（放会覆盖），
-      // 残留文件由 locks 打出来——它不是垃圾，是"谁在临界点上被误伤"的现场。
-      if (!arbiterPutBack(tmp, p)) { /* 留给 locks 看见 */ }
+    // 令牌先于搬动：拿不到就认输，**绝不碰 `p`**。这一句是 MC-1-A 的落点——
+    // 上一版"两个独立仲裁（rename + wx）"能保证不双主，却保证不了"搬走的是过期那把"。
+    const tok = arbiterTokenTake(p);
+    if (!tok.ok) {
+      tokenBlock = tok.state;
       return blocked(readLock(p));
     }
-    arbiterSweep(tmp);
-    if (create()) return { status: "stolen", code: EXIT.OK, file, path: p, holder: who,
-      prevHolder: got?.who ?? "(空位)", ageS: got ? (got.at ? ageOf(got) : idleOf(got)) : 0,
-      ttl: t.value, at: incarnation, why };
-    return blocked(readLock(p));   // 搬走后空位又被合法新建，认输
+    tokenBlock = null;
+    try {
+      const tmp = arbiterMove(p);
+      if (!tmp) return null;                                  // 仲裁输了
+      const got = readLock(tmp);
+      const canTake = !got || (got.corrupt
+        ? idleOf(got) > CORRUPT_GRACE_S
+        : Date.now() > deadlineOf(p, got).ms);                   // 标记还在盘上，判过期要一起算
+      if (!canTake) {
+        // 搬错人了。放回；空位若已被第三方合法占住，就不放（放会覆盖），
+        // 残留文件由 locks 打出来——它不是垃圾，是"谁在临界点上被误伤"的现场。
+        // 加了令牌之后这条**不该再发生**：窗口内没有别人能建锁。它还在，就是量具没拦住，
+        // 由 audit 的 [ARBITRATION_RESIDUE] 那一档报硬信号（见 cli.js）。
+        if (!arbiterPutBack(tmp, p)) { /* 留给 locks 看见 */ }
+        return blocked(readLock(p));
+      }
+      arbiterSweep(tmp);
+      if (create()) return { status: "stolen", code: EXIT.OK, file, path: p, holder: who,
+        prevHolder: got?.who ?? "(空位)", ageS: got ? (got.at ? ageOf(got) : idleOf(got)) : 0,
+        ttl: t.value, at: incarnation, why };
+      return blocked(readLock(p));   // 搬走后空位又被合法新建，认输
+    } finally {
+      arbiterTokenRelease(p);
+    }
   };
 
   if (create()) return acquired();
@@ -503,7 +641,10 @@ export function list({ claimsDir }) {
   // 仲裁残留：搬错人又放不回去的那把锁留在这儿。它后缀不是 .lock、不参与归属判定，
   // 但它是"谁在临界点上被误伤"的唯一现场——必须看得见，不能变成暗垃圾。
   const stray = names.filter((f) => f.includes(".lock.arbiter-"));
-  return { locks, stray };
+  // 令牌与它回收僵尸时留下的 .reaped- 副本：同样不参与归属判定，但"谁在临界路上"只有这里看得见。
+  const reaped = names.filter((f) => f.includes(`${TOKEN_SUFFIX}.reaped-`));
+  const tokens = names.filter((f) => f.includes(TOKEN_SUFFIX) && !reaped.includes(f));
+  return { locks, stray, tokens, reaped };
 }
 
 /**
@@ -670,7 +811,42 @@ export function auditBoard({ claimsDir, boardPath }) {
     const [fileCol, whoCol] = cols;
     if (!liveKeys.has(`${fileCol}|${whoCol}|${m[1]}`)) stale.push({ row: line.trim(), who: whoCol, file: fileCol, at: m[1] });
   }
-  return { stale, untagged, total, holders };
+  // 仲裁残留的现场判定。为什么这件事归 audit 而不是只留在 `locks` 的一行打印里（2026-10-01，MC-1-A 前提③）：
+  // 那句 `! 仲裁残留 …（不参与归属判定）` 让最坏的一种形状——别人的**活锁**被搬进临时名后再没归位——
+  // 变成"必须有个人肉眼看见才存在"的事件。它必须能挡退码。
+  // 寿命按残留**自己记的** at+ttl 算（与 tools/claims/mc1a-ruler.mjs 同一把尺子）；
+  // 读不出 at/ttl 的单列 unreadable：它不是"没有"，也不许冒充"确实有"。
+  const arbitration = { live: [], expired: [], unreadable: [], tokens: [] };
+  const view = fs.existsSync(claimsDir) ? list({ claimsDir }) : { stray: [], tokens: [], reaped: [] };
+  for (const name of view.stray || []) {
+    const c = readLock(path.join(claimsDir, name));
+    const base = { name, who: c && !c.corrupt ? (c.who ?? "(无 who)") : "(读不出)" };
+    if (!c || c.corrupt || !Number.isFinite(c.at) || !(c.ttl > 0)) {
+      arbitration.unreadable.push({ ...base, why: (c && c.why) || "字段算不出到期时刻" });
+      continue;
+    }
+    const liveMs = c.at + c.ttl * 1000 - Date.now();
+    // 残留的 who 与这个位置上现在那把活锁的 who 不同（或位置上根本没有活锁）⇒ 归属证据被人摘走了
+    const slotKey = name.replace(/\.arbiter-.*$/, "");
+    const now = holders.find((h) => h.file === slotKey);
+    if (liveMs > 0 && (!now || now.who !== c.who)) {
+      arbitration.live.push({ ...base, at: c.at, ttl: c.ttl, liveMs, currentHolder: now ? now.who : "(空位)" });
+    } else if (liveMs > 0) {
+      arbitration.unreadable.push({ ...base, why: "残留还活着，但它的 who 就是这个位置上的本人（不是摘走）" });
+    } else {
+      arbitration.expired.push({ ...base, at: c.at, ttl: c.ttl });
+    }
+  }
+  for (const name of view.tokens || []) {
+    // 令牌名去掉尾巴就是锁路径本身：tokenState 只吃锁路径
+    const st = tokenState(path.join(claimsDir, name.slice(0, -TOKEN_SUFFIX.length)));
+    arbitration.tokens.push({ name, kind: st.kind, pid: st.pid, idleMs: Math.round(st.idleMs ?? -1) });
+  }
+  for (const name of view.reaped || []) arbitration.tokens.push({ name, kind: "reaped", pid: null, idleMs: -1 });
+  // 恒等式的右边来自**扫描本身**，不来自三个桶相加：自己加自己那条式子永远成立，拦不住任何漏归。
+  arbitration.strayTotal = (view.stray || []).length;
+  arbitration.gateTotal = (view.tokens || []).length + (view.reaped || []).length;
+  return { stale, untagged, total, holders, arbitration };
 }
 
 // 时钟差超过这个秒数才打"可疑"标注（秒级同步抖动不该刷屏）。

@@ -206,6 +206,9 @@ if (cmd === "claim") {
     // 被挡住必须留下一行：否则旁观者看见目录没变化，分不清「它在等锁」和「它没干活」
     const line = noteWait({ claimsDir: CLAIMS, file, who, holder: r.holder, ageS: r.ageS, ttl: r.ttl });
     console.log(`✗ 受阻（exit ${r.code}）：${file} 被 ${r.holder} 占着，已 ${r.ageS?.toFixed?.(1) ?? "?"}s / TTL ${r.ttl ?? "?"}s`);
+    // 被仲裁闸挡下与被人占着是两件事：旁观者要能看出"是有人在临界路上"还是"撞了一把活锁"。
+    // 判据住在返回值里（r.arbiter），这一行只是把它说出来——不在这里重新判一次。
+    if (r.arbiter) console.log(`  仲裁进行中：${r.reason}`);
     console.log(`  已登记：${line}`);
     process.exit(r.code);
   }
@@ -261,13 +264,14 @@ if (cmd === "locks") {
     console.error(`✗ 读不到锁目录（exit ${view.code}）：${view.reason}`);
     process.exit(view.code);
   }
-  const { locks, stray } = view;
+  const { locks, stray, tokens = [], reaped = [] } = view;
   const wl = join(CLAIMS, "waiters.log");
   const waits = existsSync(wl) ? readFileSync(wl, "utf8").trim().split("\n").filter(Boolean).length : 0;
-  console.log(`锁 ${locks.length} 把，等待登记 ${waits} 行，仲裁残留 ${stray.length} 个：`);
+  console.log(`锁 ${locks.length} 把，等待登记 ${waits} 行，仲裁残留 ${stray.length} 个，仲裁闸 ${tokens.length + reaped.length} 个：`);
   for (const x of locks) console.log(`  ${x.lock}  持有者=${x.holder}  已占 ${x.ageS}s / TTL ${x.ttl ?? "-"}s  ${x.state}`);
   if (!locks.length) console.log("  （当前无锁）");
-  for (const s of stray) console.log(`  ! 仲裁残留 ${s}（搬错人又放不回去的现场，不参与归属判定）`);
+  for (const s of stray) console.log(`  ! 仲裁残留 ${s}（搬错人又放不回去的现场，不参与归属判定；寿命与后果由 audit 的 13 那一档判）`);
+  for (const g of [...tokens, ...reaped]) console.log(`  · 仲裁闸 ${g}（正有人在临界路上；它过 mtime 上界后由后来者回收，别人不许替它放）`);
   process.exit(EXIT.OK);
 }
 
@@ -313,6 +317,21 @@ if (cmd === "audit") {
   console.log(`板 ${boardPath}：数据行 ${a.total} 条`);
   for (const s of a.stale) console.log(`  ✗ 越写者：${s.row}\n      声称 ${s.who} 持锁（化身 ${s.at}），盘上没有这把活锁`);
   for (const u of a.untagged) console.log(`  ? 无令牌行（不经 board 写上去的，锁管不到它）：${u}`);
+  // MC-1-A 的兜底（2026-10-01 从 `locks` 的一行打印升上来）：残留里只要有一把"按自己 at+ttl 还活着"的，
+  // 就说明有人在临界点上被误伤过。它不再只是给人肉眼看见的一行——它挡退码（13）。
+  for (const r of a.arbitration.live) {
+    console.log(`  ✗ 仲裁残留（活锁被摘走）：${r.name}`);
+    console.log(`      残留自称持有者=${r.who} 化身=${r.at} TTL=${r.ttl}s 距自己到期还有 ${Math.round(r.liveMs)}ms；` +
+      `这个位置上的活锁持有者=${r.currentHolder}`);
+  }
+  for (const r of a.arbitration.unreadable) console.log(`  ? 仲裁残留读不出寿命：${r.name} —— ${r.why}`);
+  for (const r of a.arbitration.expired) console.log(`  · 已到期残骸（正常老化，不算缺陷）：${r.name} 持有者=${r.who}`);
+  for (const tk of a.arbitration.tokens) console.log(`  · 仲裁闸 ${tk.name}：${tk.kind} pid=${tk.pid ?? "-"} 闲置 ${tk.idleMs}ms`);
+  const ar = a.arbitration;
+  const binned = ar.live.length + ar.expired.length + ar.unreadable.length;
+  console.log(`  残留恒等式：活 ${ar.live.length} + 到期 ${ar.expired.length} + 读不出 ${ar.unreadable.length} = ${binned}` +
+    `｜本次扫到 ${ar.strayTotal} 把 ⇒ ${binned === ar.strayTotal ? "每把都归了类" : "有残留没被归进任何一类（量具漏桶）"}` +
+    `｜仲裁闸 ${ar.gateTotal} 个`);
   if (!a.stale.length && !a.untagged.length) console.log("  板上每一行都对得上活锁。");
   // 第二段：盘上现在谁持着锁的现状。**这也是只报不拒**——它存在的理由很具体：
   // 上一场崩溃留下的板锁还没到期时，下一个写者只看见退码 12，
@@ -352,13 +371,18 @@ if (cmd === "audit") {
   // 无令牌行(untagged)、现状条数这些**同样要能被机器判**，所以它们进这一行而不是挤进退码。
   // 这是"少报"那一侧的处置：表头/人类注释行也是"无令牌"的形状，把它们并进 11
   // 会把每张正常板子判成有问题（多报）；完全不给机读入口又会让靠退码自动化的脚本漏掉这一类。
+  // 退码由这一个表达式推出，打印处不许再算第二遍。13 压在 11 之上（归属证据被摘走比一行对不上更该先修），
+  // 但两类的计数都进了汇总行——被压住的那一侧仍然能被机器判，不是"只报不拒"的那种漏。
+  const auditCode = ar.live.length ? EXIT.ARBITRATION_RESIDUE
+    : a.stale.length ? EXIT.STALE_BOARD_ROW : EXIT.OK;
   printSummary({
     kind: "audit", rows: a.total, stale: a.stale.length, untagged: a.untagged.length,
-    holders: a.holders.length,
-    code: a.stale.length ? EXIT.STALE_BOARD_ROW : EXIT.OK,
-    codes: [...new Set([EXIT.STALE_BOARD_ROW, EXIT.OK])],
+    holders: a.holders.length, residue: ar.live.length, residueExpired: ar.expired.length,
+    residueUnreadable: ar.unreadable.length, gates: ar.gateTotal,
+    code: auditCode,
+    codes: [...new Set([EXIT.ARBITRATION_RESIDUE, EXIT.STALE_BOARD_ROW, EXIT.OK])],
   });
-  process.exit(a.stale.length ? EXIT.STALE_BOARD_ROW : EXIT.OK);
+  process.exit(auditCode);
 }
 
 function scanNew(me, keys, since) {

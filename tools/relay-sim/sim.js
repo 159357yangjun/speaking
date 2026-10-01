@@ -65,7 +65,10 @@ function boardRows() {
     .map((m) => `${m[1]}←${m[2]}`);
 }
 function lockCount() {
-  return fs.existsSync(CLAIMS) ? fs.readdirSync(CLAIMS).length : 0;
+  if (!fs.existsSync(CLAIMS)) return 0;
+  // 只数 `.lock` 结尾的：仲裁闸（<lock>.arbitrating）、它的 .reaped- 副本、仲裁残留（.arbiter-*）、
+  // waiters.log 都不是锁。上一版数"目录里所有文件"，仲裁闸一上线就会多算一个，把"1 把锁"读成 2。
+  return fs.readdirSync(CLAIMS).filter((n) => n.endsWith(".lock")).length;
 }
 function resetRun() {
   fs.writeFileSync(BOARD, EMPTY_BOARD);
@@ -140,6 +143,15 @@ if (mode === "--claimrmw") {
     try { fs.writeFileSync(path.join(bdir, `go-${who}`), String(Date.now())); } catch { /* 放行时刻记不上就算样本缺一 */ }
   }
   const r = acquire({ claimsDir: CLAIMS, file: FILE, who, ttl: process.argv[5] });
+  // status 必须**白名单**判，不许"不是 blocked 就当拿到"。2026-10-01 实测：`dirty-blocked`
+  // 从来没被这个孩子处理过，于是它一路走到"领取成功"分支、写了板、标了 claimed、退 0——
+  // 推演器自己造出假双主（S2 的 lieNew 就是这么上来的）。这条修的是**量具说真话**，不改锁的行为。
+  const WON = r.status === "acquired" || r.status === "stolen" || r.status === "renewed";
+  if (!WON && r.status !== "refused" && r.status !== "blocked") {
+    log(`  CHILD ${who}: 没处理到的返回状态 "${r.status}"（code=${r.code}）⇒ 一律按没拿到算，绝不写板：${r.reason ?? ""}`);
+    mark(who, "blocked");
+    process.exit(r.code || EXIT.BLOCKED);
+  }
   if (r.status === "refused") {
     log(`  CHILD ${who}: 拒绝领取 —— ${r.reason}`);
     mark(who, "refused");

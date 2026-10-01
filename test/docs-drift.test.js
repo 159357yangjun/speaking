@@ -196,8 +196,33 @@ test("代码里 EXIT 的每个值都能被 CLI 真跑到（防「表里有、代
   fsv.writeFileSync(path.join(auditDir, "PROGRESS.md"), "| src/z.js | ghost | now <at=1> |\n");
   observed.add(spawnSync(process.execPath, [cli, "audit", `--channel=${auditDir}`,
     `--board=${path.join(auditDir, "PROGRESS.md")}`], { encoding: "utf8" }).status);
-  const busyDir = fsv.mkdtempSync(path.join(os.tmpdir(), "relay-exit12-"));
-  fsv.mkdirSync(path.join(busyDir, "claims"), { recursive: true });
+  // 13 = audit 看见"还活着的仲裁残留"（MC-1-A 现场）。两面都必须是**盘上真跑**出来的：
+  // 只演正例，等于允许"把所有 arbiter 残留都算缺陷"这种放宽蒙混过关（灵敏度又是靠误报换的）。
+  // 板面留成空表 ⇒ stale/untagged 都是 0，退码只可能由残留决定，两面的差别干净可指。
+  const resDir = fsv.mkdtempSync(path.join(os.tmpdir(), "relay-exit13-"));
+  fsv.mkdirSync(path.join(resDir, "claims"), { recursive: true });
+  const resBoard = path.join(resDir, "PROGRESS.md");
+  fsv.writeFileSync(resBoard, "| 文件 | 谁 | 声明时间 |\n|---|---|---|\n");
+  const runAudit13 = () => spawnSync(process.execPath, [cli, "audit", `--channel=${resDir}`,
+    `--board=${resBoard}`], { encoding: "utf8" });
+  // 正例：位置上是 victim 的活锁，旁边躺一把**自己还没到期**、自称 ghost 的残留 ⇒ 归属证据被摘走
+  fsv.writeFileSync(path.join(resDir, "claims", "src_r.js.lock"),
+    JSON.stringify({ who: "victim", at: Date.now(), ttl: 600 }));
+  fsv.writeFileSync(path.join(resDir, "claims", "src_r.js.lock.arbiter-99998-live"),
+    JSON.stringify({ who: "ghost", at: Date.now(), ttl: 600 }));
+  const res13 = runAudit13();
+  observed.add(res13.status);
+  assert.equal(res13.status, 13, `活着的仲裁残留必须吃 13（实退 ${res13.status}）：\n${res13.stdout}${res13.stderr}`);
+  assert.match(res13.stdout, /仲裁残留（活锁被摘走）[\s\S]*ghost[\s\S]*victim/,
+    `13 必须指名道姓说出残留自称谁、位置上的活锁是谁：\n${res13.stdout}`);
+  // 反例：同一位置，残留换成**已到期**的那把 ⇒ 正常老化，退码必须回到 0，且要说出为什么不算缺陷
+  fsv.rmSync(path.join(resDir, "claims", "src_r.js.lock.arbiter-99998-live"));
+  fsv.writeFileSync(path.join(resDir, "claims", "src_r.js.lock.arbiter-99997-old"),
+    JSON.stringify({ who: "oldholder", at: Date.now() - 700000, ttl: 1 }));
+  const resOld = runAudit13();
+  assert.equal(resOld.status, 0, `已到期残骸被当成缺陷了（实退 ${resOld.status}）：\n${resOld.stdout}`);
+  assert.match(resOld.stdout, /已到期残骸/, `退 0 却没说出它为什么不是缺陷：\n${resOld.stdout}`);
+  const busyDir = fsv.mkdtempSync(path.join(os.tmpdir(), "relay-exit12-"));  fsv.mkdirSync(path.join(busyDir, "claims"), { recursive: true });
   const held = spawnSync(process.execPath, [cli, "claim", `--channel=${busyDir}`,
     "--file=src/b.js", "--who=a", "--ttl=600"], { encoding: "utf8" }).stdout;
   const heldToken = /--at=(\d+)/.exec(held)?.[1];
@@ -282,6 +307,7 @@ const PROBE_ROWS = [
   ["tools/claims/selfcheck-harness.mjs", [0, 8, 9]],
   ["tools/claims/dirty-census.mjs", [0, 1, 2, 9]],
   ["tools/claims/gate-census.mjs", [0, 1, 2, 9]],
+  ["tools/claims/wx-empty-window.mjs", [0, 8, 9]],
   // mc1a-ruler.mjs 不在这张表里：它是判据的定义处、不是对用户开放的取证入口（没有退码契约）。
   // 但它确实被真 spawn 过一次（见下面七面靶子那条用例末尾），所以它享有一条执行边。
 ];
@@ -823,16 +849,23 @@ test("跨机时钟：max(at, mtime) 的两道护栏都在，README 连没关掉�
   assert.ok(md.includes(`SKEW_UNTRUSTED_S = ${untrusted}`), `README 写的不可信阈值与代码不是同一个数（代码 ${untrusted}）`);
 });
 
-test("audit 的现状段是只报不拒，README 与代码都说同一件事", () => {
+test("audit 的退码只许由 stale 与活着的仲裁残留决定，别的现状一律只报不拒", () => {
   const cli = readFileSync(new URL("../src/cli.js", import.meta.url), "utf8");
   const branch = /\nif \(cmd === "audit"\) \{([\s\S]*?)\n\}\n/.exec(cli);
   assert.ok(branch, "找不到 audit 分支");
-  // 退码只能由 stale 决定：有人持锁（哪怕是死掉的尸体）都不改判据
-  assert.match(branch[1], /process\.exit\(a\.stale\.length \? EXIT\.STALE_BOARD_ROW : EXIT\.OK\);/,
-    "audit 的退码不再只由越写者决定——现状段被做成了拦截");
+  // 2026-10-01 的边界变化要说准：MC-1-A 的兜底从 locks 的一行打印升成了 audit 的硬信号（13），
+  // 所以"退码只能由越写者决定"这句话不再成立——成立的是**只多允许一件事**：活着的仲裁残留。
+  // 其余现状（谁正持着锁、无令牌行、已到期残骸、仲裁闸）都还是只报不拒，这条测试守的就是这个"只多一个"。
+  assert.match(branch[1], /const auditCode = ar\.live\.length \? EXIT\.ARBITRATION_RESIDUE\n\s*: a\.stale\.length \? EXIT\.STALE_BOARD_ROW : EXIT\.OK;/,
+    "audit 的退码不再是那一个表达式推出来的：要么有人另算了一遍判据，要么拦截面被悄悄扩宽了");
+  assert.match(branch[1], /process\.exit\(auditCode\);/,
+    "退码与汇总行里的 code 必须来自同一个表达式——分两处算是『状态与计数各说各话』");
   assert.doesNotMatch(branch[1], /holders\.length \?/, "audit 里出现了『有活锁就非 0』的形状");
+  assert.doesNotMatch(branch[1], /untagged\.length \?/, "audit 里出现了『无令牌行就非 0』的形状（表头会被算进去，每张正常板都会红）");
+  assert.doesNotMatch(branch[1], /expired\.length \?/, "audit 把**已到期残骸**当成拦截条件：那是正常老化，不是缺陷");
   const md = readFileSync(README, "utf8");
   assert.match(md, /现状，不是判决/, "README 没写 audit 现在会打出盘上持锁现状");
+  assert.match(md, /\*\*硬信号\*\*/, "README 必须点明 13 是拒的（原来这件事只有一行打印）");
 });
 
 // ============ 对照数字的"可重跑性"与出处 ============
@@ -1119,6 +1152,26 @@ test("跟踪文件在盘上必须是 LF：三条源码扫描断言的前提不�
     "报出来像『writeBoard 被摘了』，会被误读成锁被人改了。\n" +
     "修法：把这几个文件行尾换回 LF（只删行尾 CR；换完字节数应等于 git cat-file -s HEAD:<file>）；" +
     "或给仓加一行 text=auto eol=lf 让 LF 成为规范形态 —— 后者改的是全机 checkout 行为，须主控批。");
+});
+
+// `wx-empty-window.mjs` 是本轮驳回 lock.js 那句"空文件窗口已消掉"的那次实验。
+// README 按文件名引用了它，就得能按文件名跑到（这条口径就是上一批 board-race ENOENT 换来的）。
+// 注意这条断言**不判有没有抓到 0 字节**：抓没抓到随机器快慢变，是读数；退码只判实验做成没做成。
+test("wx 独占创建的 0 字节窗口实验必须真跑一次：它是读数，所以抓到与否不改退码", () => {
+  const r = runProbe("tools/claims/wx-empty-window.mjs", ["60"]);
+  const out = (r.stdout || "") + (r.stderr || "");
+  const s = parseSummary(out, "wx-empty-window",
+    ["planned", "wrote", "empty", "contentOk", "enoent", "unreadable", "code"]);
+  assert.equal(s.code, r.status, "汇总行的 code 必须就是真实退码（两份数不能各说各话）");
+  assert.equal(s.wrote, s.planned, `计划写 ${s.planned} 次、真写 ${s.wrote} 次 ⇒ 分母不是本轮真值`);
+  assert.equal(r.status, 0, `实验本身没做成（实退 ${r.status}）：\n${out.split(/\r?\n/).slice(-8).join("\n")}`);
+  assert.equal(s.unreadable, 0, `unreadable=${s.unreadable} 却退了 0：状态说做成了、计数说没读回来`);
+  assert.ok(s.empty >= 0 && s.contentOk >= 0 && s.enoent >= 0,
+    `三个计数出现负数（${JSON.stringify(s)}）：读不出被塞成了 0，那与"没抓到"就长成一个样`);
+  assert.ok(s.contentOk + s.enoent > 0,
+    `读者一次都没读到东西（contentOk=${s.contentOk}, enoent=${s.enoent}）⇒ 采样侧是死的，这份 0 不算证否`);
+  console.log(`[wx 0 字节窗口] 写 ${s.wrote} 次 ⇒ 0 字节 ${s.empty}｜有内容 ${s.contentOk}｜不存在 ${s.enoent}｜退 ${r.status}` +
+    "（抓到与否都不改退码：这是读数，不是门）");
 });
 
 // ============ 全机位口径：文档引用的每个可执行探针，套件里必须真 spawn 过它 ============
