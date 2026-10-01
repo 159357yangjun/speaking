@@ -26,14 +26,17 @@ const dir = fs.mkdtempSync(path.join(os.tmpdir(), "relay-wx-race-"));
 const p = path.join(dir, "x.lock");
 
 const reader = new Promise((res) => {
+  // 读侧在 Windows 上会拿到 EPERM/EBUSY（文件刚被创建或删除、句柄还被别的进程握着）——
+  // 2026-10-01 整套并发跑时实测到过：读者一死，stdout 空，工具就报 8"实验没做成"。
+  // 那是**采样侧的正常现象**，不是实验失败，所以单列成一桶并计进恒等式，不再当致命错误。
   const c = spawn(process.execPath, ["-e", `
     const fs=require("node:fs");const p=process.argv[1];
-    let empty=0,ok=0,enon=0,t0=Date.now();
+    let empty=0,ok=0,enon=0,other=0,t0=Date.now();
     while(Date.now()-t0<1500){
       try{const s=fs.readFileSync(p,"utf8"); if(s.length===0) empty++; else ok++;}
-      catch(e){ if(e.code==="ENOENT") enon++; else throw e; }
+      catch(e){ if(e.code==="ENOENT") enon++; else other++; }
     }
-    console.log(JSON.stringify({empty,ok,enon}));
+    console.log(JSON.stringify({empty,ok,enon,other}));
   `, p], { stdio: ["ignore", "pipe", "inherit"] });
   let o = "";
   c.stdout.on("data", (d) => (o += d));
@@ -51,16 +54,19 @@ fs.rmSync(dir, { recursive: true, force: true });
 
 const broken = r.broken === true || !Number.isInteger(r.empty) ? 1 : 0;
 const decision = broken ? EXIT_CODES.unreadable : EXIT_CODES.ran;
-// 恒等式的两边来自读者的三个互斥计数；`reads` 与 `wrote` 是两回事（读是热循环，一次创建能被读到多次）
-const reads = broken ? 0 : r.empty + r.ok + r.enon;
-const identity = broken ? false : reads === r.empty + r.ok + r.enon;
+// 恒等式的四桶互斥穷尽：0 字节 / 有内容 / 不存在 / 拿不到句柄（EPERM·EBUSY 这类，Windows 上热读必然遇到）。
+// 少了第四桶，"读者被挡在门外"就会被读成"什么都没发生"；`reads` 与 `wrote` 也本来就是两个量（一次创建能被读多次）。
+const other = broken ? 0 : (Number.isInteger(r.other) ? r.other : 0);
+const reads = broken ? 0 : r.empty + r.ok + r.enon + other;
+const identity = broken ? false : reads === r.empty + r.ok + r.enon + other;
 const untrust = crossCheck(decision, {
   reported: broken, raw: broken, expect: wrote, measured: wrote,
-}) || (identity || broken ? null : `恒等式不成立：${reads} ≠ ${r.empty}+${r.ok}+${r.enon}`);
+}) || (identity || broken ? null : `恒等式不成立：${reads} ≠ ${r.empty}+${r.ok}+${r.enon}+${other}`);
 const code = untrust ? EXIT_CODES.harness : decision;
 
 console.log(`[wx 独占创建的 0 字节窗口] 写入 ${wrote} 次（计划 ${N}）｜并发读者看到：` +
-  `0 字节 ${broken ? "读不出" : r.empty} 次｜有内容 ${broken ? "读不出" : r.ok} 次｜还不存在 ${broken ? "读不出" : r.enon} 次`);
+  `0 字节 ${broken ? "读不出" : r.empty} 次｜有内容 ${broken ? "读不出" : r.ok} 次｜还不存在 ${broken ? "读不出" : r.enon} 次` +
+  `｜读不到句柄(EPERM 类) ${broken ? "读不出" : other} 次`);
 if (broken) {
   console.log(`!! 读者没报回可解析的计数（raw=${JSON.stringify(String(r.raw ?? "")).slice(0, 120)}）⇒ 这次实验没做成，` +
     "不许读成「窗口不存在」");
@@ -72,7 +78,7 @@ if (broken) {
 if (untrust) console.log(`!! 这份读数不可信：${untrust}`);
 printSummary({
   kind: "wx-empty-window", planned: N, wrote, empty: broken ? -1 : r.empty,
-  contentOk: broken ? -1 : r.ok, enoent: broken ? -1 : r.enon,
+  contentOk: broken ? -1 : r.ok, enoent: broken ? -1 : r.enon, handleMiss: broken ? -1 : other,
   unreadable: broken, code, codes: [...new Set(Object.values(EXIT_CODES))],
 });
 process.exit(code);

@@ -1161,17 +1161,18 @@ test("wx 独占创建的 0 字节窗口实验必须真跑一次：它是读数�
   const r = runProbe("tools/claims/wx-empty-window.mjs", ["60"]);
   const out = (r.stdout || "") + (r.stderr || "");
   const s = parseSummary(out, "wx-empty-window",
-    ["planned", "wrote", "empty", "contentOk", "enoent", "unreadable", "code"]);
+    ["planned", "wrote", "empty", "contentOk", "enoent", "handleMiss", "unreadable", "code"]);
   assert.equal(s.code, r.status, "汇总行的 code 必须就是真实退码（两份数不能各说各话）");
   assert.equal(s.wrote, s.planned, `计划写 ${s.planned} 次、真写 ${s.wrote} 次 ⇒ 分母不是本轮真值`);
   assert.equal(r.status, 0, `实验本身没做成（实退 ${r.status}）：\n${out.split(/\r?\n/).slice(-8).join("\n")}`);
   assert.equal(s.unreadable, 0, `unreadable=${s.unreadable} 却退了 0：状态说做成了、计数说没读回来`);
-  assert.ok(s.empty >= 0 && s.contentOk >= 0 && s.enoent >= 0,
-    `三个计数出现负数（${JSON.stringify(s)}）：读不出被塞成了 0，那与"没抓到"就长成一个样`);
-  assert.ok(s.contentOk + s.enoent > 0,
-    `读者一次都没读到东西（contentOk=${s.contentOk}, enoent=${s.enoent}）⇒ 采样侧是死的，这份 0 不算证否`);
-  console.log(`[wx 0 字节窗口] 写 ${s.wrote} 次 ⇒ 0 字节 ${s.empty}｜有内容 ${s.contentOk}｜不存在 ${s.enoent}｜退 ${r.status}` +
-    "（抓到与否都不改退码：这是读数，不是门）");
+  assert.ok(s.empty >= 0 && s.contentOk >= 0 && s.enoent >= 0 && s.handleMiss >= 0,
+    `计数出现负数（${JSON.stringify(s)}）：读不出被塞成了 0，那与"没抓到"就长成一个样`);
+  // 四桶必须凑出"读者确实在读"：EPERM 那一桶单独列，否则"被 Windows 挡在门外"会冒充"什么都没发生"
+  assert.ok(s.contentOk + s.enoent + s.handleMiss > 0,
+    `三个非空桶全为 0（${JSON.stringify(s)}）⇒ 采样侧是死的，这份 0 不算证否`);
+  console.log(`[wx 0 字节窗口] 写 ${s.wrote} 次 ⇒ 0 字节 ${s.empty}｜有内容 ${s.contentOk}｜不存在 ${s.enoent}` +
+    `｜读不到句柄 ${s.handleMiss}｜退 ${r.status}（抓到与否都不改退码：这是读数，不是门）`);
 });
 
 // ============ 全机位口径：文档引用的每个可执行探针，套件里必须真 spawn 过它 ============
