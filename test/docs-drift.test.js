@@ -10,6 +10,8 @@ import { digestOf } from "../src/proto/envelope.js";
 // 计数行的判读函数与打印函数同处定义（src/claims/summary.js）。
 // 这里**直接 import 它**而不是正则读它：文档说"汇总行能被读到"，就得用真的判读器验一遍。
 import { parseSummary } from "../src/claims/summary.js";
+// 脏件普查的尺子与门共用同一份实现（名单、分桶、分母都在这里，测试不许自己抄一遍正则）。
+import { census, censusLine, SCRATCH } from "../tools/claims/dirty-census.mjs";
 
 const SIGNING_DOC = new URL("../docs/specs/03-signing.md", import.meta.url);
 const SCHEMA = new URL("../proto/envelope.schema.json", import.meta.url);
@@ -276,6 +278,7 @@ const PROBE_ROWS = [
   ["tools/claims/window-measure.mjs", [0, 8, 9]],
   ["tools/claims/red-demo.mjs", [0, 7, 8, 9]],
   ["tools/claims/selfcheck-harness.mjs", [0, 8, 9]],
+  ["tools/claims/dirty-census.mjs", [0, 1, 2, 9]],
 ];
 
 test("README 引用的探针与夹具必须真实存在，且写明的参数、退码与脚本一致", () => {
@@ -496,70 +499,73 @@ test("探针的读数只作即时判别：README 明写了'不落盘'与'引用�
   //   ① dump 只走 stdout（仓库里不得出现 .log / .verify / .shots-rejected 这类目录或文件）
   //   ② 有上限（每处 slice 到位：harness 10 行 ×170 字、烟雾 12 行、普查 20 个码一行）
   //   ③ 只在失败时印（成功路径不产文件、也不堆输出）
-  const all = readdirSync(new URL("..", import.meta.url), { recursive: true, encoding: "utf-8" })
-    .filter((p) => !p.startsWith("node_modules") && !/^\.git([\\/]|$)/.test(p));
-  // 【运行期脏件的门：命名清单 + 未跟踪兜底，两层】
+  // 【运行期脏件的门：命名清单 + 未跟踪兜底，两层】扫描逻辑住在 tools/claims/dirty-census.mjs，
+  // 门与 %TEMP% 夹具共用同一把尺子——这里若再抄一遍正则，两边可以一起错（"测量用复制品"那一族）。
   // 旧版只扫 `.log`/`.tmp` 两种后缀，于是**本轮我自己写的 `.tmp-readme-fix.cjs`（用来改 README 的一次性脚本）
-  // 它一个都不认**——"名字里带 tmp、后缀是源码"恰恰是最常见的"用完就忘"形状。这条盲区是我上一轮自己报的，
-  // 现在补上。两层缺一不可：清单管"已经跟踪上的脏名字"（有人把 .log 提交进来），未跟踪兜底管"任何名字的临时件"。
-  const SCRATCH = [
-    [/\.(log|tmp|bak[-\w]*|orig|rej|save|swp|swo)$/i,
-      "跑出来的日志 / 备份 / 合并残留（red-demo 的 .bak-red 若崩在半路也在这儿）"],
-    [/(^|[/\\])\.?tmp[-_]/,
-      "以 tmp- / .tmp- 起头的一次性脚本：本轮那两个改 README 的 .cjs 就是这个形状"],
-    [/(^|[/\\])(scratch[-_]\S*|dumps?|\.verify|\.shots-rejected)([/\\]|$)/i,
-      "dump 与输出目录：隔壁仓的 .verify/ 与 .shots-rejected/ 各堆到上百个，把真信号埋掉、没人删"],
-    [/[-_ ](?:copy|副本|final|new|old|v\d+|test\d*)\.(?:c|m)?js$/i,
-      "手工复制出来的第二份源码：会被人当成现行那份读（过期副本冒充源码那一族）"],
-  ];
-  // 分桶必须单点：由一个 classify 决定"这条路径算哪一类"，再把**恒等式印出来**。
-  // 不这么做的话，某类既不算命中也不算漏，而"名单命中=0"到底是扫了 900 个还是 0 个，读者分不出来。
-  const classify = (p) => SCRATCH.findIndex(([re]) => re.test(p));
-  const byCat = SCRATCH.map(() => 0);
-  const hits = [];
-  for (const p of all) {
-    const i = classify(p);
-    if (i < 0) continue;
-    byCat[i]++;
-    hits.push(`${p} ← ${SCRATCH[i][1]}`);
-  }
-  const catSum = byCat.reduce((a, b) => a + b, 0);
-  // 第二层：git 眼里"未跟踪且没被 .gitignore 认可"的文件就是脏件（不管叫什么）。
-  // 没有 .git 的树（如 `git archive` 导出的对照树）必须**明写 skipped-because**——
-  // 静默跳过 = 这一面从没验过却算通过，正是本轮 crossCheck 那条修向针对的形状。
-  const isRepo = existsSync(path.join(rootDir, ".git"));
-  const g = isRepo ? spawnSync("git", ["ls-files", "--others", "--exclude-standard"], { cwd: rootDir, encoding: "utf8" }) : null;
-  const untracked = g && g.status === 0 ? (g.stdout || "").trim().split(/\r?\n/).filter(Boolean) : [];
-  // 兜底层自己的分母：git 认得的跟踪文件数。它要是 0，说明 git 瞎了，那"未跟踪=0"就不是"干净"。
-  const t = isRepo ? spawnSync("git", ["ls-files"], { cwd: rootDir, encoding: "utf8" }) : null;
-  const trackedList = t && t.status === 0 ? (t.stdout || "").trim().split(/\r?\n/).filter(Boolean) : [];
-  const tracked = trackedList.length;
-  // 【范围下限不许多 invent 一个魔数】"至少扫到 100 个"对一个 51 文件的仓是凭空定的，它只会把干净树判红。
-  // 真正的下限得来自**另一个独立来源**：git 认得的每一个跟踪文件，都必须在这次扫描里出现。
-  // 这里必须显式统一分隔符：readdir(recursive) 在 Windows 上给 `src\claims\lock.js`，
-  // 而 `git ls-files` 给 `src/claims/lock.js`——直接比会"一个都没覆盖"，那是量具瞎，不是仓干净。
-  const slashed = new Set(all.map((p) => p.split("\\").join("/")));
-  const missing = trackedList.filter((p) => !slashed.has(p));
-  const fallback = !isRepo ? `skipped-because=不是 git 工作树` : (g.status === 0 ? `已核` : `skipped-because=git 调用失败 status=${g.status}`);
-  // 【扫描的三个数：分母、逐类、恒等式】每次跑都印在同一行，可事后核对（跑法：重定向到文件再 grep）
-  console.log(`[脏件普查] 分母=扫到 ${all.length} 个路径(已排除 node_modules/.git，含 ${slashed.size} 个不同名) 覆盖=跟踪 ${tracked - missing.length}/${tracked} `
-    + `名单命中=${hits.length} 每类=[${byCat.join(",")}] 恒等式 ${hits.length}==${catSum} `
-    + `未跟踪=${untracked.length} 兜底=${fallback}`
-    + (missing.length ? `｜漏扫=${missing.slice(0, 5).join(",")}` : "")
-    + (hits.length ? ` → ${hits.slice(0, 6).join(" | ")}` : "")
-    + (untracked.length ? ` → ${untracked.slice(0, 6).join(" | ")}` : ""));
-  // 范围下限：git 的跟踪集就是分母。少一个就是"没扫到"而不是"扫了没找到"，这份 0 命中不作数。
-  assert.ok(!isRepo || tracked >= 1,
-    `git 认得的跟踪文件数是 ${tracked}：兜底层没有分母，"未跟踪=0"是 git 瞎了不是仓干净`);
-  assert.deepEqual(missing.slice(0, 8), [],
-    `扫描没覆盖到 ${missing.length} 个已跟踪文件（列前 8 个：${missing.slice(0, 8).join(", ")}）` +
+  // 它一个都不认**——"名字里带 tmp、后缀是源码"恰恰是最常见的"用完就忘"形状。两层缺一不可：
+  // 清单管"已经跟踪上的脏名字"（有人把 .log 提交进来，兜底看不见它），兜底管"任何名字的临时件"。
+  const c = census(rootDir);
+  console.log(censusLine(c));
+  // 范围下限不许我发明魔数："至少扫到 100 个"对一个 51 文件的仓是凭空定的，它只会把干净树判红。
+  // 真正的下限来自**另一个独立来源**：git 认得的每个跟踪文件都必须在这次扫描里出现
+  // （分隔符归一在 census 里做：readdir 给 `src\claims\lock.js`，git ls-files 给正斜杠，不归一就是"全没覆盖"）。
+  assert.ok(c.tracked >= 1,
+    `git 认得的跟踪文件数是 ${c.tracked}：兜底层没有分母，"未跟踪=0"是 git 瞎了不是仓干净`);
+  assert.deepEqual(c.missing.slice(0, 8), [],
+    `扫描没覆盖到 ${c.missing.length} 个已跟踪文件（列前 8 个：${c.missing.slice(0, 8).join(", ")}）` +
     `\n—— 那是扫描根/排除正则/分隔符归一坏了，"名单命中=0"随之不作数`);
-  assert.equal(hits.length, catSum,
-    `恒等式不成立：名单命中=${hits.length} 但逐类之和=${catSum}（分桶不止一处在做判断，某类既没算命中也没算漏）`);
-  assert.deepEqual([...hits, ...untracked.map((p) => `未跟踪:${p}`)], [],
+  assert.equal(c.hits.length, c.catSum,
+    `恒等式不成立：名单命中=${c.hits.length} 但逐类之和=${c.catSum}（分桶不止一处在做判断，某类既没算命中也没算漏）`);
+  assert.deepEqual([...c.hits.map((h) => `${h.file} ← ${h.why}`), ...c.untracked.map((p) => `未跟踪:${p}`)], [],
     "仓里有运行期脏件（清单命中或未被跟踪）。临时脚本用完必须删；确要留就 `git add` 进仓并由 README 说清它是什么。" +
     `\n处置上限：诊断只走 stdout、有上限、只在失败时印（README"即时判别"第 3 条）。`);
-  assert.ok(hits.length === 0 || typeof SCRATCH[0][1] === "string", "清单每条必须带理由，不然下个人只会放宽它");
+  assert.ok(SCRATCH.every(([, why]) => typeof why === "string" && why.length > 8),
+    "清单每条必须带理由，不然下个人只会放宽它");
+});
+
+test("脏件普查的两面夹具：同一支工具，脏树退 1、清树退 0、没分母的树退 2", async () => {
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  // 上一笔交付的"两面"只是我手动 touch + 跑 + rm，原文落在 /tmp——这台机器上最容易被清的位置。
+  // 现在两面长在套件里：脏树造在 %TEMP%，靠 `--scan-root` 指过去，所以"门会红自己的仓"不再是不做的理由。
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "relay-scan-"));
+  try {
+    const git = (args) => spawnSync("git", args, {
+      cwd: dir, encoding: "utf8",
+      env: { ...process.env, GIT_AUTHOR_NAME: "t", GIT_AUTHOR_EMAIL: "t@t", GIT_COMMITTER_NAME: "t", GIT_COMMITTER_EMAIL: "t@t" },
+    });
+    assert.equal(git(["init", "-q"]).status, 0, "夹具建不起 git 树：这一面从没验过，不许算通过");
+    fs.writeFileSync(path.join(dir, "keep.js"), "export const x = 1;\n");
+    assert.equal(git(["add", "keep.js"]).status, 0, "git add 失败：夹具没有分母");
+    assert.equal(git(["commit", "-qm", "fixture"]).status, 0, "git commit 失败：夹具没有分母");
+    // 三类名单形状 + 一个谁都不认识的野名字（野名字只能由兜底层抓到）
+    for (const f of ["run.log", ".tmp-oops.mjs", "src-copy.js", "notes.md"]) fs.writeFileSync(path.join(dir, f), "x");
+    const dirty = runProbe("tools/claims/dirty-census.mjs", [`--scan-root=${dir}`]);
+    const dOut = (dirty.stdout || "") + (dirty.stderr || "");
+    assert.equal(dirty.status, 1, `脏树应当退 1（抓到脏件），实退 ${dirty.status}：\n${dOut.split(/\r?\n/).slice(-8).join("\n")}`);
+    const ds = parseSummary(dOut, "dirty-census", ["scope", "tracked", "missing", "hits", "untracked", "bad", "code"]);
+    assert.equal(ds.code, dirty.status, "汇总行写的 code 必须就是进程真实退码（两份数不许各说各话）");
+    assert.equal(ds.hits, 3, `名单该抓到 3 个（run.log / .tmp-oops.mjs / src-copy.js），实抓 ${ds.hits}`);
+    assert.equal(ds.untracked, 4, `兜底该抓到 4 个（含名单不认识的 notes.md），实抓 ${ds.untracked}`);
+    assert.equal(ds.bad, ds.hits + ds.untracked, "bad 必须是两层之和，只报其中一层就是替下一层遮丑");
+    assert.equal(ds.tracked, 1, "夹具的分母就是那 1 个跟踪文件；不是 1 说明扫描根指错了地方");
+    assert.equal(ds.missing, 0, "有跟踪文件没被扫到：分母在但覆盖塌了");
+    console.log(`[两面夹具·脏] ${dOut.split(/\r?\n/).find((l) => l.startsWith("[脏件普查]"))}`);
+    // 同一入参指向清干净后的同一棵树 ⇒ 必须退 0。只测红的那面不叫两面夹具。
+    for (const f of ["run.log", ".tmp-oops.mjs", "src-copy.js", "notes.md"]) fs.rmSync(path.join(dir, f));
+    const clean = runProbe("tools/claims/dirty-census.mjs", [`--scan-root=${dir}`]);
+    const cOut = (clean.stdout || "") + (clean.stderr || "");
+    assert.equal(clean.status, 0, `清树应当退 0，实退 ${clean.status}：\n${cOut.split(/\r?\n/).slice(-8).join("\n")}`);
+    console.log(`[两面夹具·清] ${cOut.split(/\r?\n/).find((l) => l.startsWith("[脏件普查]"))}`);
+    // 第三面：非 git 的空树必须退 2——"什么都没见过"从来不等于"干净"
+    const wild = fs.mkdtempSync(path.join(os.tmpdir(), "relay-scan-plain-"));
+    try {
+      fs.writeFileSync(path.join(wild, "a.txt"), "x");
+      const w = runProbe("tools/claims/dirty-census.mjs", [`--scan-root=${wild}`]);
+      assert.equal(w.status, 2,
+        `没有分母的目录必须退 2，实退 ${w.status}：\n${((w.stdout || "") + (w.stderr || "")).split(/\r?\n/).slice(-6).join("\n")}`);
+    } finally { fs.rmSync(wild, { recursive: true, force: true }); }
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
 });
 
 test("README 写的变异条数必须等于 red-demo 的条目数（两处数字不许各飘各的）", () => {
@@ -859,7 +865,7 @@ test("clamp 的可见性走返回值：判据算一次，读数侧不许再算�
 test("本仓探针与 CLI 不走 http：一旦有人起了服务器，必须先补『该端口 LISTEN 的 pid 恰为 1』这条判据", () => {
   const files = ["src/cli.js", "src/claims/lock.js", "src/claims/summary.js",
     "tools/claims/board-race.mjs", "tools/claims/renew-race.mjs", "tools/claims/window-measure.mjs",
-    "tools/claims/red-demo.mjs", "tools/claims/selfcheck-harness.mjs", "tools/relay-sim/sim.js"];
+    "tools/claims/red-demo.mjs", "tools/claims/selfcheck-harness.mjs", "tools/claims/dirty-census.mjs", "tools/relay-sim/sim.js"];
   const hits = [];
   for (const f of files) {
     const s = readFileSync(new URL("../" + f, import.meta.url), "utf8");
@@ -912,8 +918,8 @@ test("被解析的文本里含分隔符：不许静默少读一行，也不许�
 //
 // 这条断言用"真跑一次才登记"而不是"扫源码里有没有 spawn 字样"：后者会被注释、
 // 被 readFileSync 的字符串、被一条永不执行的分支骗过去。SPAWNED 只能由实际发生凑齐。
-// 顺序依赖：node:test 顶层用例按登记顺序执行，本条放在文件最末，前面五个探针都已真跑过。
-test("现场证据表点名的五个探针都被套件真 spawn 过（没有执行边就不许写'N/N 全绿'）", () => {
+// 顺序依赖：node:test 顶层用例按登记顺序执行，本条放在文件最末，前面六个探针都已真跑过。
+test("现场证据表点名的六个探针都被套件真 spawn 过（没有执行边就不许写'N/N 全绿'）", () => {
   const missing = PROBE_ROWS.map(([rel]) => rel).filter((rel) => !SPAWNED.has(rel));
   assert.deepEqual(missing, [],
     `这几个探针只被"读文本"核对过、从没被 spawn 过一次：${missing.join("、")}。` +
