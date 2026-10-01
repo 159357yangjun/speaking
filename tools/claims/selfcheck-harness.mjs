@@ -24,7 +24,20 @@ import { spawnSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import { printSummary, parseSummary, crossCheck, HARNESS_EXIT } from "../../src/claims/summary.js";
+import { printSummary, parseSummary, crossCheck, HARNESS_EXIT, SUMMARY_PREFIX } from "../../src/claims/summary.js";
+
+/**
+ * 撕行的切点：**按长度取中点，并要求它落在行内**。
+ * 上一版这里钉的是绝对偏移 40——那在当时的行上是行内，可一旦字段顺序或值变了、
+ * 整行短到 40 以内，`slice(0,40)` 就是整行本身：那次"撕"根本没撕，而判读侧不抛，
+ * 于是这一面会从"咬住"变成"静默通过"。取中点让这个靶子随行长自动走。
+ * 返回 null = 这行撕不动（太短 ⇒ 中点落在前缀里或行外），调用方必须把这一面判成"没验过"而不是"过了"。
+ */
+export function tearPoint(line) {
+  const prefixLen = `${SUMMARY_PREFIX} `.length;
+  const mid = Math.floor(String(line).length / 2);
+  return mid > prefixLen && mid < String(line).length ? mid : null;
+}
 
 // 退 10 那一族的现场取证：失败那一刻 %TEMP% 下有多少棵 relay-* 临时树、都是谁的。
 // 上限 6 条 + 按前缀计数（打印必须有上限，否则诊断自己变成第二个 .verify/）。
@@ -142,11 +155,25 @@ const CASES = [
     judge: (r) => {
       // 上面那行是完整 JSON，先确认它能读；再把它从中间截断，模拟被别的写者插进一行
       const whole = r.stdout.trim();
-      const torn = `${whole.slice(0, 40)}
-${whole.slice(40)}`;
+      // 两面自检：**短行必须撕不动**（tearPoint 返 null），**长行必须有行内切点**。
+      // 只测长行那一面的话，"守卫被摘掉"这件事没有任何东西能发现——它只会一直绿。
+      const shortLine = `${SUMMARY_PREFIX} {}`;
+      const pShort = tearPoint(shortLine);
+      if (pShort !== null) {
+        return [false, `撕点守卫失效：短行 '${shortLine}'（长度 ${shortLine.length}）被判成可撕（切点 ${pShort}）` +
+          `⇒ 那次"撕"可能根本没撕，这面从此只会一直绿`];
+      }
+      const cut = tearPoint(whole);
+      if (cut === null) {
+        return [false, `这一面这次撕不动（行长 ${whole.length}，中点落在前缀里或行外）` +
+          `⇒ 判"没验过"，不算咬住——把没量到当通过是本仓反复犯的那一族`];
+      }
+      const torn = `${whole.slice(0, cut)}
+${whole.slice(cut)}`;
       try { parseSummary(whole, "board-race", ["rounds"]); } catch (e) { return [false, `完整行反而读不了：${e.message}`]; }
-      try { parseSummary(torn, "board-race", ["rounds"]); return [false, "半截 JSON 被接受了（应当抛）"]; }
-      catch (e) { return [true, `抛了：${String(e.message).split(String.fromCharCode(10))[0].slice(0, 120)}`]; }
+      try { parseSummary(torn, "board-race", ["rounds"]); return [false, `半截 JSON 被接受了（应当抛）｜切点=${cut}/${whole.length}`]; }
+      catch (e) { return [true, `抛了：${String(e.message).split(String.fromCharCode(10))[0].slice(0, 120)}` +
+        `｜撕点=中点 ${cut}/${whole.length}（不是绝对偏移，行长变了它跟着走）`]; }
     },
   },
   {
@@ -167,6 +194,7 @@ ${whole.slice(40)}`;
 ];
 
 let caught = 0;
+let ran = 0;
 for (const c of CASES) {
   const { tmp, file } = c.target ? sabotage(c.target, c.patch) : { tmp: null, file: null };
   const r = c.run(file, tmp);
@@ -201,13 +229,14 @@ for (const c of CASES) {
     for (const l of out.split(/\r?\n/).slice(-10)) console.log("     " + l.slice(0, 170));
   }
   if (tmp) fs.rmSync(tmp, { recursive: true, force: true });
+  ran++;                                     // 跑到数与咬住数是两件事：一件没咬住不等于它没跑
   if (ok) caught++;
 }
 
 const raw = CASES.length - caught;                       // 现场重算：没被抓到的面数
 const code = raw > 0 ? EXIT_CODES.notCaught : EXIT_CODES.bothCaught;
 const summary = {
-  kind: "selfcheck-harness", rounds: CASES.length, measured: caught,
+  kind: "selfcheck-harness", rounds: CASES.length, measured: ran, caught,
   lost: raw, code, codes: [...new Set(Object.values(EXIT_CODES))],
 };
 console.log("");
@@ -216,6 +245,12 @@ console.log(code === EXIT_CODES.bothCaught
   : `=== 只抓到 ${caught}/${CASES.length} 面：印证有半边是装饰，结论不成立 ===`);
 printSummary(summary);
 // 本脚本也遵守同一条规矩：报出去的面数必须等于现场重算的，且与退码互相印证。
-const why = crossCheck(code, { reported: summary.lost, raw, expect: CASES.length, measured: caught });
+// 旧版把 `measured` 填成 caught ⇒ 任何"有一面没咬住"都会额外触发"样本数不齐"，
+// 于是 8（印证是装饰）这一档永远到不了，报出去的都是 9（测具不可信）。
+// 现在 measured=跑到数，另加一条恒等式：咬住数 + 没咬住数 必须等于跑到数 = 安排数。
+const why = crossCheck(code, { reported: summary.lost, raw, expect: CASES.length, measured: ran })
+  || (caught + raw === ran && ran === CASES.length
+    ? null
+    : `恒等式不成立：安排 ${CASES.length}、跑到 ${ran}、咬住 ${caught}、没咬住 ${raw}（四者凑不齐，这份计数是拼出来的）`);
 if (why) console.error(`!! 本脚本自身不自洽：${why}`);
 process.exit(why ? EXIT_CODES.harness : code);

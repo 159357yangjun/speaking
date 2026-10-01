@@ -19,6 +19,7 @@ const BR = join(ROOT, "tools/claims/board-race.mjs");
 const DEMO = join(ROOT, "tools/claims/red-demo.mjs");
 const CENSUS = join(ROOT, "tools/claims/dirty-census.mjs");
 const RENEW = join(ROOT, "tools/claims/renew-race.mjs");
+const HARNESS = join(ROOT, "tools/claims/selfcheck-harness.mjs");
 
 // M27 的锚点是**从 README 当场读出来的**，不是手抄的。
 // 上一版手抄了"121"，本轮 121→122→123 连炸两次"锚点没命中"——那是测具自己的固定故障，
@@ -530,6 +531,16 @@ const MUT = [
     file: RENEW,
     pairs: [['"relay-race-src-"', '"relay-board-src-"']],
     test: "临时树前缀两两不同",
+    suite: "test/docs-drift.test.js",
+  },
+  {
+    // M67 摘掉撕点守卫：短行本该"撕不动"（返回 null ⇒ 那面判『没验过』），守卫没了就一律返回中点。
+    // 这条靶子的价值在于它是这一面**唯一的红路**：守卫在位时五面全咬住、退 0，
+    // 摘掉之后没有任何行为变化（长行照样抛），只有这条自检会发现"以后它只会一直绿"。
+    name: "M67 撕点守卫失效（短行也被判成可撕 ⇒ 那面从此只会一直绿）",
+    file: HARNESS,
+    pairs: [["  return mid > prefixLen && mid < String(line).length ? mid : null;", "  return mid;   // 变异：不判行内性"]],
+    test: "五面自证",
     suite: "test/docs-drift.test.js",
   },
 ];
