@@ -279,6 +279,7 @@ const PROBE_ROWS = [
   ["tools/claims/red-demo.mjs", [0, 7, 8, 9]],
   ["tools/claims/selfcheck-harness.mjs", [0, 8, 9]],
   ["tools/claims/dirty-census.mjs", [0, 1, 2, 9]],
+  ["tools/claims/gate-census.mjs", [0, 1, 2, 9]],
 ];
 
 test("README 引用的探针与夹具必须真实存在，且写明的参数、退码与脚本一致", () => {
@@ -455,6 +456,22 @@ test("renew-race 也必须有执行边：真跑 1 轮，判据被走到、汇总
   // skipped 与 passed 必须**看得见**：每次跑都印一行，不让"这次没量到"沉到输出底下。
   console.log(`   [renew-race 烟雾] 退 ${r.status}｜lost=${s.lost} precondition=${s.precondition}` +
     (r.status === 4 ? "｜本次抢占方一家都没赢：仪器开过机，但判据没被走到（烟雾算过，测量不作数）" : ""));
+});
+
+test("gate-census 必须真跑一次：抓到的双主只登记、不接退码，这条定档由它自己钉住", () => {
+  const t0 = Date.now();
+  const r = runProbe("tools/claims/gate-census.mjs", [rootDir, "--batches=1", "--gated=1"]);
+  const out = (r.stdout || "") + (r.stderr || "");
+  const s = parseSummary(out, "gate-census", ["planned", "rounds", "anomalies", "notFull", "unreadable", "code"]);
+  assert.equal(s.unreadable, 0,
+    `有一批读不到 RESULT_JSON ⇒ 这份"抓到 ${s.anomalies} 次"不作数（到不了 ≠ 没有）：\n${out.split(/\r?\n/).slice(-10).join("\n")}`);
+  assert.equal(s.rounds, s.planned, `计划 ${s.planned} 轮、真跑到 ${s.rounds} 轮：分母塌了，退码必须是 2 而不是 0`);
+  assert.equal(s.code, r.status, "汇总行写的 code 必须就是进程真实退码");
+  assert.ok([0, 1, 2, 9].includes(r.status),
+    `实退 ${r.status}（0=登记完 · 1=--strict 且抓到 · 2=分母塌 · 9=测具档，两条成因共用：用法错 / 读数与状态不互印，` +
+    `各印自己的 !! 原文）：\n${out.split(/\r?\n/).slice(-8).join("\n")}`);
+  console.log(`[gate-census 烟雾] 1 轮：抓到双主 ${s.anomalies}，未到齐 ${s.notFull}，退 ${r.status}` +
+    `｜本条耗时 ${Date.now() - t0}ms（默认不带 --strict ⇒ 抓到也只登记，不改退码）`);
 });
 
 test("window-measure 也必须有执行边：真跑 2 次，样本齐且窗口量为正", () => {

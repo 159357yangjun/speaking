@@ -543,21 +543,13 @@ const MUT = [
     test: "五面自证",
     suite: "test/docs-drift.test.js",
   },
-  {
-    // M68 打的是刚建起来的闸口臂（S2b-G）。要把**两道**仲裁一起拆掉才出得了双主：
-    // 只拆 rename 是不够的——实测拆完 winners 仍是 1（`wx` 独占创建是第二道闸，19 家照样撞死在 EEXIST 上）。
-    // 这条靶子因此同时是一句结论：抢占的安全性由两道冗余仲裁撑着，单道坏掉不会红，只有两道一起坏才露出来。
-    name: "M68 两道仲裁一起拆（rename 输了也当前往前面走 + 独占创建退化成普通写）",
-    file: LOCK,
-    pairs: [
-      ['    if (e.code === "ENOENT") return null;   // 别人先搬走了',
-       '    if (e.code === "ENOENT") return p + ".arbiter-ghost";   // 变异：搬输了也当搬到了'],
-      ['fs.writeFileSync(p, JSON.stringify({ who, at: incarnation, ttl: t.value }), { flag: "wx" });',
-       'fs.writeFileSync(p, JSON.stringify({ who, at: incarnation, ttl: t.value }));'],
-    ],
-    test: "S2b-G",
-    suite: "test/sim.test.js",
-  },
+  // M68 已撤回，ID 不复用。理由留在这儿：它打的靶子是 `sim.test.js` 里的 `S2b-G` 断言，
+  // 而那条断言 2026-10-01 被移出套件（约 14% 会红的门不接退码，改由 gate-census 登记）。
+  // 留着 M68 只会让它去匹配一条不存在的用例 ⇒ red-demo 把它读成"空跑"，
+  // 而"空跑"和"变异没被抓住"在两处报告里长得不一样，没必要留个假靶子在这儿。
+  // 它曾经的红是真实发生过的（见证据 29.3 与提交 fd7b273：两道仲裁一起拆 ⇒ winners>1），
+  // 那条结论保留，被撤回的只是这条靶子。要再验一次：
+  //   node tools/claims/gate-census.mjs <仓绝对路径> --gated=6 --batches=2 --strict
 ];
 
 // 计数行的正则与判读放在**同一处**定义：`node --test` 的报告格式一改，

@@ -19,11 +19,12 @@ const AS_JSON = process.argv.includes("--json");
 // S2b-G 闸口放行跑几次。写成参数而不是写死：一次放行 ≈ 1.4s 等过期 + 20 个进程，成本必须能自己调，
 // 而且要按"写了却不认就是静默空跑"那条口径校验——非法值当场退非 0，不静默取默认。
 const GATED_ARG = process.argv.find((a) => a.startsWith("--gated="));
-if (GATED_ARG !== undefined && !/^\-\-gated=[1-9]\d{0,2}$/.test(GATED_ARG)) {
-  console.error(`!! --gated 必须是 1..999 的整数，收到 ${GATED_ARG}`);
+if (GATED_ARG !== undefined && !/^\-\-gated=([1-9]\d{0,2}|0)$/.test(GATED_ARG)) {
+  console.error(`!! --gated 必须是 0..999 的整数（0=不跑闸口），收到 ${GATED_ARG}`);
   process.exit(9);
 }
-const GATED_ROUNDS = GATED_ARG ? Number(GATED_ARG.split("=")[1]) : 4;
+// 默认 0：整套 `npm test` 里**不跑**闸口（红只登记不拦是这条案的定档）；要跑就 --gated=N，由 gate-census.mjs 负责。
+const GATED_ROUNDS = GATED_ARG ? Number(GATED_ARG.split("=")[1]) : 0;
 const BOARD = path.join(ROOT, "board.md");
 const CLAIMS = path.join(ROOT, "claims");
 const OUT = path.join(ROOT, "out");
@@ -143,6 +144,16 @@ if (mode === "--claimrmw") {
   const rows = b.split("\n");
   rows.splice(rows.findIndex((x) => x.startsWith("|---")) + 1, 0, `| ${FILE} | ${who} | now |`);
   fs.writeFileSync(BOARD, rows.join("\n"));
+  // 拿到 `why` 原文是这一案的判据：双主那把被搬走的活锁，搬它的那家当时是怎么判定"可以拿"的，
+  // 全在这条返回值里（status/prevHolder/why/incarnation）。写在 ROOT/why 而不是 OUT——
+  // OUT 被 verdicts() 按文件内容计数，混进去就会把 claimed/blocked 的数污染掉。
+  try {
+    fs.mkdirSync(path.join(ROOT, "why"), { recursive: true });
+    fs.writeFileSync(path.join(ROOT, "why", `${who}.json`), JSON.stringify({
+      who, status: r.status, prevHolder: r.prevHolder ?? null, why: r.why ?? null,
+      at: r.at ?? null, pid: process.pid,
+    }));
+  } catch { /* 取证写不进去不影响这次领取 */ }
   mark(who, "claimed");
   log(`  CHILD ${who}: ${r.status === "stolen" ? `抢占成功（原持有者 ${r.prevHolder}，${r.why}）` : r.status === "renewed" ? "续期持有" : "领取成功"} ${FILE}（TTL=${r.ttl}s），已写板`);
   process.exit(EXIT.OK);
@@ -249,7 +260,7 @@ log(`    对照：把仲裁换成「先删再建」，同场景 20 家里 12 家
 
 // S2b-G：闸口放行版。低载下这条夹具 95% 的轮次量的是派发顺序（证据廿八），这里让 20 家到齐再一起放行，
 // 并把"放行跨度"量出来——它是窗口宽度的直接读数，不是"我猜这次撞上了"。
-head(`S2b-G · 闸口放行下的 ${ROUNDS} 路并发抢占 × ${GATED_ROUNDS} 次`);
+if (GATED_ROUNDS > 0) head(`S2b-G · 闸口放行下的 ${ROUNDS} 路并发抢占 × ${GATED_ROUNDS} 次`);
 const gPer = [];
 for (let gi = 0; gi < GATED_ROUNDS; gi++) {
   resetRun();
@@ -257,6 +268,8 @@ for (let gi = 0; gi < GATED_ROUNDS; gi++) {
   sleepMs(1400);
   const bdir = path.join(ROOT, `barrier-g${gi}`);
   fs.mkdirSync(bdir, { recursive: true });
+  // 每轮清掉上一轮的 why：这个目录是"这一轮谁凭什么落笔"的现场，混轮就没人能读它
+  fs.rmSync(path.join(ROOT, "why"), { recursive: true, force: true });
   const gCodes = await runConcurrent(
     Array.from({ length: ROUNDS }, (_, i) => ["--claimrmw", `racer-${i}`, "60"]),
     { env: { SIM_BARRIER_DIR: bdir, SIM_BARRIER_N: String(ROUNDS) } });
@@ -274,8 +287,16 @@ for (let gi = 0; gi < GATED_ROUNDS; gi++) {
   // 而同一个根目录后面被 S3/S4 的 resetRun 清过——留住的是别人的板面，不是异常那轮的。
   let gScene = null;
   let gSceneListing = null;
+  let gWhys = null;
   if (gWin !== 1 || gRows !== 1) {
     gScene = `scenes-g${gi}`;
+    // 异常那轮把"每家自称拿到时的那条判定原文"收进 JSON——这是本案唯一还缺的一环
+    const wd = path.join(ROOT, "why");
+    if (fs.existsSync(wd)) {
+      gWhys = fs.readdirSync(wd).map((f) => {
+        try { return JSON.parse(fs.readFileSync(path.join(wd, f), "utf8")); } catch { return { file: f, parse: "失败" }; }
+      });
+    }
     try {
       fs.mkdirSync(path.join(ROOT, gScene), { recursive: true });
       // 光把文件抄进根目录不够——测试跑完会把根目录整个删掉，现场跟着消失。
@@ -289,7 +310,7 @@ for (let gi = 0; gi < GATED_ROUNDS; gi++) {
       }
     } catch (e) { gScene = `抄现场失败:${e.code || e.message}`; }
   }
-  gPer.push({ winners: gWin, blocked: gBlocked, arrivals: gArrivals, spreadMs: gSpread, holder: gHolder, racerRows: gRows, boardRacerLines: gBoard, scene: gScene, sceneListing: gSceneListing, codes: gCodes });
+  gPer.push({ winners: gWin, blocked: gBlocked, arrivals: gArrivals, spreadMs: gSpread, holder: gHolder, racerRows: gRows, boardRacerLines: gBoard, scene: gScene, sceneListing: gSceneListing, whys: gWhys, codes: gCodes });
   fs.rmSync(bdir, { recursive: true, force: true });
   log(`  第${gi + 1}次：到齐 ${gArrivals}/${ROUNDS} 放行跨度 ${gSpread}ms 赢家=${gHolder} 分布 0×${gWin} 3×${gBlocked} racer行=${gRows}${gScene ? ` 现场=${gScene}${gSceneListing ? ` [${gSceneListing.join(" ｜ ")}]` : ""}` : ""}`);
 }
@@ -297,13 +318,13 @@ R.s2bGated = {
   rounds: GATED_ROUNDS, needed: ROUNDS, per: gPer,
   holders: gPer.map((g) => g.holder),
   distinctHolders: new Set(gPer.map((g) => g.holder)).size,
-  allFull: gPer.every((g) => g.arrivals === ROUNDS),
-  maxSpreadMs: Math.max(...gPer.map((g) => g.spreadMs)),
+  allFull: gPer.length > 0 && gPer.every((g) => g.arrivals === ROUNDS),
+  maxSpreadMs: gPer.length ? Math.max(...gPer.map((g) => g.spreadMs)) : null,
 };
-log(`  → ${GATED_ROUNDS} 次放行的赢家：${R.s2bGated.holders.join(", ")}（不同赢家 ${R.s2bGated.distinctHolders} 个）｜` +
+if (GATED_ROUNDS > 0) log(`  → ${GATED_ROUNDS} 次放行的赢家：${R.s2bGated.holders.join(", ")}（不同赢家 ${R.s2bGated.distinctHolders} 个）｜` +
   `放行跨度最大 ${R.s2bGated.maxSpreadMs}ms`);
-log(`    这一步的量在上一版里根本没有：那 20 家谁赢由创建顺序决定，` +
-  `所以"恰 1 家赢"里有 95% 是恒真。闸口到齐才让它们真挤进同一个临界区。`);
+if (GATED_ROUNDS > 0) log(`    对照：低载那臂 57/60 轮赢家都是第一家（到达顺序真换人的只有 3/60）⇒` +
+  `不加闸口时，"恰 1 家赢"多数时候量的是派发顺序；闸口到齐才让它们真挤进同一个临界区（证据廿八/廿九）。`);
 
 head("S3 · 脏声明：领了锁就崩，不收尾");
 resetRun();
