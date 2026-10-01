@@ -20,6 +20,7 @@ const DEMO = join(ROOT, "tools/claims/red-demo.mjs");
 const CENSUS = join(ROOT, "tools/claims/dirty-census.mjs");
 const RENEW = join(ROOT, "tools/claims/renew-race.mjs");
 const HARNESS = join(ROOT, "tools/claims/selfcheck-harness.mjs");
+const SIM = join(ROOT, "tools/relay-sim/sim.js");
 
 // M27 的锚点是**从 README 当场读出来的**，不是手抄的。
 // 上一版手抄了"121"，本轮 121→122→123 连炸两次"锚点没命中"——那是测具自己的固定故障，
@@ -541,6 +542,17 @@ const MUT = [
     file: HARNESS,
     pairs: [["  return mid > prefixLen && mid < String(line).length ? mid : null;", "  return mid;   // 变异：不判行内性"]],
     test: "五面自证",
+    suite: "test/docs-drift.test.js",
+  },
+  {
+    // M69 打的是 2026-10-01 那条"跟踪文件在盘上必须是 LF"的门。
+    // 它挑的靶子是**真发生过的那件事**：脏重启后用 `git checkout HEAD -- .` 恢复，
+    // smudge 按 core.autocrlf=true 把文件写回 CRLF——内容哈希完全看不出来，红的却是三条吃 LF 的源码扫描断言。
+    // 所以这条变异"不改变任何行为"（node 照样跑 CRLF 文件），除了这条门没人会红：正是"约定只活在盘上"的形状。
+    name: "M69 往 sim.js 的一处行尾塞进 CR（工作树出现 CRLF，而内容哈希仍与 HEAD 相同）",
+    file: SIM,
+    pairs: [["\nconst OUT =", "\r\nconst OUT ="]],
+    test: "跟踪文件在盘上必须是 LF",
     suite: "test/docs-drift.test.js",
   },
   // M68 已撤回，ID 不复用。理由留在这儿：它打的靶子是 `sim.test.js` 里的 `S2b-G` 断言，

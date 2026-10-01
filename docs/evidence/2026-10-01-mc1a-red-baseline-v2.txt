@@ -1,0 +1,28 @@
+# MC-1-A 先红基线 v2（判据搬到 mc1a-ruler.mjs 之后，语义未变）
+# 生成时间: 2026-10-01T03:55:30-04:00
+# 复算命令: node tools/claims/gate-census.mjs . --batches=5 --gated=10
+# 与 v1 的差别：汇总行多了 strayOwn 字段、输出多一行『空桶登记』；桶的定义在 tools/claims/mc1a-ruler.mjs
+# ---------------------------------------------------------------------------
+[闸口普查] 计划 5 次 × 每次 10 轮 = 50 轮，root=C:\Users\yyyy\Documents\Qoder\2026-09-28\50171e16
+  批1: 10 轮，跨度最大 35ms，全到齐=true，赢家 racer-19,racer-6,racer-19,racer-19,racer-19,racer-19,racer-19,racer-8,racer-19,racer-19
+  批2: 10 轮，跨度最大 52ms，全到齐=true，赢家 racer-19,racer-5,racer-19,racer-18,racer-19,racer-19,racer-19,racer-19,racer-19,racer-19
+  批3: 10 轮，跨度最大 34ms，全到齐=true，赢家 racer-19,racer-19,racer-19,racer-18,racer-19,racer-18,racer-19,racer-19,racer-19,racer-19
+  ★ 批4 第4轮 winners=2 racerRows=2 blocked=18 holder=racer-3 跨度=19ms 判据=双主+MC-1-A×1
+      板面=src/cli.js←racer-3 ⏎ src/cli.js←racer-19
+      还活着的仲裁残留=["src_cli.js.lock.arbiter-25564-2yqxpqe87r8 who=racer-19 at=1790841397664 ttl=60s 距自己到期还有 59928ms"]
+      claims 现场=["src_cli.js.lock(45B) \"{\\\"who\\\":\\\"racer-3\\\",\\\"at\\\":1790841397669,\\\"ttl\\\":60}\"","src_cli.js.lock.arbiter-25564-2yqxpqe87r8(46B) \"{\\\"who\\\":\\\"racer-19\\\",\\\"at\\\":1790841397664,\\\"ttl\\\":60}\"","src_cli.js.lock.arbiter-26408-3arw23y8o92(49B) \"{\\\"who\\\":\\\"stale-holder\\\",\\\"at\\\":1790841395878,\\\"ttl\\\":1}\""]
+      各家判定原文=[{"who":"racer-19","status":"acquired","prevHolder":null,"why":null,"at":1790841397664,"pid":21800},{"who":"racer-3","status":"stolen","prevHolder":"(空位)","why":"超时 1.8s > TTL 1s","at":1790841397669,"pid":22532}]
+  批4: 10 轮，跨度最大 39ms，全到齐=true，赢家 racer-3,racer-10,racer-19,racer-3,racer-19,racer-9,racer-19,racer-19,racer-19,racer-11
+  ★ 批5 第2轮 winners=3 racerRows=2 blocked=17 holder=racer-7 跨度=20ms 判据=双主+MC-1-A×1
+      板面=src/cli.js←racer-12 ⏎ src/cli.js←racer-19
+      还活着的仲裁残留=["src_cli.js.lock.arbiter-17940-mckcai54qg who=racer-19 at=1790841413101 ttl=60s 距自己到期还有 59932ms"]
+      claims 现场=["src_cli.js.lock(45B) \"{\\\"who\\\":\\\"racer-7\\\",\\\"at\\\":1790841413108,\\\"ttl\\\":60}\"","src_cli.js.lock.arbiter-17940-mckcai54qg(46B) \"{\\\"who\\\":\\\"racer-19\\\",\\\"at\\\":1790841413101,\\\"ttl\\\":60}\"","src_cli.js.lock.arbiter-24852-s27a495zjuh(49B) \"{\\\"who\\\":\\\"stale-holder\\\",\\\"at\\\":1790841411297,\\\"ttl\\\":1}\""]
+      各家判定原文=[{"who":"racer-12","status":"dirty-blocked","prevHolder":null,"why":null,"at":null,"pid":24852},{"who":"racer-19","status":"acquired","prevHolder":null,"why":null,"at":1790841413101,"pid":7928},{"who":"racer-7","status":"stolen","prevHolder":"(空位)","why":"超时 1.8s > TTL 1s","at":1790841413108,"pid":8260}]
+  批5: 10 轮，跨度最大 33ms，全到齐=true，赢家 racer-19,racer-7,racer-16,racer-18,racer-19,racer-19,racer-19,racer-11,racer-19,racer-19
+
+[闸口普查] 分母=真跑到 50 轮（计划 50）｜事件 2 次（双主 2｜MC-1-A 2｜其中板面正常的"静默" 0）｜残留分桶：活的他人 2 起 / 活的本人 0 / 到期 5 / 读不出 0｜未到齐 0 轮｜读不出 0 批
+[闸口普查] 空桶登记：静默、读不出的残留、活的本人＝本轮没有证人 ⇒ 只说明没被抓到，不说明结构上不可能
+[闸口普查] 恒等式：事件 2 = 双主 2 + 静默(只有 MC-1-A、板面正常) 0 ⇒ 2+0=2｜成立｜MC-1-A 2 与双主 2 是交叉关系（可同轮共现），不许加成事件数
+[闸口普查] 分母 A（本工具，--only=s2bg 快路径）=闸口轮 50；分母 B（完整推演器）=另由 sim.test.js 顶部那次整套真跑负责，本工具没跑过它
+RELAY-SUMMARY {"kind":"gate-census","planned":50,"rounds":50,"events":2,"dbl":2,"mc1a":2,"silent":0,"strayExpired":5,"strayUnreadable":0,"strayOwn":0,"notFull":0,"unreadable":0,"fastPath":1,"collapsed":0,"code":1,"codes":[0,1,2,9]}
+# EXIT=1

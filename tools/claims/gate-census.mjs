@@ -9,6 +9,9 @@ import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import path from "node:path";
 import { printSummary, crossCheck, HARNESS_EXIT } from "../../src/claims/summary.js";
+// 判据不内联在这里：它住在 mc1a-ruler.mjs，普查与套件的两面夹具共用同一把尺子
+// （内联的话想证"它会分对桶"就只剩真跑并发一条路，而并发里根本没有那两种样本）。
+import { classifyRound } from "./mc1a-ruler.mjs";
 
 export const EXIT_CODES = { clean: 0, found: 1, noMeasurement: 2, badUsage: 9, harness: HARNESS_EXIT };
 
@@ -45,25 +48,13 @@ if (GATED < 1 || BATCHES < 1) {
 }
 
 let rounds = 0, events = 0, dbl = 0, mc1a = 0, silent = 0, unreadable = 0, notFull = 0;
-let strayExpired = 0, strayUnreadable = 0;
+let strayExpired = 0, strayUnreadable = 0, strayOwn = 0;
 let onlyTag = null;   // 记的是 sim 回来的 only 标记：没有它，读者分不清这数是全量跑还是快路径
 const rows = [];
 
-// 判据只住这一处（sim 交的是原始读数 at/ttl/liveMs，不再自己判一遍）：
-//   dbl  = winners≠1 或 racerRows≠1 ⇒ 双主/多主现形（两家都落了笔）
-//   MC-1-A = 残留那把 `.arbiter-*` 按它**自己记的** at+ttl 还没到期（liveMs>0），且 who ≠ 这一轮的存活持有者
-//            ⇒ 一把还活着的锁被搬进仲裁临时名后再没归位，它的归属证据被静默摘走
-//   到期残骸（liveMs≤0）与读不出的（liveMs===null）各自单列：前者是正常老化、不是缺陷，
-//   后者是量具到不了——两种都不进 MC-1-A，但绝不能混成"确实没有"。
-const classify = (p) => {
-  const strays = p.strays || [];
-  return {
-    dbl: p.winners !== 1 || p.racerRows !== 1,
-    foreign: strays.filter((s) => s.liveMs !== null && s.liveMs > 0 && s.who !== p.holder),
-    expired: strays.filter((s) => s.liveMs !== null && s.liveMs <= 0),
-    unreadable: strays.filter((s) => s.liveMs === null),
-  };
-};
+// 桶的定义（foreign=MC-1-A / own / expired / unreadable）在 mc1a-ruler.mjs，这里只负责数与摊现场。
+// 到期残骸与读不出的残留各占一格、都不进事件：前者是正常老化，后者是量具到不了，
+// 两种都不进事件不等于"确实没有"，所以两格各自印数，空着就写"没人证过"。
 
 console.log(`[闸口普查] 计划 ${BATCHES} 次 × 每次 ${GATED} 轮 = ${BATCHES * GATED} 轮，root=${path.resolve(ROOT)}`);
 for (let i = 1; i <= BATCHES; i++) {
@@ -88,9 +79,10 @@ for (let i = 1; i <= BATCHES; i++) {
     rounds++;
     // 没等齐的轮不是"并发放行"，是又一次顺序派发 ⇒ 它测不到这条判据。计入分母塌，不算"没抓到"。
     if (p.arrivals !== g.needed) { notFull++; }
-    const c = classify(p);
+    const c = classifyRound(p);
     strayExpired += c.expired.length;
     strayUnreadable += c.unreadable.length;
+    strayOwn += c.own.length;
     if (!c.dbl && c.foreign.length === 0) return;
     events++;
     if (c.dbl) dbl++;
@@ -127,7 +119,11 @@ const code = untrust ? EXIT_CODES.harness : collapsed ? EXIT_CODES.noMeasurement
 
 console.log(`\n[闸口普查] 分母=真跑到 ${rounds} 轮（计划 ${BATCHES * GATED}）｜事件 ${events} 次` +
   `（双主 ${dbl}｜MC-1-A ${mc1a}｜其中板面正常的"静默" ${silent}）` +
-  `｜到期残骸 ${strayExpired} 把｜读不出的残留 ${strayUnreadable} 把｜未到齐 ${notFull} 轮｜读不出 ${unreadable} 批`);
+  `｜残留分桶：活的他人 ${mc1a} 起 / 活的本人 ${strayOwn} / 到期 ${strayExpired} / 读不出 ${strayUnreadable}` +
+  `｜未到齐 ${notFull} 轮｜读不出 ${unreadable} 批`);
+const emptyBuckets = [["静默", silent], ["读不出的残留", strayUnreadable], ["活的本人", strayOwn]]
+  .filter(([, n]) => n === 0).map(([k]) => k);
+console.log(`[闸口普查] 空桶登记：${emptyBuckets.join("、") || "（无空桶）"}＝本轮没有证人 ⇒ 只说明没被抓到，不说明结构上不可能`);
 console.log(`[闸口普查] 恒等式：事件 ${events} = 双主 ${dbl} + 静默(只有 MC-1-A、板面正常) ${silent} ⇒ ` +
   `${dbl}+${silent}=${dbl + silent}｜${identityHolds ? "成立" : "不成立 ⇒ 已判读数不可信（退 9），不许带着它报「抓到 N 次」"}` +
   `｜MC-1-A ${mc1a} 与双主 ${dbl} 是交叉关系（可同轮共现），不许加成事件数`);
@@ -141,7 +137,7 @@ console.log(`[闸口普查] 分母 A（本工具，--only=s2bg 快路径）=闸�
   `分母 B（完整推演器）=另由 sim.test.js 顶部那次整套真跑负责，本工具没跑过它`);
 printSummary({
   kind: "gate-census", planned: BATCHES * GATED, rounds, events, dbl, mc1a, silent,
-  strayExpired, strayUnreadable, notFull, unreadable,
+  strayExpired, strayUnreadable, strayOwn, notFull, unreadable,
   fastPath: onlyTag === "s2bg" ? 1 : 0, collapsed: collapsed ? 1 : 0, code,
   codes: [...new Set(Object.values(EXIT_CODES))],
 });

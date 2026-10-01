@@ -12,6 +12,8 @@ import { digestOf } from "../src/proto/envelope.js";
 import { parseSummary } from "../src/claims/summary.js";
 // 脏件普查的尺子与门共用同一份实现（名单、分桶、分母都在这里，测试不许自己抄一遍正则）。
 import { census, censusLine, SCRATCH } from "../tools/claims/dirty-census.mjs";
+// MC-1-A 的判据同样从它自己那一处取：夹具喂合成靶子、普查数真轮次，两边共用一把尺子。
+import { classifyRound, tallyPeriods, BUCKETS } from "../tools/claims/mc1a-ruler.mjs";
 
 const SIGNING_DOC = new URL("../docs/specs/03-signing.md", import.meta.url);
 const SCHEMA = new URL("../proto/envelope.schema.json", import.meta.url);
@@ -280,6 +282,8 @@ const PROBE_ROWS = [
   ["tools/claims/selfcheck-harness.mjs", [0, 8, 9]],
   ["tools/claims/dirty-census.mjs", [0, 1, 2, 9]],
   ["tools/claims/gate-census.mjs", [0, 1, 2, 9]],
+  // mc1a-ruler.mjs 不在这张表里：它是判据的定义处、不是对用户开放的取证入口（没有退码契约）。
+  // 但它确实被真 spawn 过一次（见下面七面靶子那条用例末尾），所以它享有一条执行边。
 ];
 
 test("README 引用的探针与夹具必须真实存在，且写明的参数、退码与脚本一致", () => {
@@ -495,6 +499,93 @@ test("gate-census 必须真跑一次：工具抓到事件就退 1，而套件这
   console.log(`[gate-census 烟雾] 1 轮：事件 ${s.events}（双主 ${s.dbl}｜MC-1-A ${s.mc1a}｜静默 ${s.silent}）` +
     `｜到期残骸 ${s.strayExpired} 把｜读不出的残留 ${s.strayUnreadable} 把｜退 ${r.status}` +
     `｜本条耗时 ${Date.now() - t0}ms（工具抓到就退 1；套件允许 1，所以这条不因真缺陷红）`);
+});
+
+// 判据必须**能被合成靶子喂到**。上一轮 50 圈真并发里"静默"与"读不出"两格各 0 个证人，
+// 只靠真跑的后果是：这两格永远空着，而空桶会被下一个读台账的人当成"结构上不可能"。
+// 更要紧的是第①面：如果 MC-1-A 只能在 `winners≠1` 的轮里出现，它就只是双主的另一个名字，
+// "归属证据可被静默摘走"这句话就没有仪器支撑——这面证明判据自己有独立于双主的自由度。
+test("MC-1-A 判据的七面合成靶子：静默摘走不许只是双主的别名，到期残骸与读不出不许冒充它", () => {
+  const stray = (who, liveMs) => ({ name: `src_x.js.lock.arbiter-1-abc`, who, at: 1, ttl: 60, liveMs });
+  const faces = [
+    ["① 板面正常 + 一把还活着的**他人**残留 ⇒ 事件 + 静默（判据的独立自由度）",
+      { winners: 1, racerRows: 1, holder: "a", strays: [stray("b", 500)] },
+      { event: true, dbl: false, silent: true, foreign: 1, own: 0, expired: 0, unreadable: 0 }],
+    ["② 双主 + 一把还活着的他人残留 ⇒ 事件、但不是静默（上一轮 4/4 就是这一面）",
+      { winners: 2, racerRows: 2, holder: "a", strays: [stray("b", 500)] },
+      { event: true, dbl: true, silent: false, foreign: 1, own: 0, expired: 0, unreadable: 0 }],
+    ["③ 多赢家公司却没多落板（计数与状态不互印）⇒ 仍算双主",
+      { winners: 5, racerRows: 1, holder: "a", strays: [] },
+      { event: true, dbl: true, silent: false, foreign: 0, own: 0, expired: 0, unreadable: 0 }],
+    ["④ 板面正常 + **已到期**残骸 ⇒ 不算事件（这条就是被撤回的那个判据的靶子：只看 who 会在这里误报）",
+      { winners: 1, racerRows: 1, holder: "a", strays: [stray("b", -1)] },
+      { event: false, dbl: false, silent: false, foreign: 0, own: 0, expired: 1, unreadable: 0 }],
+    ["⑤ 板面正常 + 还活着但 who 就是当前持有者本人 ⇒ 不算摘走，单列 own 格",
+      { winners: 1, racerRows: 1, holder: "a", strays: [stray("a", 500)] },
+      { event: false, dbl: false, silent: false, foreign: 0, own: 1, expired: 0, unreadable: 0 }],
+    ["⑥ 板面正常 + at/ttl 读不出 ⇒ 不算事件、也不算'没有'，单列 unreadable 格（安全侧）",
+      { winners: 1, racerRows: 1, holder: "a", strays: [stray("b", null)] },
+      { event: false, dbl: false, silent: false, foreign: 0, own: 0, expired: 0, unreadable: 1 }],
+    ["⑦ 干净轮 ⇒ 什么都不算",
+      { winners: 1, racerRows: 1, holder: "a", strays: [] },
+      { event: false, dbl: false, silent: false, foreign: 0, own: 0, expired: 0, unreadable: 0 }],
+  ];
+  for (const [name, p, want] of faces) {
+    const c = classifyRound(p);
+    for (const k of ["event", "dbl", "silent"]) {
+      assert.equal(c[k], want[k], `${name}：${k} 判成 ${c[k]}，期望 ${want[k]}`);
+    }
+    for (const b of BUCKETS) {
+      assert.equal(c[b].length, want[b], `${name}：桶 ${b} 装了 ${c[b].length} 把，期望 ${want[b]}`);
+    }
+  }
+  // 恒等式在这七面上必须成立，且 census 那边是拿它拦退码的（不只是印一句话）。
+  const t = tallyPeriods(faces.map(([, p]) => p));
+  assert.equal(t.identityHolds, true, `恒等式在七面上不成立：events=${t.events} dbl=${t.dbl} silent=${t.silent}`);
+  assert.equal(t.events, t.dbl + t.silent, `聚合器自己就不自洽：${t.events} ≠ ${t.dbl} + ${t.silent}`);
+  assert.deepEqual([t.events, t.dbl, t.silent, t.mc1a, t.own, t.expired, t.unreadable], [3, 2, 1, 2, 1, 1, 1],
+    `七面聚合出来的数变了（${JSON.stringify(t)}）：要么有人改了判据没改靶子，要么靶子被悄悄放宽了`);
+  // 判据只许住一处：普查里若再写一遍寿命式，就有两份真相（与 clamp 那一族同形）。
+  const gc = readFileSync(new URL("../tools/claims/gate-census.mjs", import.meta.url), "utf8");
+  assert.ok(gc.includes('from "./mc1a-ruler.mjs"'), "gate-census 不再从尺子取判据了：它内联了第二份");
+  assert.doesNotMatch(gc, /liveMs\s*[><=!]+\s*0\s*&&/, "gate-census 里出现了第二处寿命判据：两份谓词会各自飘");
+  console.log(`[MC-1-A 判据靶子] 七面全过｜聚合 events=${t.events}=dbl ${t.dbl}+silent ${t.silent}｜` +
+    `foreign ${t.mc1a} own ${t.own} expired ${t.expired} unreadable ${t.unreadable}｜桶定义 ${BUCKETS.join("/")}`);
+  // 尺子自己被真 spawn 过一次（README 按文件名引用它，就得能按文件名跑到）
+  const rr = runProbe("tools/claims/mc1a-ruler.mjs", []);
+  assert.equal(rr.status, 0, `尺子单跑退 ${rr.status}：\n${(rr.stdout || "") + (rr.stderr || "")}`);
+});
+
+// gate-census 的退码 2 与 9 这两档，上一轮只有 README 里的一句话、没有任何夹具走到过：
+// "分母塌了要退 2"这句从没被真验一次，等于该档可能只是注释担保（读到 0 与到不了不分的形状）。
+test("gate-census 的 2 与 9 三面必须真被走到：分母塌不许读成'没抓到'，摘掉的开关必须降到安全侧", async () => {
+  const fs = await import("node:fs");
+  const os = await import("node:os");
+  const fields = ["planned", "rounds", "events", "collapsed", "code"];
+  // 面 1：ROOT 指向一个空目录 ⇒ sim 起不来、RESULT_JSON 读不到 ⇒ 必须退 2 并自报 collapsed
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), "relay-gate-empty-"));
+  try {
+    const r = runProbe("tools/claims/gate-census.mjs", [dir, "--batches=1", "--gated=1"]);
+    const out = (r.stdout || "") + (r.stderr || "");
+    const s = parseSummary(out, "gate-census", fields);
+    assert.equal(r.status, 2, `分母塌了却退 ${r.status}（0=量到了、干净）：\n${out.split(/\r?\n/).slice(-8).join("\n")}`);
+    assert.equal(s.code, r.status, "汇总行的 code 必须就是真实退码（否则读者核的是两份数）");
+    assert.equal(s.collapsed, 1, `退 2 却没标 collapsed=1：${s.collapsed}`);
+    assert.equal(s.planned, 1);
+    assert.equal(s.rounds, 0, `计划 1 轮却数到 ${s.rounds} 轮：到不了的轮次不许计进分母`);
+    assert.equal(s.events, 0);
+    assert.ok(out.includes("!! 分母塌了"), "退 2 没印出自己的成因原文：读者只能猜是哪一侧塌了");
+    console.log(`[gate-census 塌分母] 空 ROOT ⇒ 退 ${r.status}、collapsed=${s.collapsed}、rounds=${s.rounds}/${s.planned}（原文含「!! 分母塌了」）`);
+  } finally { fs.rmSync(dir, { recursive: true, force: true }); }
+  // 面 2：`--strict` 这一档已经摘了；旧写法必须落到"不认的参数"（退 9），不能被静默吞掉
+  const r2 = runProbe("tools/claims/gate-census.mjs", [rootDir, "--batches=1", "--gated=1", "--strict"]);
+  const out2 = (r2.stdout || "") + (r2.stderr || "");
+  assert.equal(r2.status, 9, `不认的开关 --strict 退了 ${r2.status}：它必须降到安全侧，不能被忽略后装作按老语义跑了`);
+  assert.ok(out2.includes("不认的参数 --strict"), `没打印拒绝原因：\n${out2.split(/\r?\n/).slice(-6).join("\n")}`);
+  // 面 3：0 轮的"没抓到"不是证据 ⇒ 用法档拒绝
+  const r3 = runProbe("tools/claims/gate-census.mjs", [rootDir, "--batches=1", "--gated=0"]);
+  assert.equal(r3.status, 9, `--gated=0 退了 ${r3.status}，应为 9：0 轮的普查没有分母`);
+  console.log("[gate-census 用法档] --strict 与 --gated=0 都退 9，各印自己的 !! 原文");
 });
 
 test("window-measure 也必须有执行边：真跑 2 次，样本齐且窗口量为正", () => {
